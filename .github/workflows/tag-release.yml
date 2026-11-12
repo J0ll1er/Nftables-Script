@@ -1,0 +1,54 @@
+name: Тег и релиз версии
+
+# При изменении CHANGELOG.md создаёт тег vВЕРСИЯ для верхней версии (если его нет)
+# и страницы релизов на GitHub с описанием из CHANGELOG.md для всех версий, у которых тег уже есть.
+on:
+  push:
+    branches: [main]
+    paths: [CHANGELOG.md, .github/workflows/tag-release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Убрать теги и релизы, которых нет в истории main
+        run: |
+          git fetch --tags --force
+          for tag in $(git tag -l); do
+            if ! git merge-base --is-ancestor "$tag" HEAD; then
+              gh release delete "$tag" --cleanup-tag --yes || git push origin ":refs/tags/$tag"
+            fi
+          done
+      - name: Тег для верхней версии
+        run: |
+          top=$(grep -m1 '^## ' CHANGELOG.md | sed 's/^## //; s/[[:space:]]*$//')
+          [[ "$top" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Не удалось прочитать версию: '$top'"; exit 1; }
+          grep -q "FW_VERSION='$top'" fw-install.sh || { echo "fw-install.sh не содержит FW_VERSION='$top'"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/v$top" >/dev/null 2>&1; then
+            echo "Тег v$top уже есть"
+          else
+            git tag "v$top"
+            git push origin "v$top"
+          fi
+          echo "TOP=$top" >> "$GITHUB_ENV"
+      - name: Релизы на GitHub
+        run: |
+          git fetch --tags --force
+          grep '^## ' CHANGELOG.md | sed 's/^## //; s/[[:space:]]*$//' | while read -r version; do
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            git rev-parse -q --verify "refs/tags/v$version" >/dev/null || continue
+            if gh release view "v$version" >/dev/null 2>&1; then continue; fi
+            awk -v v="$version" '$0 == "## " v {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+            [ -s notes.md ] || echo "Описание изменений — в CHANGELOG.md" > notes.md
+            if [ "$version" = "$TOP" ]; then latest=true; else latest=false; fi
+            gh release create "v$version" --title "$version" --notes-file notes.md --verify-tag --latest="$latest"
+          done

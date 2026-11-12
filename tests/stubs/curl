@@ -1,0 +1,41 @@
+#!/bin/bash
+# Заглушка curl для тестов update-fw.sh. Сценарий задаёт переменная SCEN_RIPE / SCEN_IPVERSE.
+url=""; out=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    -o) out="${args[$((i+1))]}"; i=$((i+1)) ;;
+    https://*) url="${args[$i]}" ;;
+  esac
+done
+emit() { if [ -n "$out" ]; then cat > "$out"; else cat; fi; }
+case "$url" in
+  *zkeenip.dat*)
+    if [ "${SCEN_GEO:-ok}" = down ]; then echo "curl: geo down" >&2; exit 28; fi
+    emit < "$GEO_DAT" ;;
+  https://stat.ripe.net/*)
+    echo x >> "$STUB_DIR/ripe_calls"
+    if [ "${SCEN_RIPE:-ok}" = down ]; then echo "curl: (28) Operation timed out" >&2; exit 28; fi
+    asn=${url##*resource=AS}
+    printf '{"status":"ok","data":{"resource":"%s","prefixes":[{"prefix":"203.0.%s.0/24"}]}}' "$asn" "$((asn % 200))" | emit ;;
+  *ipverse/as-ip-blocks*)
+    echo x >> "$STUB_DIR/ipverse_calls"
+    if [ "${SCEN_IPVERSE:-ok}" = down ]; then echo "curl: ipverse down" >&2; exit 22; fi
+    asn=${url#*/as/}; asn=${asn%%/*}
+    case "${SCEN_IPVERSE:-ok}" in
+      only:*) [ "${SCEN_IPVERSE#only:}" = "$asn" ] || { echo "curl: ipverse down (AS$asn)" >&2; exit 22; } ;;
+    esac
+    case "$url" in
+      *ipv4-aggregated.txt) printf '198.51.%s.0/24\n' "$((asn % 200))" | emit ;;
+      *ipv6-aggregated.txt) : | emit ;;
+    esac ;;
+  *)
+    # списки сканеров (GitHub и зеркала jsDelivr)
+    if [ "${SCEN_LISTS:-ok}" = down ]; then exit 22; fi
+    if [ -n "${SCEN_LIST_CONTENT:-}" ]; then
+      printf '%s\n' "$SCEN_LIST_CONTENT" | emit
+    else
+      printf '192.0.2.%s\n' "$((RANDOM % 250 + 1))" | emit
+    fi ;;
+esac
+exit 0

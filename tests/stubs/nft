@@ -1,0 +1,7 @@
+#!/bin/bash
+# Заглушка nft: проверка и применение «успешны», в журнал заглушки пишется режим.
+echo "nft $*" >> "$STUB_DIR/nft_calls"
+case "$*" in
+  *" -f "*) cp "${!#}" "$STUB_DIR/nft_snapshot" ;;
+esac
+exit 0

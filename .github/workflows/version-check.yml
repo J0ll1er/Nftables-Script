@@ -1,0 +1,44 @@
+name: Проверка версии и сборки
+
+# Установщик должен совпадать со сборкой, а его изменение требует новой версии.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: fw-install.sh совпадает с результатом build.py
+        run: |
+          python3 -I build.py
+          if ! git diff --exit-code -- fw-install.sh; then
+            echo "::error::fw-install.sh не совпадает со сборкой. Запусти python3 -I build.py и закоммить результат."
+            exit 1
+          fi
+      - name: Изменение установщика сопровождается новой версией
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          case "$base" in ""|0000000000000000000000000000000000000000) exit 0;; esac
+          git cat-file -e "$base^{commit}" 2>/dev/null || exit 0
+          if git diff --quiet "$base" HEAD -- build.py orig-fw-install.sh fw-install.sh; then
+            exit 0
+          fi
+          old=$(git show "$base:build.py" | sed -n 's/^VERSION = "\(.*\)"/\1/p' | head -1)
+          new=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' build.py | head -1)
+          if [ "$old" = "$new" ]; then
+            echo "::error::Установщик изменён, но VERSION в build.py остался $new. Подними версию и добавь раздел в CHANGELOG.md."
+            exit 1
+          fi
+          if ! grep -q "^## $new\$" CHANGELOG.md; then
+            echo "::error::В CHANGELOG.md нет раздела ## $new."
+            exit 1
+          fi

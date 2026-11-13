@@ -19,11 +19,11 @@ class Box(unittest.TestCase):
         self.menu = importlib.util.module_from_spec(SPEC)
         LOADER.exec_module(self.menu)
 
-    def draw(self, text, columns=60):
+    def draw(self, text, columns=60, headings=True):
         self.menu.shutil.get_terminal_size = lambda fallback=None: type("S", (), {"columns": columns})()
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.menu.print_box("Статус файрвола", text)
+            self.menu.print_box("Статус файрвола", text, self.menu.BOX_HEADINGS if headings else ())
         return out.getvalue().splitlines()
 
     def test_all_lines_have_same_visible_width(self):

@@ -746,17 +746,17 @@ BOX_HEADINGS = (
 )
 
 
-def print_box(title, text):
+def print_box(title, text, headings=()):
     columns = shutil.get_terminal_size((100, 24)).columns
     limit = max(30, columns - 4)
     entries = []
-    for raw in text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n"):
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").strip("\n").split("\n"):
         raw = raw.rstrip()
         plain = BOX_ANSI.sub("", raw)
         if not plain and entries and entries[-1][0] == "rule":
             continue
         previous = next((item for item in reversed(entries) if item[0] == "rule" or item[1]), None)
-        if (plain.startswith(BOX_HEADINGS) and len(plain) <= limit - 4
+        if (headings and plain.startswith(tuple(headings)) and len(plain) <= limit - 4
                 and not (previous and previous[0] == "rule")):
             # Заголовок блока становится разделителем; пустая строка перед ним не нужна.
             while entries and entries[-1][0] == "line" and not entries[-1][1]:
@@ -778,44 +778,64 @@ def print_box(title, text):
     print("└" + "─" * (inner + 2) + "┘")
 
 
-def show_status_boxed():
-    if not (sys.stdout.isatty() and sys.stdin.isatty()):
-        show_status()
-        return
-    import pty
-    master, slave = pty.openpty()
-    chunks = []
+def boxed(title, function, headings=()):
+    # Выводит всё, что печатает function, в рамке. Если функция спрашивает input(),
+    # рамка закрывается до вопроса: приглашение и ответ идут уже без неё.
+    def wrapper():
+        if not (sys.stdout.isatty() and sys.stdin.isatty()):
+            return function()
+        import builtins
+        import pty
+        master, slave = pty.openpty()
+        chunks = []
 
-    def reader():
-        while True:
-            try:
-                data = os.read(master, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            chunks.append(data)
+        def reader():
+            while True:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                chunks.append(data)
 
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
-    sys.stdout.flush()
-    saved = os.dup(1)
-    os.dup2(slave, 1)
-    try:
-        show_status()
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
         sys.stdout.flush()
-    finally:
-        os.dup2(saved, 1)
-        os.close(saved)
-        os.close(slave)
-    thread.join(timeout=5)
-    os.close(master)
-    print_box("Статус файрвола", b"".join(chunks).decode("utf-8", "replace"))
+        state = {"saved": os.dup(1), "done": False}
+        os.dup2(slave, 1)
+
+        def finish():
+            if state["done"]:
+                return
+            state["done"] = True
+            sys.stdout.flush()
+            os.dup2(state["saved"], 1)
+            os.close(state["saved"])
+            os.close(slave)
+            thread.join(timeout=5)
+            os.close(master)
+            print_box(title, b"".join(chunks).decode("utf-8", "replace"), headings)
+
+        real_input = builtins.input
+
+        def boxed_input(*args, **kwargs):
+            finish()
+            return real_input(*args, **kwargs)
+
+        builtins.input = boxed_input
+        try:
+            return function()
+        finally:
+            builtins.input = real_input
+            finish()
+    wrapper.__wrapped__ = function
+    return wrapper
 
 
 """
 menu = replace_once(menu, "def show_status():\n", BOXED + "def show_status():\n", "boxed_status")
-menu = replace_once(menu, '("Статус файрвола", show_status),', '("Статус файрвола", show_status_boxed),', "boxed_entry")
+menu = replace_once(menu, '("Статус файрвола", show_status),', '("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),', "boxed_entry")
 
 OLD_TAIL = r'''    print("\nЗагруженные правила", flush=True)
     table = subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
@@ -1107,7 +1127,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.2.3"
+VERSION = "1.3.0"
 VERSIONS_CODE = r'''FW_VERSION = "@@VERSION@@"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -1624,6 +1644,17 @@ menu = replace_once(menu, '        ("Журнал ошибок", show_error_log)
 menu = replace_once(menu, '            ("Откатить скрипт к другой версии", rollback_script),\n        )),\n',
                     '            ("Откатить скрипт к другой версии", rollback_script),\n        )),\n'
                     '        ("Что ещё есть на сервере", show_server_overview),\n', "пункт 8")
+# Рамка вокруг пунктов, которые только выводят информацию (с вопросом input() рамка закрывается до вопроса).
+for old, title in (
+    ('("Показать доверенные адреса", show_trusted),', "Доверенные адреса"),
+    ('("Показать пути к файлам на VPS", show_file_paths),', "Пути к файлам"),
+    ('("Журнал ошибок", show_error_log),', "Журнал ошибок"),
+    ('("Версии и что исправлено", show_versions),', "Версии"),
+    ('("Что ещё есть на сервере", show_server_overview),', "Что ещё есть на сервере"),
+):
+    name = old.split(", ")[-1].rstrip("),")
+    new = old.replace(name + "),", f'boxed("{title}", {name})),')
+    menu = replace_once(menu, old, new, "рамка " + title)
 menu = replace_once(menu, '    if os.geteuid() != 0:\n        raise SystemExit("Запусти fw-menu от root.")\n',
     '    if sys.argv[1:] == ["--version"]:\n        print(FW_VERSION)\n        return\n'
     '    if os.geteuid() != 0:\n        raise SystemExit("Запусти fw-menu от root.")\n', "--version")

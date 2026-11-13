@@ -458,8 +458,8 @@ if unexpected:
 
 # DDNS-имена в trusted*.txt: при каждом обновлении превращаются в адреса.
 DDNS_BASH = r"""
-# DDNS: имена из trusted*.txt превращаются в адреса. Ответ принимается только из глобальных адресов,
-# не больше 8 на имя; при сбое DNS берётся кэш не старше DDNS_CACHE_HOURS часов.
+# DDNS: DDNS-адреса из trusted*.txt превращаются в IP. Ответ принимается только из глобальных адресов,
+# не больше 8 на DDNS-адрес; при сбое DNS берётся кэш не старше DDNS_CACHE_HOURS часов.
 DDNS_CACHE_HOURS="${DDNS_CACHE_HOURS:-72}"
 ddns_resolve() {
   local names="$TMP/ddns_names" out
@@ -539,9 +539,9 @@ for name in names:
     if kept:
         new_cache[name] = kept
         addresses.extend(address for address, _ in kept)
-        print(f"WARN: имя {name}: {reason}, использую прежние адреса из кэша")
+        print(f"WARN: DDNS-адрес {name}: {reason}, использую прежние IP из кэша")
     else:
-        print(f"WARN: имя {name}: {reason}, адресов нет — имя в правила не попало")
+        print(f"WARN: DDNS-адрес {name}: {reason}, IP нет — в правила не попал")
 
 Path(out_file).write_text("".join(address + "\n" for address in dict.fromkeys(addresses)), encoding="utf-8")
 if dry != "1":
@@ -550,10 +550,10 @@ if dry != "1":
                                             for name, items in new_cache.items() for address, stamp in items),
                                     encoding="utf-8")
     except OSError:
-        print("WARN: не записался кэш DDNS-имён")
+        print("WARN: не записался кэш DDNS-адресов")
 PY_DDNS
   ); then
-    note "WARN: не удалось разрешить DDNS-имена из trusted, использую только адреса"
+    note "WARN: не удалось разрешить DDNS-адреса из trusted, использую только обычные адреса"
     : > "$TMP/ddns_ips"
     return 0
   fi
@@ -1908,7 +1908,7 @@ def parse_trusted(value):
         name = value.lower()
         if HOSTNAME_RE.match(name):
             return name
-        raise ValueError(f"«{value}» — не адрес, не подсеть и не имя хоста вида home.example.com")
+        raise ValueError(f"«{value}» — не IP-адрес, не подсеть и не DDNS-адрес вида home.example.com")
     return parse_network(value)
 
 
@@ -1926,7 +1926,7 @@ def trusted_names():
 
 
 def add_trusted():
-    value = input("IPv4, IPv6, CIDR или DDNS-имя через пробел (или ssh для текущего подключения): ").strip()
+    value = input("IPv4, IPv6, CIDR или DDNS-адрес через пробел (или ssh для текущего подключения): ").strip()
     if not value:
         return
     if value.lower() == "ssh":
@@ -1946,7 +1946,7 @@ def add_trusted():
         append_entries(TRUSTED, addresses)
     print(f"Добавлено: {', '.join(addresses)}. Чтобы обновить правила, открой «Проверить и применить правила».")
     if any(isinstance(item, str) for item in items):
-        print("Имя превращается в адрес при каждом плановом обновлении. Чтобы смену адреса подхватывало быстрее,")
+        print("DDNS-адрес превращается в IP при каждом плановом обновлении. Чтобы смену IP подхватывало быстрее,")
         print("задай частоту: «Проверить и применить правила» → «Настроить расписание обновления» → 3 (раз в 3 часа).")
 """
 menu = replace_once(menu, OLD_ADD_TRUSTED, NEW_ADD_TRUSTED, "добавление доверенных и DDNS-имён")
@@ -1975,7 +1975,7 @@ menu = replace_once(menu,
     "запись расписания")
 menu = replace_once(menu, '    print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")\n',
     '    print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")\n'
-    '    if trusted_names():\n        print(f"  Доверенных DDNS-имён — {len(trusted_names())} (адрес подставляется при каждом обновлении)")\n'
+    '    if trusted_names():\n        print(f"  Доверенных DDNS-адресов — {len(trusted_names())} (IP подставляется при каждом обновлении)")\n'
     '    warn_old_trusted()\n', "предупреждение о старых")
 menu = replace_once(menu, '("Показать доверенные адреса", show_trusted),',
     '("Показать доверенные адреса", show_trusted),\n            ("Удалить доверенные адреса", remove_trusted),', "пункт удаления")

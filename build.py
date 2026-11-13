@@ -55,6 +55,7 @@ print("исходные суммы сходятся")
 # ------------------------------------------------------------ update-fw.sh
 upd = parts["update"][2]
 
+
 upd = replace_once(
     upd,
     'fail_keep() { echo "ERR: $1 — правила не тронуты" >&2; exit 1; }\n'
@@ -454,6 +455,124 @@ leftover = [line for line in upd.splitlines() if ">&2" in line]
 unexpected = [line for line in leftover if 'echo "$1" >&2' not in line and 'paint ' not in line]
 if unexpected:
     sys.exit("остались прямые записи в stderr:\n" + "\n".join(unexpected))
+
+# DDNS-имена в trusted*.txt: при каждом обновлении превращаются в адреса.
+DDNS_BASH = r"""
+# DDNS: имена из trusted*.txt превращаются в адреса. Ответ принимается только из глобальных адресов,
+# не больше 8 на имя; при сбое DNS берётся кэш не старше DDNS_CACHE_HOURS часов.
+DDNS_CACHE_HOURS="${DDNS_CACHE_HOURS:-72}"
+ddns_resolve() {
+  local names="$TMP/ddns_names" out
+  cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" 2>/dev/null > "$names"
+  : > "$TMP/ddns_ips"
+  grep -qE '[A-Za-z]' "$names" || return 0
+  if ! out=$(timeout 60 python3 - "$names" "$DIR/ddns-cache.txt" "$TMP/ddns_ips" "$DRY" "$DDNS_CACHE_HOURS" <<'PY_DDNS'
+import ipaddress
+import re
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+
+names_file, cache_file, out_file, dry, max_hours = sys.argv[1:6]
+max_age = int(max_hours) * 3600
+NAME = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+MAX_ADDRESSES = 8
+now = int(time.time())
+
+names = []
+for line in Path(names_file).read_text(encoding="utf-8", errors="replace").splitlines():
+    value = "".join(line.partition("#")[0].split()).lower()
+    if not value:
+        continue
+    try:
+        ipaddress.ip_network(value)
+        continue
+    except ValueError:
+        pass
+    if NAME.match(value) and value not in names:
+        names.append(value)
+
+cache = {}
+try:
+    for line in Path(cache_file).read_text(encoding="utf-8").splitlines():
+        name, address, stamp = line.split()
+        cache.setdefault(name, []).append((address, int(stamp)))
+except (OSError, ValueError):
+    cache = {}
+
+
+def resolve(name):
+    result = []
+
+    def work():
+        try:
+            for item in socket.getaddrinfo(name, None, proto=socket.IPPROTO_TCP):
+                result.append(item[4][0])
+        except (OSError, UnicodeError):
+            pass
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(8)
+    return list(result)
+
+
+new_cache = {}
+addresses = []
+for name in names:
+    found = []
+    for text in resolve(name):
+        try:
+            address = ipaddress.ip_address(text.split("%")[0])
+        except ValueError:
+            continue
+        if address.is_global and not address.is_multicast and str(address) not in found:
+            found.append(str(address))
+    if found and len(found) <= MAX_ADDRESSES:
+        new_cache[name] = [(address, now) for address in found]
+        addresses.extend(found)
+        continue
+    reason = "ответ пустой или без глобальных адресов" if not found else f"слишком много адресов ({len(found)})"
+    kept = [(address, stamp) for address, stamp in cache.get(name, []) if now - stamp <= max_age]
+    if kept:
+        new_cache[name] = kept
+        addresses.extend(address for address, _ in kept)
+        print(f"WARN: имя {name}: {reason}, использую прежние адреса из кэша")
+    else:
+        print(f"WARN: имя {name}: {reason}, адресов нет — имя в правила не попало")
+
+Path(out_file).write_text("".join(address + "\n" for address in dict.fromkeys(addresses)), encoding="utf-8")
+if dry != "1":
+    try:
+        Path(cache_file).write_text("".join(f"{name} {address} {stamp}\n"
+                                            for name, items in new_cache.items() for address, stamp in items),
+                                    encoding="utf-8")
+    except OSError:
+        print("WARN: не записался кэш DDNS-имён")
+PY_DDNS
+  ); then
+    note "WARN: не удалось разрешить DDNS-имена из trusted, использую только адреса"
+    : > "$TMP/ddns_ips"
+    return 0
+  fi
+  [ -z "$out" ] || while IFS= read -r line; do note "$line"; done <<< "$out"
+}
+ddns_resolve
+"""
+
+upd = replace_once(
+    upd,
+    "# Исключить из внешних блокировок сети, которые затрагивают доверенные или LAN.\n",
+    DDNS_BASH.lstrip("\n") + "# Исключить из внешних блокировок сети, которые затрагивают доверенные или LAN.\n", "ddns_resolve")
+upd = replace_once(
+    upd, '{ cat "$TMP/lan_raw"; cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" 2>/dev/null; } > "$TMP/protected_raw"',
+    '{ cat "$TMP/lan_raw" "$TMP/ddns_ips"; cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" 2>/dev/null; } > "$TMP/protected_raw"',
+    "ddns в protected")
+upd = replace_once(
+    upd, 'cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" 2>/dev/null > "$TMP/tr_raw"',
+    'cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" "$TMP/ddns_ips" 2>/dev/null > "$TMP/tr_raw"', "ddns в trusted")
 
 # ----------------------------------------------------------------- fw-menu
 menu = parts["menu"][2]
@@ -1127,7 +1246,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 VERSIONS_CODE = r'''FW_VERSION = "@@VERSION@@"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -1755,8 +1874,109 @@ def remove_trusted():
     print("Чтобы правила обновились, открой «Проверить и применить правила» → «Применить правила и включить таймер».")
 '''
 menu = replace_once(menu, OLD_SHOW_TRUSTED, NEW_TRUSTED, "доверенные адреса")
+
+# DDNS-имена в доверенных и расписание «каждые N часов».
+OLD_ADD_TRUSTED = r"""def add_trusted():
+    value = input("IPv4, IPv6 или CIDR через пробел (или ssh для текущего подключения): ").strip()
+    if not value:
+        return
+    if value.lower() == "ssh":
+        value = ssh_client()
+        if not value:
+            print("Адрес SSH-подключения недоступен. Введи его вручную.")
+            return
+    networks = dict.fromkeys(parse_network(item) for item in value.split())
+
+    with (DIRECTORY / ".trusted.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        existing = set(trusted_networks())
+        addresses = [network_text(network) for network in networks if network not in existing]
+        if not addresses:
+            print("Все указанные записи уже есть.")
+            return
+        append_entries(TRUSTED, addresses)
+    print(f"Добавлено: {', '.join(addresses)}. Чтобы обновить правила, открой «Проверить и применить правила».")
+"""
+NEW_ADD_TRUSTED = r"""HOSTNAME_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+
+def parse_trusted(value):
+    # Адрес или подсеть возвращаются как сеть, иначе допускается только имя хоста (DDNS), например home.example.com.
+    try:
+        ipaddress.ip_network(value)
+    except ValueError:
+        name = value.lower()
+        if HOSTNAME_RE.match(name):
+            return name
+        raise ValueError(f"«{value}» — не адрес, не подсеть и не имя хоста вида home.example.com")
+    return parse_network(value)
+
+
+def trusted_names():
+    names = []
+    for path in (TRUSTED, DIRECTORY / "trusted.local.txt"):
+        for value in entries(path):
+            name = value.lower()
+            try:
+                ipaddress.ip_network(value)
+            except ValueError:
+                if HOSTNAME_RE.match(name) and name not in names:
+                    names.append(name)
+    return names
+
+
+def add_trusted():
+    value = input("IPv4, IPv6, CIDR или DDNS-имя через пробел (или ssh для текущего подключения): ").strip()
+    if not value:
+        return
+    if value.lower() == "ssh":
+        value = ssh_client()
+        if not value:
+            print("Адрес SSH-подключения недоступен. Введи его вручную.")
+            return
+    items = dict.fromkeys(parse_trusted(item) for item in value.split())
+
+    with (DIRECTORY / ".trusted.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        existing = set(trusted_networks()) | set(trusted_names())
+        addresses = [item if isinstance(item, str) else network_text(item) for item in items if item not in existing]
+        if not addresses:
+            print("Все указанные записи уже есть.")
+            return
+        append_entries(TRUSTED, addresses)
+    print(f"Добавлено: {', '.join(addresses)}. Чтобы обновить правила, открой «Проверить и применить правила».")
+    if any(isinstance(item, str) for item in items):
+        print("Имя превращается в адрес при каждом плановом обновлении. Чтобы смену адреса подхватывало быстрее,")
+        print("задай частоту: «Проверить и применить правила» → «Настроить расписание обновления» → 3 (раз в 3 часа).")
+"""
+menu = replace_once(menu, OLD_ADD_TRUSTED, NEW_ADD_TRUSTED, "добавление доверенных и DDNS-имён")
+
+HOURS_CHOICES = "2, 3, 4, 6, 8 или 12"
+menu = replace_once(menu,
+    '    value = input("Введи время ЧЧ:ММ по часам VPS, «сброс» для штатного графика или Enter для отмены: ").strip().casefold()\n'
+    '    if not value:\n        return\n'
+    '    if value != "сброс" and not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):\n'
+    '        raise ValueError("введи время в формате ЧЧ:ММ от 00:00 до 23:59")\n',
+    '    print("Раз в сутки: время ЧЧ:ММ по часам VPS. Чаще: число часов — 2, 3, 4, 6, 8 или 12 (каждые N часов).")\n'
+    '    value = input("Введи время, число часов, «сброс» для штатного графика или Enter для отмены: ").strip().casefold()\n'
+    '    if not value:\n        return\n'
+    '    hours = re.fullmatch(r"(?:каждые\\s+)?(\\d{1,2})(?:\\s*(?:ч|час|часа|часов))?", value)\n'
+    '    if hours and not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):\n'
+    '        if int(hours[1]) not in (2, 3, 4, 6, 8, 12):\n'
+    '            raise ValueError("частота: 2, 3, 4, 6, 8 или 12 часов (меньше нельзя: каждое обновление скачивает списки)")\n'
+    '        value = f"every:{int(hours[1])}"\n'
+    '    elif value != "сброс" and not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):\n'
+    '        raise ValueError("введи время ЧЧ:ММ от 00:00 до 23:59 или число часов: 2, 3, 4, 6, 8, 12")\n',
+    "ввод расписания")
+menu = replace_once(menu,
+    '            write_text_atomic(SCHEDULE_FILE, f"[Timer]\\nOnCalendar=\\nOnCalendar=*-*-* {value}:00\\n"\n',
+    '            calendar = f"0/{value[6:]}:00:00" if value.startswith("every:") else f"{value}:00"\n'
+    '            write_text_atomic(SCHEDULE_FILE, f"[Timer]\\nOnCalendar=\\nOnCalendar=*-*-* {calendar}\\n"\n',
+    "запись расписания")
 menu = replace_once(menu, '    print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")\n',
-    '    print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")\n    warn_old_trusted()\n', "предупреждение о старых")
+    '    print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")\n'
+    '    if trusted_names():\n        print(f"  Доверенных DDNS-имён — {len(trusted_names())} (адрес подставляется при каждом обновлении)")\n'
+    '    warn_old_trusted()\n', "предупреждение о старых")
 menu = replace_once(menu, '("Показать доверенные адреса", show_trusted),',
     '("Показать доверенные адреса", show_trusted),\n            ("Удалить доверенные адреса", remove_trusted),', "пункт удаления")
 
@@ -1784,7 +2004,7 @@ HEALTH_CHECK = r'''def health_check():
         print("warn: последнее обновление списков прошло с предупреждениями")
         return 1
     if not quiet("systemctl", "is-active", "--quiet", "fw-update.timer"):
-        print("warn: таймер ежедневного обновления fw-update.timer не запущен")
+        print("warn: таймер обновления fw-update.timer не запущен")
         return 1
     if result != "ok":
         print("warn: результат последнего обновления неизвестен")

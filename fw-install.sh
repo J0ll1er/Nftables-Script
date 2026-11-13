@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.3.0'
+FW_VERSION='1.4.0'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -959,11 +959,108 @@ def add_trusted():
     print(f"Добавлено: {', '.join(addresses)}. Чтобы обновить правила, открой «Проверить и применить правила».")
 
 
+TRUSTED_OLD_DAYS = 14
+
+
+def trusted_records():
+    # Записи обоих файлов доверенных: файл, адрес, комментарий, признак «добавлен установщиком» и дата.
+    records = []
+    for path in (TRUSTED, DIRECTORY / "trusted.local.txt"):
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            body, _, comment = line.partition("#")
+            value = "".join(body.split())
+            if not value:
+                continue
+            comment = comment.strip()
+            found = re.search(r"\d{4}-\d{2}-\d{2}", comment)
+            added = None
+            if found:
+                try:
+                    added = datetime.date.fromisoformat(found[0])
+                except ValueError:
+                    added = None
+            records.append({"path": path, "value": value, "auto": comment.startswith("авто"), "added": added})
+    return records
+
+
+def trusted_age(record):
+    return (datetime.date.today() - record["added"]).days if record["added"] else None
+
+
+def trusted_note(record):
+    age = trusted_age(record)
+    if record["auto"]:
+        return f"  — добавлен установщиком {record['added']}, {age} дн. назад" if record["added"] else "  — добавлен установщиком"
+    if record["added"]:
+        return f"  — добавлен {record['added']}"
+    return ""
+
+
+def warn_old_trusted():
+    for record in trusted_records():
+        age = trusted_age(record)
+        if record["auto"] and age is not None and age > TRUSTED_OLD_DAYS:
+            paint(33, f"  Внимание: адрес {record['value']} добавлен установщиком {age} дн. назад. "
+                      "Если он больше не нужен, удали его: «Настроить доступ» → «Удалить доверенные адреса».")
+
+
 def show_trusted():
+    records = trusted_records()
     for path in (TRUSTED, DIRECTORY / "trusted.local.txt"):
         if path.exists():
             print(f"{path}:")
-            print("\n".join(entries(path)) or "(пусто)")
+            items = [record for record in records if record["path"] == path]
+            if not items:
+                print("(пусто)")
+            for record in items:
+                print(f"  {record['value']}{trusted_note(record)}")
+
+
+def remove_trusted():
+    records = trusted_records()
+    if not records:
+        print("Доверенных адресов нет.")
+        return
+    client = ssh_client()
+    for number, record in enumerate(records, 1):
+        mark = "  ← адрес этого подключения" if client and record["value"] == client else ""
+        print(f"  {number}. {record['value']}{trusted_note(record)}{mark}")
+    answer = input("Номера или адреса через пробел для удаления (Enter — отмена): ").strip()
+    if not answer:
+        return
+    chosen = set()
+    for token in answer.replace(",", " ").split():
+        if token.isdigit() and 1 <= int(token) <= len(records):
+            chosen.add(records[int(token) - 1]["value"])
+        elif any(record["value"] == token for record in records):
+            chosen.add(token)
+        else:
+            print(f"«{token}» в списке нет. Ничего не удалено.")
+            return
+    if input(f"Удалить из доверенных: {', '.join(sorted(chosen))}? Введи «да»: ").strip().casefold() != "да":
+        print("Отменено.")
+        return
+    removed = []
+    with (DIRECTORY / ".trusted.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Файлы перечитываются под блокировкой: удаляются строки с выбранными адресами, остальное не меняется.
+        for path in (TRUSTED, DIRECTORY / "trusted.local.txt"):
+            if not path.exists():
+                continue
+            kept = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                value = "".join(line.partition("#")[0].split())
+                if value in chosen:
+                    removed.append(value)
+                else:
+                    kept.append(line)
+            write_text_atomic(path, "".join(item + "\n" for item in kept))
+    print(f"Удалено: {', '.join(dict.fromkeys(removed))}.")
+    if client and client in chosen:
+        print("Это адрес вашего текущего подключения: если он не российский, после применения правил 443 для него закроется. SSH это не затрагивает.")
+    print("Чтобы правила обновились, открой «Проверить и применить правила» → «Применить правила и включить таймер».")
 
 
 def parse_asn(value):
@@ -1884,6 +1981,7 @@ def show_status():
     for name in ("nft", "curl", "systemctl"):
         print(f"  {'OK' if shutil.which(name) else 'ПРОВЕРЬ'} {name}")
     print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")
+    warn_old_trusted()
     warn_reverse_proxy()
     show_profile()
     script = ('source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; '
@@ -2040,6 +2138,28 @@ def last_result():
         return (DIRECTORY / "last-result").read_text().strip()
     except OSError:
         return ""
+
+
+def health_check():
+    """Одна строка «ok|warn|error: причина» и код выхода 0/1/2 — для мониторинга."""
+    if not quiet("nft", "-t", "list", "table", "inet", "fw"):
+        print("error: таблица inet fw не загружена, фаервол не работает")
+        return 2
+    result = last_result()
+    if result == "error":
+        print("error: последнее обновление списков закончилось ошибкой, см. журнал ошибок")
+        return 2
+    if result == "warn":
+        print("warn: последнее обновление списков прошло с предупреждениями")
+        return 1
+    if not quiet("systemctl", "is-active", "--quiet", "fw-update.timer"):
+        print("warn: таймер ежедневного обновления fw-update.timer не запущен")
+        return 1
+    if result != "ok":
+        print("warn: результат последнего обновления неизвестен")
+        return 1
+    print("ok: правила загружены, последнее обновление без ошибок")
+    return 0
 
 
 def ask_confirmation(timeout):
@@ -2885,7 +3005,7 @@ def show_error_log():
     print("Журнал очищен.")
 
 
-FW_VERSION = "1.3.0"
+FW_VERSION = "1.4.0"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
@@ -3136,6 +3256,11 @@ def show_menu(title, entries, exit_label="Назад"):
 
 
 def main():
+    if sys.argv[1:] == ["--check"]:
+        if os.geteuid() != 0:
+            print("error: для --check нужен root")
+            raise SystemExit(2)
+        raise SystemExit(health_check())
     if sys.argv[1:] == ["--version"]:
         print(FW_VERSION)
         return
@@ -3162,6 +3287,7 @@ def main():
         ("Настроить доступ", (
             ("Добавить доверенные IP или подсети через пробел", add_trusted),
             ("Показать доверенные адреса", boxed("Доверенные адреса", show_trusted)),
+            ("Удалить доверенные адреса", remove_trusted),
             ("Настроить порт управления и разрешённые IP", configure_api),
         )),
         ("Настроить блокировки", (
@@ -4934,7 +5060,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'd4cfc5125b081f3c5576583e94dba4891e179612bc8b5843804e634fc9d114a2' "$stage/update-fw.sh" \
-    '9776ad8ea29d8221f7facfed4dda945b3ebf97e6438a55069ba3e1a9b95889f9' "$stage/fw-menu" \
+    '9f9036658130662ac6926829876a2c157c8ae83187376a35cdd4bcf77d0be277' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1
@@ -5053,8 +5179,8 @@ if [ "$mode" = upgrade ]; then
     echo 'LAN_ALLOW выключен. Для включения добавь LAN_ALLOW="нужная_подсеть" в /opt/fw/local.conf.'
   fi
   ssh_client=$(detect_admin)
-  if [ -n "$ssh_client" ] && ! grep -Fxq "$ssh_client" "$FW/trusted.txt"; then
-    printf "%s\n" "$ssh_client" >> "$FW/trusted.txt"
+  if [ -n "$ssh_client" ] && ! sed "s/#.*//; s/[[:space:]]//g" "$FW/trusted.txt" | grep -Fxq "$ssh_client"; then
+    printf "%s  # авто, добавлен %s\n" "$ssh_client" "$(date +%F)" >> "$FW/trusted.txt"
     echo "Адрес администратора ($ssh_client) добавлен в trusted.txt."
   fi
 
@@ -5179,7 +5305,7 @@ printf '%s\n' "$DEFAULT_ASN" > "$FW/asn.txt"
 : > "$FW/trusted.txt"
 ssh_client=$(detect_admin)
 if [ -n "$ssh_client" ]; then
-  printf "%s\n" "$ssh_client" > "$FW/trusted.txt"
+  printf "%s  # авто, добавлен %s\n" "$ssh_client" "$(date +%F)" > "$FW/trusted.txt"
   echo "Адрес этого SSH-подключения ($ssh_client) добавлен в доверенные."
 else
   echo 'WARN: адрес администратора не определён. Добавь свой IPv4/IPv6 в /opt/fw/trusted.txt до применения правил.' >&2

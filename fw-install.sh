@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.2.2'
+FW_VERSION='1.2.3'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -2288,8 +2288,9 @@ def show_server_overview():
         suffix = {"open": "открыт", "closed": "в ufw закрыт — при включённом ufw доступ по SSH пропадёт",
                   "limited": "ограничен адресами"}[state]
         print(f"SSH: порт {port} — {suffix}")
+    width = max(60, min(shutil.get_terminal_size((100, 24)).columns - 2, 110))
     for line in port80_report(policy, listeners):
-        print(line)
+        print(textwrap.fill(line, width=width, subsequent_indent="  ", break_long_words=False, break_on_hyphens=False))
 
 
 def apply_rules():
@@ -2864,7 +2865,7 @@ def show_error_log():
     print("Журнал очищен.")
 
 
-FW_VERSION = "1.2.2"
+FW_VERSION = "1.2.3"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
@@ -4913,7 +4914,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'd4cfc5125b081f3c5576583e94dba4891e179612bc8b5843804e634fc9d114a2' "$stage/update-fw.sh" \
-    'b8fe11b9e3f18d9c3782f2e83cfeabd7fdc08201ec3f3c7641d2af531d7e0e09' "$stage/fw-menu" \
+    '7db9ea56899e055b4337a8a47aaf2f150be7ff0afd41df3a6432135402bc8bed' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

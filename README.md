@@ -213,14 +213,7 @@ echo "НОВЫЙ_IP" >> /opt/fw/trusted.local.txt
 
 ## Благодарности
 
-Скрипт сам списки не составляет, он собирает правила из чужих открытых проектов. Без них он не работал бы, поэтому спасибо их авторам.
-
-- **[jameszeroX](https://github.com/jameszeroX)** и его проект **[zkeen-ip](https://github.com/jameszeroX/zkeen-ip)**: готовая база российских адресов (`zkeenip.dat`). На ней построен весь геофильтр, который пускает на защищённые порты (по умолчанию 443 и подобные) только российские адреса. Большое спасибо за этот труд и за то, что список поддерживается в актуальном виде.
-- **[tread-lightly/CyberOK_Skipa_ips](https://github.com/tread-lightly/CyberOK_Skipa_ips)** и **[shadow-netlab/traffic-guard-lists](https://github.com/shadow-netlab/traffic-guard-lists)**: списки сетей сканеров (наборы `skipa` и `antiscanner`).
-- **[OpenFilters/internet-scanners](https://github.com/OpenFilters/internet-scanners)**: адреса известных сканеров интернета (Censys, Shodan, Shadowserver и другие).
-- **[RIPEstat](https://stat.ripe.net/)** (RIPE NCC) и **[ipverse/as-ip-blocks](https://github.com/ipverse/as-ip-blocks)**: адреса сетей по номерам ASN.
-
-Если вы автор одного из этих проектов и хотите изменить формулировку, откройте issue.
+Большое спасибо **[jameszeroX](https://github.com/jameszeroX)** за проект **[zkeen-ip](https://github.com/jameszeroX/zkeen-ip)**: готовую базу российских адресов (`zkeenip.dat`). На ней построен весь геофильтр, который пускает на защищённые порты (по умолчанию 443 и подобные) только российские адреса. Спасибо за этот труд и за то, что список поддерживается в актуальном виде.
 
 ## Для разработчиков
 

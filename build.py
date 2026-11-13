@@ -1107,7 +1107,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 VERSIONS_CODE = r'''FW_VERSION = "@@VERSION@@"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -1607,8 +1607,9 @@ def show_server_overview():
         suffix = {"open": "открыт", "closed": "в ufw закрыт — при включённом ufw доступ по SSH пропадёт",
                   "limited": "ограничен адресами"}[state]
         print(f"SSH: порт {port} — {suffix}")
+    width = max(60, min(shutil.get_terminal_size((100, 24)).columns - 2, 110))
     for line in port80_report(policy, listeners):
-        print(line)
+        print(textwrap.fill(line, width=width, subsequent_indent="  ", break_long_words=False, break_on_hyphens=False))
 
 
 '''

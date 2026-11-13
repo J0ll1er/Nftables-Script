@@ -1793,7 +1793,11 @@ def print_box(title, text):
     for raw in text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n"):
         raw = raw.rstrip()
         plain = BOX_ANSI.sub("", raw)
-        if plain.startswith(BOX_HEADINGS) and len(plain) <= limit - 4:
+        if not plain and entries and entries[-1][0] == "rule":
+            continue
+        previous = next((item for item in reversed(entries) if item[0] == "rule" or item[1]), None)
+        if (plain.startswith(BOX_HEADINGS) and len(plain) <= limit - 4
+                and not (previous and previous[0] == "rule")):
             # Заголовок блока становится разделителем; пустая строка перед ним не нужна.
             while entries and entries[-1][0] == "line" and not entries[-1][1]:
                 entries.pop()
@@ -4890,7 +4894,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'd4cfc5125b081f3c5576583e94dba4891e179612bc8b5843804e634fc9d114a2' "$stage/update-fw.sh" \
-    'b4f181580c182b3532d930f41da18afb052e7190d107f3ff65857ba77463b4c4' "$stage/fw-menu" \
+    '7a863ee4533ea02a242962df210c4c6d108898b2ffcb5df349f1f71e5e3ea6aa' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

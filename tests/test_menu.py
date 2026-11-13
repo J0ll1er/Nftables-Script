@@ -125,8 +125,8 @@ check(titles[:5] == ["Статус файрвола", "Настроить дос
                      "Проверить и применить правила", "Отключить или удалить"],
       "пункты 1–5 на прежних местах")
 check(len(titles) == 8 and titles[5] == "Журнал ошибок", "шестой пункт — «Журнал ошибок»")
-check(captured["sixth"] is menu.show_error_log, "шестой пункт вызывает show_error_log")
-check(titles[7] == "Что ещё есть на сервере" and captured["eighth"] is menu.show_server_overview, "восьмой пункт — «Что ещё есть на сервере»")
+check(getattr(captured["sixth"], "__wrapped__", captured["sixth"]) is menu.show_error_log, "шестой пункт вызывает show_error_log")
+check(titles[7] == "Что ещё есть на сервере" and getattr(captured["eighth"], "__wrapped__", captured["eighth"]) is menu.show_server_overview, "восьмой пункт — «Что ещё есть на сервере»")
 check(titles[6] == "Версии и обновление скрипта" and isinstance(captured["seventh"], tuple), "седьмой пункт — «Версии и обновление скрипта»")
 
 # 7. список файлов знает про журнал

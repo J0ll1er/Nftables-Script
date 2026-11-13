@@ -679,8 +679,8 @@ if [ "$asn_total" -gt 0 ]; then
 fi
 cat "$DIR/extra.txt" >> "$TMP/scan_raw" 2>/dev/null
 normalize_scanners "$TMP/scan_raw" "$TMP/scan_normalized" || fail_keep "список сканеров некорректен"
-# DDNS: имена из trusted*.txt превращаются в адреса. Ответ принимается только из глобальных адресов,
-# не больше 8 на имя; при сбое DNS берётся кэш не старше DDNS_CACHE_HOURS часов.
+# DDNS: DDNS-адреса из trusted*.txt превращаются в IP. Ответ принимается только из глобальных адресов,
+# не больше 8 на DDNS-адрес; при сбое DNS берётся кэш не старше DDNS_CACHE_HOURS часов.
 DDNS_CACHE_HOURS="${DDNS_CACHE_HOURS:-72}"
 ddns_resolve() {
   local names="$TMP/ddns_names" out
@@ -760,9 +760,9 @@ for name in names:
     if kept:
         new_cache[name] = kept
         addresses.extend(address for address, _ in kept)
-        print(f"WARN: имя {name}: {reason}, использую прежние адреса из кэша")
+        print(f"WARN: DDNS-адрес {name}: {reason}, использую прежние IP из кэша")
     else:
-        print(f"WARN: имя {name}: {reason}, адресов нет — имя в правила не попало")
+        print(f"WARN: DDNS-адрес {name}: {reason}, IP нет — в правила не попал")
 
 Path(out_file).write_text("".join(address + "\n" for address in dict.fromkeys(addresses)), encoding="utf-8")
 if dry != "1":
@@ -771,10 +771,10 @@ if dry != "1":
                                             for name, items in new_cache.items() for address, stamp in items),
                                     encoding="utf-8")
     except OSError:
-        print("WARN: не записался кэш DDNS-имён")
+        print("WARN: не записался кэш DDNS-адресов")
 PY_DDNS
   ); then
-    note "WARN: не удалось разрешить DDNS-имена из trusted, использую только адреса"
+    note "WARN: не удалось разрешить DDNS-адреса из trusted, использую только обычные адреса"
     : > "$TMP/ddns_ips"
     return 0
   fi
@@ -1050,7 +1050,7 @@ def parse_trusted(value):
         name = value.lower()
         if HOSTNAME_RE.match(name):
             return name
-        raise ValueError(f"«{value}» — не адрес, не подсеть и не имя хоста вида home.example.com")
+        raise ValueError(f"«{value}» — не IP-адрес, не подсеть и не DDNS-адрес вида home.example.com")
     return parse_network(value)
 
 
@@ -1068,7 +1068,7 @@ def trusted_names():
 
 
 def add_trusted():
-    value = input("IPv4, IPv6, CIDR или DDNS-имя через пробел (или ssh для текущего подключения): ").strip()
+    value = input("IPv4, IPv6, CIDR или DDNS-адрес через пробел (или ssh для текущего подключения): ").strip()
     if not value:
         return
     if value.lower() == "ssh":
@@ -1088,7 +1088,7 @@ def add_trusted():
         append_entries(TRUSTED, addresses)
     print(f"Добавлено: {', '.join(addresses)}. Чтобы обновить правила, открой «Проверить и применить правила».")
     if any(isinstance(item, str) for item in items):
-        print("Имя превращается в адрес при каждом плановом обновлении. Чтобы смену адреса подхватывало быстрее,")
+        print("DDNS-адрес превращается в IP при каждом плановом обновлении. Чтобы смену IP подхватывало быстрее,")
         print("задай частоту: «Проверить и применить правила» → «Настроить расписание обновления» → 3 (раз в 3 часа).")
 
 
@@ -2115,7 +2115,7 @@ def show_status():
         print(f"  {'OK' if shutil.which(name) else 'ПРОВЕРЬ'} {name}")
     print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")
     if trusted_names():
-        print(f"  Доверенных DDNS-имён — {len(trusted_names())} (адрес подставляется при каждом обновлении)")
+        print(f"  Доверенных DDNS-адресов — {len(trusted_names())} (IP подставляется при каждом обновлении)")
     warn_old_trusted()
     warn_reverse_proxy()
     show_profile()
@@ -5201,8 +5201,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    '02340694ce6373b328d4d3c04f5f79b85ef13cd5079acf736f4e2d80f61b1861' "$stage/update-fw.sh" \
-    '0684bf2d39af906064fb20e049106e964617c3be76161449c0212ad2ef8f0204' "$stage/fw-menu" \
+    'a3d61ded757a65d371633e26aae5e421b49b4f8f10b428ff745f474c1984e6a7' "$stage/update-fw.sh" \
+    '9f3e774122abe784720514f330d1ea60775dbbe4d294f4b02bcfbe5e70b80c66' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

@@ -1107,7 +1107,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 VERSIONS_CODE = r'''FW_VERSION = "@@VERSION@@"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -1529,6 +1529,9 @@ def port80_report(policy, listeners):
         lines.append("ВНИМАНИЕ: порт закрыт, а способа открыть его на время продления не найдено — продление может не сработать")
     elif need_http and listening and exposed == "open" and handled:
         lines.append("Порт 80 открыт постоянно, хотя есть хук или задание, которые его открывают: проверь, что после продления он закрывается")
+    elif need_http and listening and exposed == "open" and not handled:
+        lines.append("Порт 80 открыт постоянно, поэтому открывать его на время продления не нужно. "
+                     "Хотите закрывать его между продлениями: настройте хуки certbot pre и post (открыть и закрыть порт в ufw)")
     elif need_http and not handled:
         lines.append("Открытие и закрытие порта 80 вокруг продления не найдено — если оно настроено иначе (скриптом, контейнером), здесь этого не видно")
     return lines
@@ -1551,6 +1554,11 @@ NFT_TABLE_NOTES = {
     "ip remnanode": "плагины ноды Remnawave (Torrent Blocker и др.)",
     "ip6 remnanode6": "плагины ноды Remnawave (Torrent Blocker и др.)",
     "inet geoblock": "старый геофильтр, его заменяет inet fw",
+    "ip filter": "чужая, ведётся iptables-nft (обычно ufw или Docker), мы её не трогаем",
+    "ip6 filter": "чужая, ведётся iptables-nft (обычно ufw или Docker), мы её не трогаем",
+    "ip nat": "чужая, ведётся iptables-nft (обычно Docker), мы её не трогаем",
+    "ip6 nat": "чужая, ведётся iptables-nft (обычно Docker), мы её не трогаем",
+    "inet vps_warp": "чужая, Cloudflare WARP (подрезка MSS и метки пакетов), мы её не трогаем",
 }
 
 
@@ -1579,7 +1587,18 @@ def show_server_overview():
     listeners = parse_listeners(probe_output("ss", "-H", "-lntup"))
     outside = sorted((port, proto, name) for proto, port, name, loopback in listeners if not loopback)
     print("Слушают не только локально:" if outside else "Снаружи ничего не слушает")
+    names_by_port = {}
     for port, proto, name in outside:
+        names_by_port.setdefault((port, proto), []).append(name)
+    merged = []
+    for (port, proto), names in sorted(names_by_port.items()):
+        real = [name for name in names if name and name != "systemd"]
+        if real and "systemd" in names:
+            # Один и тот же порт слушают служба и сокет-активация systemd: показываем одной строкой.
+            merged.append((port, proto, ", ".join(dict.fromkeys(real)) + " (через сокет systemd)"))
+        else:
+            merged.extend((port, proto, name) for name in dict.fromkeys(names))
+    for port, proto, name in merged:
         state, sources = exposure(policy, proto, port)
         label = {"open": "открыт", "closed": "закрыт ufw", "limited": "ufw пускает только " + ", ".join(sources)}[state]
         print(f"  {proto.upper()} {port} — {name or 'процесс не определён'}, {label}")

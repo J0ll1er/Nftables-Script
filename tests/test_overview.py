@@ -116,6 +116,30 @@ class Overview(unittest.TestCase):
         self.assertNotIn("323", text)
         self.assertIn("SSH: порт 22 — открыт", text)
 
+    def test_permanently_open_port_80_is_stated_plainly(self):
+        policy = self.menu.ufw_policy(UFW_ACTIVE.replace("443/tcp", "80/tcp"))
+        text = self.report(policy=policy)
+        self.assertIn("Порт 80 открыт постоянно, поэтому открывать его на время продления не нужно", text)
+        self.assertNotIn("не найдено", text)
+
+    def test_systemd_socket_and_service_are_one_line_and_warp_is_named(self):
+        outputs = {
+            ("nft", "list", "tables"): "table inet vps_warp\ntable ip filter\n",
+            ("ss", "-H", "-lntup"): 'tcp LISTEN 0 4096 0.0.0.0:11022 0.0.0.0:* users:(("sshd",pid=1,fd=3),("systemd",pid=1,fd=89))\n'
+                                     'tcp LISTEN 0 4096 [::]:11022 [::]:* users:(("sshd",pid=1,fd=4),("systemd",pid=1,fd=90))\n',
+            ("sshd", "-T"): "port 11022\n",
+        }
+        self.menu.probe_output = lambda *command: outputs.get(command, "")
+        self.menu.subprocess.run = lambda *a, **k: types.SimpleNamespace(stdout="Status: inactive\n")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.menu.show_server_overview()
+        text = output.getvalue()
+        self.assertEqual(text.count("TCP 11022"), 1)
+        self.assertIn("sshd (через сокет systemd)", text)
+        self.assertIn("inet vps_warp — чужая, Cloudflare WARP", text)
+        self.assertIn("ip filter — чужая, ведётся iptables-nft", text)
+
 
 if __name__ == "__main__":
     unittest.main()

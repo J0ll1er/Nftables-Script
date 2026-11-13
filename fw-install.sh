@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.1.1'
+FW_VERSION='1.2.0'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -1718,6 +1718,111 @@ def explain_rules(items):
         print(textwrap.fill(f"{number}. {text}", width=92, initial_indent="  ", subsequent_indent="     "))
 
 
+import threading
+
+BOX_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def box_cells(raw):
+    # Строка в виде списка (символ, цвет). Цвет хранится как накопленные коды ANSI.
+    cells, color = [], ""
+    position = 0
+    for found in BOX_ANSI.finditer(raw):
+        cells.extend((char, color) for char in raw[position:found.start()])
+        code = found.group(0)
+        color = "" if code in ("\x1b[0m", "\x1b[m") else color + code
+        position = found.end()
+    cells.extend((char, color) for char in raw[position:])
+    return cells
+
+
+def box_render(cells):
+    out, current = [], ""
+    for char, color in cells:
+        if color != current:
+            if current:
+                out.append("\x1b[0m")
+            out.append(color)
+            current = color
+        out.append(char)
+    if current:
+        out.append("\x1b[0m")
+    return "".join(out)
+
+
+def box_wrap(cells, width):
+    # Перенос по пробелам; продолжение строки сдвигается так же, как начало, плюс два пробела.
+    if len(cells) <= width:
+        return [cells]
+    indent = 0
+    while indent < len(cells) and cells[indent][0] == " ":
+        indent += 1
+    indent = min(indent, width // 3)
+    pad = [(" ", "")] * (indent + 2)
+    lines, rest = [], cells
+    while len(rest) > width:
+        cut = -1
+        for index in range(min(width, len(rest) - 1), indent + 1, -1):
+            if rest[index][0] == " ":
+                cut = index
+                break
+        if cut <= 0:
+            cut = width
+        lines.append(rest[:cut])
+        rest = pad + [cell for cell in rest[cut:]][(1 if rest[cut][0] == " " else 0):]
+    lines.append(rest)
+    return lines
+
+
+def print_box(title, text):
+    columns = shutil.get_terminal_size((100, 24)).columns
+    limit = max(30, columns - 4)
+    lines = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n"):
+        lines.extend(box_wrap(box_cells(raw.rstrip()), limit))
+    inner = max([len(title) + 2] + [len(line) for line in lines])
+    top = "┌─ " + title + " " + "─" * (inner + 2 - len(title) - 3) + "┐"
+    print(top)
+    for line in lines:
+        print("│ " + box_render(line) + " " * (inner - len(line)) + " │")
+    print("└" + "─" * (inner + 2) + "┘")
+
+
+def show_status_boxed():
+    if not (sys.stdout.isatty() and sys.stdin.isatty()):
+        show_status()
+        return
+    import pty
+    master, slave = pty.openpty()
+    chunks = []
+
+    def reader():
+        while True:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            chunks.append(data)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    sys.stdout.flush()
+    saved = os.dup(1)
+    os.dup2(slave, 1)
+    try:
+        show_status()
+        sys.stdout.flush()
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+        os.close(slave)
+    thread.join(timeout=5)
+    os.close(master)
+    print_box("Статус файрвола", b"".join(chunks).decode("utf-8", "replace"))
+
+
 def show_status():
     print("Проверка файлов и команд")
     for name in ("fw.conf", "asn.txt", "extra.txt", "trusted.txt", "update-fw.sh"):
@@ -2710,7 +2815,7 @@ def show_error_log():
     print("Журнал очищен.")
 
 
-FW_VERSION = "1.1.1"
+FW_VERSION = "1.2.0"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
@@ -2983,7 +3088,7 @@ def main():
         show_suggestion()
         return
     entries = (
-        ("Статус файрвола", show_status),
+        ("Статус файрвола", show_status_boxed),
         ("Настроить доступ", (
             ("Добавить доверенные IP или подсети через пробел", add_trusted),
             ("Показать доверенные адреса", show_trusted),
@@ -4759,7 +4864,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'd4cfc5125b081f3c5576583e94dba4891e179612bc8b5843804e634fc9d114a2' "$stage/update-fw.sh" \
-    'f923939dbb320e66e025f42446239d49309e87e0a81ad9f827176e08031cdc3d' "$stage/fw-menu" \
+    '2a1def7368bb3de0961d7267bbd8124197e2884e12e73ab0255555e8c5f6fa08' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

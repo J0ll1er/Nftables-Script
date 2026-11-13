@@ -678,6 +678,115 @@ def explain_rules(items):
 '''
 menu = replace_once(menu, "def show_status():\n", EXPLAIN + "def show_status():\n", "explain_rules")
 
+BOXED = r"""import threading
+
+BOX_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def box_cells(raw):
+    # Строка в виде списка (символ, цвет). Цвет хранится как накопленные коды ANSI.
+    cells, color = [], ""
+    position = 0
+    for found in BOX_ANSI.finditer(raw):
+        cells.extend((char, color) for char in raw[position:found.start()])
+        code = found.group(0)
+        color = "" if code in ("\x1b[0m", "\x1b[m") else color + code
+        position = found.end()
+    cells.extend((char, color) for char in raw[position:])
+    return cells
+
+
+def box_render(cells):
+    out, current = [], ""
+    for char, color in cells:
+        if color != current:
+            if current:
+                out.append("\x1b[0m")
+            out.append(color)
+            current = color
+        out.append(char)
+    if current:
+        out.append("\x1b[0m")
+    return "".join(out)
+
+
+def box_wrap(cells, width):
+    # Перенос по пробелам; продолжение строки сдвигается так же, как начало, плюс два пробела.
+    if len(cells) <= width:
+        return [cells]
+    indent = 0
+    while indent < len(cells) and cells[indent][0] == " ":
+        indent += 1
+    indent = min(indent, width // 3)
+    pad = [(" ", "")] * (indent + 2)
+    lines, rest = [], cells
+    while len(rest) > width:
+        cut = -1
+        for index in range(min(width, len(rest) - 1), indent + 1, -1):
+            if rest[index][0] == " ":
+                cut = index
+                break
+        if cut <= 0:
+            cut = width
+        lines.append(rest[:cut])
+        rest = pad + [cell for cell in rest[cut:]][(1 if rest[cut][0] == " " else 0):]
+    lines.append(rest)
+    return lines
+
+
+def print_box(title, text):
+    columns = shutil.get_terminal_size((100, 24)).columns
+    limit = max(30, columns - 4)
+    lines = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n"):
+        lines.extend(box_wrap(box_cells(raw.rstrip()), limit))
+    inner = max([len(title) + 2] + [len(line) for line in lines])
+    top = "┌─ " + title + " " + "─" * (inner + 2 - len(title) - 3) + "┐"
+    print(top)
+    for line in lines:
+        print("│ " + box_render(line) + " " * (inner - len(line)) + " │")
+    print("└" + "─" * (inner + 2) + "┘")
+
+
+def show_status_boxed():
+    if not (sys.stdout.isatty() and sys.stdin.isatty()):
+        show_status()
+        return
+    import pty
+    master, slave = pty.openpty()
+    chunks = []
+
+    def reader():
+        while True:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            chunks.append(data)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    sys.stdout.flush()
+    saved = os.dup(1)
+    os.dup2(slave, 1)
+    try:
+        show_status()
+        sys.stdout.flush()
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+        os.close(slave)
+    thread.join(timeout=5)
+    os.close(master)
+    print_box("Статус файрвола", b"".join(chunks).decode("utf-8", "replace"))
+
+
+"""
+menu = replace_once(menu, "def show_status():\n", BOXED + "def show_status():\n", "boxed_status")
+menu = replace_once(menu, '("Статус файрвола", show_status),', '("Статус файрвола", show_status_boxed),', "boxed_entry")
+
 OLD_TAIL = r'''    print("\nЗагруженные правила", flush=True)
     table = subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
                            text=True, capture_output=True, check=False)
@@ -968,7 +1077,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 VERSIONS_CODE = r'''FW_VERSION = "@@VERSION@@"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")

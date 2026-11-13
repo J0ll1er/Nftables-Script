@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.2.3'
+FW_VERSION='1.3.0'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -1786,17 +1786,17 @@ BOX_HEADINGS = (
 )
 
 
-def print_box(title, text):
+def print_box(title, text, headings=()):
     columns = shutil.get_terminal_size((100, 24)).columns
     limit = max(30, columns - 4)
     entries = []
-    for raw in text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n"):
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").strip("\n").split("\n"):
         raw = raw.rstrip()
         plain = BOX_ANSI.sub("", raw)
         if not plain and entries and entries[-1][0] == "rule":
             continue
         previous = next((item for item in reversed(entries) if item[0] == "rule" or item[1]), None)
-        if (plain.startswith(BOX_HEADINGS) and len(plain) <= limit - 4
+        if (headings and plain.startswith(tuple(headings)) and len(plain) <= limit - 4
                 and not (previous and previous[0] == "rule")):
             # Заголовок блока становится разделителем; пустая строка перед ним не нужна.
             while entries and entries[-1][0] == "line" and not entries[-1][1]:
@@ -1818,39 +1818,59 @@ def print_box(title, text):
     print("└" + "─" * (inner + 2) + "┘")
 
 
-def show_status_boxed():
-    if not (sys.stdout.isatty() and sys.stdin.isatty()):
-        show_status()
-        return
-    import pty
-    master, slave = pty.openpty()
-    chunks = []
+def boxed(title, function, headings=()):
+    # Выводит всё, что печатает function, в рамке. Если функция спрашивает input(),
+    # рамка закрывается до вопроса: приглашение и ответ идут уже без неё.
+    def wrapper():
+        if not (sys.stdout.isatty() and sys.stdin.isatty()):
+            return function()
+        import builtins
+        import pty
+        master, slave = pty.openpty()
+        chunks = []
 
-    def reader():
-        while True:
-            try:
-                data = os.read(master, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            chunks.append(data)
+        def reader():
+            while True:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                chunks.append(data)
 
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
-    sys.stdout.flush()
-    saved = os.dup(1)
-    os.dup2(slave, 1)
-    try:
-        show_status()
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
         sys.stdout.flush()
-    finally:
-        os.dup2(saved, 1)
-        os.close(saved)
-        os.close(slave)
-    thread.join(timeout=5)
-    os.close(master)
-    print_box("Статус файрвола", b"".join(chunks).decode("utf-8", "replace"))
+        state = {"saved": os.dup(1), "done": False}
+        os.dup2(slave, 1)
+
+        def finish():
+            if state["done"]:
+                return
+            state["done"] = True
+            sys.stdout.flush()
+            os.dup2(state["saved"], 1)
+            os.close(state["saved"])
+            os.close(slave)
+            thread.join(timeout=5)
+            os.close(master)
+            print_box(title, b"".join(chunks).decode("utf-8", "replace"), headings)
+
+        real_input = builtins.input
+
+        def boxed_input(*args, **kwargs):
+            finish()
+            return real_input(*args, **kwargs)
+
+        builtins.input = boxed_input
+        try:
+            return function()
+        finally:
+            builtins.input = real_input
+            finish()
+    wrapper.__wrapped__ = function
+    return wrapper
 
 
 def show_status():
@@ -2865,7 +2885,7 @@ def show_error_log():
     print("Журнал очищен.")
 
 
-FW_VERSION = "1.2.3"
+FW_VERSION = "1.3.0"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
@@ -3138,10 +3158,10 @@ def main():
         show_suggestion()
         return
     entries = (
-        ("Статус файрвола", show_status_boxed),
+        ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),
         ("Настроить доступ", (
             ("Добавить доверенные IP или подсети через пробел", add_trusted),
-            ("Показать доверенные адреса", show_trusted),
+            ("Показать доверенные адреса", boxed("Доверенные адреса", show_trusted)),
             ("Настроить порт управления и разрешённые IP", configure_api),
         )),
         ("Настроить блокировки", (
@@ -3155,19 +3175,19 @@ def main():
             ("Проверить обновление без применения (--dry)", dry_run),
             ("Применить правила и включить таймер", apply_rules),
             ("Настроить расписание обновления", configure_schedule),
-            ("Показать пути к файлам на VPS", show_file_paths),
+            ("Показать пути к файлам на VPS", boxed("Пути к файлам", show_file_paths)),
         )),
         ("Отключить или удалить", (
             ("Удалить правила и автообновление", remove_rules),
             ("Удалить скрипт и настройки", uninstall),
         )),
-        ("Журнал ошибок", show_error_log),
+        ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),
         ("Версии и обновление скрипта", (
-            ("Версии и что исправлено", show_versions),
+            ("Версии и что исправлено", boxed("Версии", show_versions)),
             ("Обновить скрипт до последней версии", update_script),
             ("Откатить скрипт к другой версии", rollback_script),
         )),
-        ("Что ещё есть на сервере", show_server_overview),
+        ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),
     )
     print(f"Версия скрипта — {FW_VERSION}")
     try:
@@ -4914,7 +4934,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'd4cfc5125b081f3c5576583e94dba4891e179612bc8b5843804e634fc9d114a2' "$stage/update-fw.sh" \
-    '7db9ea56899e055b4337a8a47aaf2f150be7ff0afd41df3a6432135402bc8bed' "$stage/fw-menu" \
+    '9776ad8ea29d8221f7facfed4dda945b3ebf97e6438a55069ba3e1a9b95889f9' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

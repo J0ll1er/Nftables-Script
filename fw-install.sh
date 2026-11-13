@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.2.1'
+FW_VERSION='1.2.2'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -2210,6 +2210,9 @@ def port80_report(policy, listeners):
         lines.append("ВНИМАНИЕ: порт закрыт, а способа открыть его на время продления не найдено — продление может не сработать")
     elif need_http and listening and exposed == "open" and handled:
         lines.append("Порт 80 открыт постоянно, хотя есть хук или задание, которые его открывают: проверь, что после продления он закрывается")
+    elif need_http and listening and exposed == "open" and not handled:
+        lines.append("Порт 80 открыт постоянно, поэтому открывать его на время продления не нужно. "
+                     "Хотите закрывать его между продлениями: настройте хуки certbot pre и post (открыть и закрыть порт в ufw)")
     elif need_http and not handled:
         lines.append("Открытие и закрытие порта 80 вокруг продления не найдено — если оно настроено иначе (скриптом, контейнером), здесь этого не видно")
     return lines
@@ -2232,6 +2235,11 @@ NFT_TABLE_NOTES = {
     "ip remnanode": "плагины ноды Remnawave (Torrent Blocker и др.)",
     "ip6 remnanode6": "плагины ноды Remnawave (Torrent Blocker и др.)",
     "inet geoblock": "старый геофильтр, его заменяет inet fw",
+    "ip filter": "чужая, ведётся iptables-nft (обычно ufw или Docker), мы её не трогаем",
+    "ip6 filter": "чужая, ведётся iptables-nft (обычно ufw или Docker), мы её не трогаем",
+    "ip nat": "чужая, ведётся iptables-nft (обычно Docker), мы её не трогаем",
+    "ip6 nat": "чужая, ведётся iptables-nft (обычно Docker), мы её не трогаем",
+    "inet vps_warp": "чужая, Cloudflare WARP (подрезка MSS и метки пакетов), мы её не трогаем",
 }
 
 
@@ -2260,7 +2268,18 @@ def show_server_overview():
     listeners = parse_listeners(probe_output("ss", "-H", "-lntup"))
     outside = sorted((port, proto, name) for proto, port, name, loopback in listeners if not loopback)
     print("Слушают не только локально:" if outside else "Снаружи ничего не слушает")
+    names_by_port = {}
     for port, proto, name in outside:
+        names_by_port.setdefault((port, proto), []).append(name)
+    merged = []
+    for (port, proto), names in sorted(names_by_port.items()):
+        real = [name for name in names if name and name != "systemd"]
+        if real and "systemd" in names:
+            # Один и тот же порт слушают служба и сокет-активация systemd: показываем одной строкой.
+            merged.append((port, proto, ", ".join(dict.fromkeys(real)) + " (через сокет systemd)"))
+        else:
+            merged.extend((port, proto, name) for name in dict.fromkeys(names))
+    for port, proto, name in merged:
         state, sources = exposure(policy, proto, port)
         label = {"open": "открыт", "closed": "закрыт ufw", "limited": "ufw пускает только " + ", ".join(sources)}[state]
         print(f"  {proto.upper()} {port} — {name or 'процесс не определён'}, {label}")
@@ -2845,7 +2864,7 @@ def show_error_log():
     print("Журнал очищен.")
 
 
-FW_VERSION = "1.2.1"
+FW_VERSION = "1.2.2"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
@@ -4894,7 +4913,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'd4cfc5125b081f3c5576583e94dba4891e179612bc8b5843804e634fc9d114a2' "$stage/update-fw.sh" \
-    '7a863ee4533ea02a242962df210c4c6d108898b2ffcb5df349f1f71e5e3ea6aa' "$stage/fw-menu" \
+    'b8fe11b9e3f18d9c3782f2e83cfeabd7fdc08201ec3f3c7641d2af531d7e0e09' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

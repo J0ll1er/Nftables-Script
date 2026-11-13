@@ -753,7 +753,11 @@ def print_box(title, text):
     for raw in text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n"):
         raw = raw.rstrip()
         plain = BOX_ANSI.sub("", raw)
-        if plain.startswith(BOX_HEADINGS) and len(plain) <= limit - 4:
+        if not plain and entries and entries[-1][0] == "rule":
+            continue
+        previous = next((item for item in reversed(entries) if item[0] == "rule" or item[1]), None)
+        if (plain.startswith(BOX_HEADINGS) and len(plain) <= limit - 4
+                and not (previous and previous[0] == "rule")):
             # Заголовок блока становится разделителем; пустая строка перед ним не нужна.
             while entries and entries[-1][0] == "line" and not entries[-1][1]:
                 entries.pop()

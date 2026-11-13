@@ -59,6 +59,13 @@ class Box(unittest.TestCase):
         self.assertNotEqual(lines[index - 1].strip("│ ").strip(), "")
         self.assertEqual(len({len(ANSI.sub("", line)) for line in lines}), 1)
 
+    def test_adjacent_headings_do_not_make_two_dividers(self):
+        lines = self.draw("Служба и таймер\nстрока\n\nЗагруженные правила (счётчики)\n\nСписки адресов (записей):\n  a")
+        dividers = [line for line in lines if line.startswith("├─ ")]
+        self.assertEqual(len(dividers), 1)
+        self.assertIn("Загруженные правила", dividers[0])
+        self.assertTrue(any("Списки адресов" in line and line.startswith("│") for line in lines))
+
 
 if __name__ == "__main__":
     unittest.main()

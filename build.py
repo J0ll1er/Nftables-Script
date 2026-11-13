@@ -734,17 +734,43 @@ def box_wrap(cells, width):
     return lines
 
 
+BOX_HEADINGS = (
+    "Проверка файлов и команд",
+    "Проверка reverse proxy",
+    "Профиль сервера",
+    "Служба и таймер",
+    "Загруженные правила",
+    "Списки адресов",
+    "Как проверяется каждое новое входящее подключение",
+    "Технический вид правил",
+)
+
+
 def print_box(title, text):
     columns = shutil.get_terminal_size((100, 24)).columns
     limit = max(30, columns - 4)
-    lines = []
+    entries = []
     for raw in text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n"):
-        lines.extend(box_wrap(box_cells(raw.rstrip()), limit))
-    inner = max([len(title) + 2] + [len(line) for line in lines])
-    top = "┌─ " + title + " " + "─" * (inner + 2 - len(title) - 3) + "┐"
-    print(top)
-    for line in lines:
-        print("│ " + box_render(line) + " " * (inner - len(line)) + " │")
+        raw = raw.rstrip()
+        plain = BOX_ANSI.sub("", raw)
+        if plain.startswith(BOX_HEADINGS) and len(plain) <= limit - 4:
+            # Заголовок блока становится разделителем; пустая строка перед ним не нужна.
+            while entries and entries[-1][0] == "line" and not entries[-1][1]:
+                entries.pop()
+            entries.append(("rule", plain) if entries else ("line", box_cells(raw)))
+            continue
+        for part in box_wrap(box_cells(raw), limit):
+            entries.append(("line", part))
+    if entries and entries[-1][0] == "rule":
+        # Разделитель без текста под ним не нужен: оставляем строку как обычную.
+        entries[-1] = ("line", box_cells(entries[-1][1]))
+    inner = max([len(title) + 2] + [len(item) + (4 if kind == "rule" else 0) for kind, item in entries])
+    print("┌─ " + title + " " + "─" * (inner + 2 - len(title) - 3) + "┐")
+    for kind, item in entries:
+        if kind == "rule":
+            print("├─ " + item + " " + "─" * (inner + 2 - len(item) - 3) + "┤")
+        else:
+            print("│ " + box_render(item) + " " * (inner - len(item)) + " │")
     print("└" + "─" * (inner + 2) + "┘")
 
 
@@ -1077,7 +1103,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 VERSIONS_CODE = r'''FW_VERSION = "@@VERSION@@"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")

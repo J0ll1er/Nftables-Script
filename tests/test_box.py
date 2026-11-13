@@ -45,6 +45,20 @@ class Box(unittest.TestCase):
         for line in body:
             self.assertIn("\x1b[0m", line)
 
+    def test_headings_become_dividers(self):
+        text = ("Проверка файлов и команд\n  OK a\n\nСлужба и таймер\nСлужба — загружена\n\n"
+                "Загруженные правила (счётчики)\n  строка")
+        lines = self.draw(text, columns=70)
+        self.assertTrue(lines[1].startswith("│ Проверка файлов и команд"))
+        dividers = [line for line in lines if line.startswith("├─ ")]
+        self.assertEqual(len(dividers), 2)
+        self.assertTrue(all(line.endswith("┤") for line in dividers))
+        self.assertTrue(dividers[0].startswith("├─ Служба и таймер "))
+        # пустая строка перед разделителем убрана
+        index = lines.index(dividers[0])
+        self.assertNotEqual(lines[index - 1].strip("│ ").strip(), "")
+        self.assertEqual(len({len(ANSI.sub("", line)) for line in lines}), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

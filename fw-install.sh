@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.2.0'
+FW_VERSION='1.2.1'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -1774,17 +1774,43 @@ def box_wrap(cells, width):
     return lines
 
 
+BOX_HEADINGS = (
+    "Проверка файлов и команд",
+    "Проверка reverse proxy",
+    "Профиль сервера",
+    "Служба и таймер",
+    "Загруженные правила",
+    "Списки адресов",
+    "Как проверяется каждое новое входящее подключение",
+    "Технический вид правил",
+)
+
+
 def print_box(title, text):
     columns = shutil.get_terminal_size((100, 24)).columns
     limit = max(30, columns - 4)
-    lines = []
+    entries = []
     for raw in text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n"):
-        lines.extend(box_wrap(box_cells(raw.rstrip()), limit))
-    inner = max([len(title) + 2] + [len(line) for line in lines])
-    top = "┌─ " + title + " " + "─" * (inner + 2 - len(title) - 3) + "┐"
-    print(top)
-    for line in lines:
-        print("│ " + box_render(line) + " " * (inner - len(line)) + " │")
+        raw = raw.rstrip()
+        plain = BOX_ANSI.sub("", raw)
+        if plain.startswith(BOX_HEADINGS) and len(plain) <= limit - 4:
+            # Заголовок блока становится разделителем; пустая строка перед ним не нужна.
+            while entries and entries[-1][0] == "line" and not entries[-1][1]:
+                entries.pop()
+            entries.append(("rule", plain) if entries else ("line", box_cells(raw)))
+            continue
+        for part in box_wrap(box_cells(raw), limit):
+            entries.append(("line", part))
+    if entries and entries[-1][0] == "rule":
+        # Разделитель без текста под ним не нужен: оставляем строку как обычную.
+        entries[-1] = ("line", box_cells(entries[-1][1]))
+    inner = max([len(title) + 2] + [len(item) + (4 if kind == "rule" else 0) for kind, item in entries])
+    print("┌─ " + title + " " + "─" * (inner + 2 - len(title) - 3) + "┐")
+    for kind, item in entries:
+        if kind == "rule":
+            print("├─ " + item + " " + "─" * (inner + 2 - len(item) - 3) + "┤")
+        else:
+            print("│ " + box_render(item) + " " * (inner - len(item)) + " │")
     print("└" + "─" * (inner + 2) + "┘")
 
 
@@ -2815,7 +2841,7 @@ def show_error_log():
     print("Журнал очищен.")
 
 
-FW_VERSION = "1.2.0"
+FW_VERSION = "1.2.1"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
@@ -4864,7 +4890,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'd4cfc5125b081f3c5576583e94dba4891e179612bc8b5843804e634fc9d114a2' "$stage/update-fw.sh" \
-    '2a1def7368bb3de0961d7267bbd8124197e2884e12e73ab0255555e8c5f6fa08' "$stage/fw-menu" \
+    'b4f181580c182b3532d930f41da18afb052e7190d107f3ff65857ba77463b4c4' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

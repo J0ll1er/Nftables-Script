@@ -2351,6 +2351,7 @@ def reverse_name(address):
 OWNER_CACHE_FILE = "owner-cache.json"
 OWNER_CACHE_DAYS = 30
 OWNER_CACHE_LIMIT = 500
+OWNER_TEXT_WIDTH = 40
 
 
 def fetch_ripe(address):
@@ -2429,10 +2430,16 @@ def lookup_owner(address):
         # название из записи блока (регистратор) точнее владельца AS: берём его, если оно есть
         name, country = parse_whois_owner(fetch_whois(address))
         holder, _, asn = owner.rpartition(" ")
+        if not name and len(owner) > OWNER_TEXT_WIDTH:
+            owner = holder[:max(8, OWNER_TEXT_WIDTH - len(asn) - 2)].rstrip(" ,-") + "… " + asn
         if name and name.isupper() and holder:
             name = holder  # «MSFT», «NET-V4-…»: технический код сети, понятнее название владельца AS
         if name:
-            owner = ", ".join(part for part in (name, country, asn) if part)
+            tail = ", ".join(part for part in (country, asn) if part)
+            room = OWNER_TEXT_WIDTH - len(tail) - 2
+            if len(name) > room:
+                name = name[:max(8, room - 1)].rstrip(" ,-") + "…"
+            owner = f"{name}, {tail}"
     if owner:
         cache[address] = [owner, now]
         fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list) and len(item[1]) == 2

@@ -285,6 +285,23 @@ class Lookup(unittest.TestCase):
             self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "Microsoft Corporation, GB, AS8075", technical)
             (Path(self.tmp.name) / "owner-cache.json").unlink(missing_ok=True)
 
+    def test_long_name_is_shortened_but_country_and_as_stay(self):
+        long = "LimitedNetwork-AS Limited Network LTD and sons of something"
+        self.menu.fetch_whois = lambda address: json.dumps(
+            {"data": {"records": [[{"key": "descr", "value": long}, {"key": "country", "value": "GB"}]]}})
+        owner = self.menu.lookup_owner("20.98.155.81")
+        self.assertTrue(owner.endswith(", GB, AS8075"), owner)
+        self.assertIn("…", owner)
+        self.assertLessEqual(len(owner), 40)
+
+    def test_long_as_holder_fallback_keeps_as_number(self):
+        long = "VERY-LONG-HOLDER - Очень длинное название владельца автономной системы Inc"
+        self.menu.fetch_ripe = lambda address: json.dumps({"data": {"asns": [{"asn": 64500, "holder": long}]}})
+        owner = self.menu.lookup_owner("20.98.155.81")
+        self.assertTrue(owner.endswith(" AS64500"), owner)
+        self.assertLessEqual(len(owner), 40)
+        self.assertIn("…", owner)
+
     def test_lowercase_netname_is_kept(self):
         self.menu.fetch_whois = lambda address: WHOIS_ANSWER
         self.assertTrue(self.menu.lookup_owner("172.110.223.81").startswith("dedires, HK"))

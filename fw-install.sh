@@ -2272,6 +2272,7 @@ def reverse_name(address):
 OWNER_CACHE_FILE = "owner-cache.json"
 OWNER_CACHE_DAYS = 30
 OWNER_CACHE_LIMIT = 500
+OWNER_TEXT_WIDTH = 40
 
 
 def fetch_ripe(address):
@@ -2350,10 +2351,16 @@ def lookup_owner(address):
         # название из записи блока (регистратор) точнее владельца AS: берём его, если оно есть
         name, country = parse_whois_owner(fetch_whois(address))
         holder, _, asn = owner.rpartition(" ")
+        if not name and len(owner) > OWNER_TEXT_WIDTH:
+            owner = holder[:max(8, OWNER_TEXT_WIDTH - len(asn) - 2)].rstrip(" ,-") + "… " + asn
         if name and name.isupper() and holder:
             name = holder  # «MSFT», «NET-V4-…»: технический код сети, понятнее название владельца AS
         if name:
-            owner = ", ".join(part for part in (name, country, asn) if part)
+            tail = ", ".join(part for part in (country, asn) if part)
+            room = OWNER_TEXT_WIDTH - len(tail) - 2
+            if len(name) > room:
+                name = name[:max(8, room - 1)].rstrip(" ,-") + "…"
+            owner = f"{name}, {tail}"
     if owner:
         cache[address] = [owner, now]
         fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list) and len(item[1]) == 2
@@ -5580,7 +5587,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '8f964e852248f101f014689da49e42410adbb871b66788d43d63c02c21d00147' "$stage/update-fw.sh" \
-    '47dc7be212f038a6274bd580fa36fdc29ede2c756093bf60abc6df93cc6f42a5' "$stage/fw-menu" \
+    '1f268ebeae72799431300e50f24c358648cb26370a8b7c5d72ef8184fda2adf7' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

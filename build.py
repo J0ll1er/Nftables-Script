@@ -2428,8 +2428,11 @@ def lookup_owner(address):
     if owner:
         # название из записи блока (регистратор) точнее владельца AS: берём его, если оно есть
         name, country = parse_whois_owner(fetch_whois(address))
+        holder, _, asn = owner.rpartition(" ")
+        if name and name.isupper() and holder:
+            name = holder  # «MSFT», «NET-V4-…»: технический код сети, понятнее название владельца AS
         if name:
-            owner = ", ".join(part for part in (name, country, owner.rpartition(" ")[2]) if part)
+            owner = ", ".join(part for part in (name, country, asn) if part)
     if owner:
         cache[address] = [owner, now]
         fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list) and len(item[1]) == 2

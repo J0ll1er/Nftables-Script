@@ -277,6 +277,18 @@ class Lookup(unittest.TestCase):
         self.menu.fetch_whois = lambda address: WHOIS_ANSWER
         self.assertEqual(self.menu.lookup_owner("172.110.223.81"), "dedires, HK, AS8075")
 
+    def test_technical_uppercase_netname_is_replaced_by_as_holder(self):
+        for technical in ("MSFT", "NET-V4-192-248-128-0-18", "NO-BLIXCUST10463"):
+            answer = json.dumps({"data": {"records": [[{"key": "netname", "value": technical},
+                                                       {"key": "country", "value": "GB"}]]}})
+            self.menu.fetch_whois = lambda address, answer=answer: answer
+            self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "Microsoft Corporation, GB, AS8075", technical)
+            (Path(self.tmp.name) / "owner-cache.json").unlink(missing_ok=True)
+
+    def test_lowercase_netname_is_kept(self):
+        self.menu.fetch_whois = lambda address: WHOIS_ANSWER
+        self.assertTrue(self.menu.lookup_owner("172.110.223.81").startswith("dedires, HK"))
+
     def test_owner_without_whois_falls_back_to_as_holder(self):
         self.assertEqual(self.menu.lookup_owner("172.110.223.81"), "Microsoft Corporation AS8075")
 

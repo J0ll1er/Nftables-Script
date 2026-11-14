@@ -2349,8 +2349,11 @@ def lookup_owner(address):
     if owner:
         # название из записи блока (регистратор) точнее владельца AS: берём его, если оно есть
         name, country = parse_whois_owner(fetch_whois(address))
+        holder, _, asn = owner.rpartition(" ")
+        if name and name.isupper() and holder:
+            name = holder  # «MSFT», «NET-V4-…»: технический код сети, понятнее название владельца AS
         if name:
-            owner = ", ".join(part for part in (name, country, owner.rpartition(" ")[2]) if part)
+            owner = ", ".join(part for part in (name, country, asn) if part)
     if owner:
         cache[address] = [owner, now]
         fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list) and len(item[1]) == 2
@@ -5577,7 +5580,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '8f964e852248f101f014689da49e42410adbb871b66788d43d63c02c21d00147' "$stage/update-fw.sh" \
-    '5cca93a4f3409ad75e314f3975040cf7c70d79d30dae8ff04d1e40ef31210785' "$stage/fw-menu" \
+    '47dc7be212f038a6274bd580fa36fdc29ede2c756093bf60abc6df93cc6f42a5' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

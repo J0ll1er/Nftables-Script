@@ -2395,6 +2395,9 @@ def parse_whois_owner(text):
             fields.setdefault(str(item["key"]).lower(), str(item["value"]).strip())
     except (ValueError, KeyError, IndexError, TypeError):
         return "", ""
+    # В descr у RIPE часто стоит адрес улицы («11 Hanbury St»): такое не берём, остаётся netname.
+    if fields.get("descr", " ")[:1].isdigit():
+        fields.pop("descr")
     name = next((fields[key] for key in ("descr", "orgname", "owner", "netname") if fields.get(key)), "")
     return name, fields.get("country", "")
 

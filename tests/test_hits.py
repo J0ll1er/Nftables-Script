@@ -264,6 +264,11 @@ class Lookup(unittest.TestCase):
                 {"key": "descr", "value": "Blix Solutions AS"}, {"key": "descr", "value": "второе"}]]}})
         self.assertEqual(self.menu.parse_whois_owner(descr), ("Blix Solutions AS", ""))
 
+    def test_parse_whois_skips_street_address_in_descr(self):
+        text = json.dumps({"data": {"records": [[{"key": "netname", "value": "CHOOPA-NET"},
+                {"key": "descr", "value": "11 Hanbury St"}, {"key": "country", "value": "GB"}]]}})
+        self.assertEqual(self.menu.parse_whois_owner(text), ("CHOOPA-NET", "GB"))
+
     def test_parse_whois_bad_answers(self):
         for bad in ("", "x", "{}", '{"data": {"records": []}}', '{"data": {"records": [[]]}}'):
             self.assertEqual(self.menu.parse_whois_owner(bad), ("", ""), bad)

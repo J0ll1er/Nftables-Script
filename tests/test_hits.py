@@ -434,6 +434,55 @@ class Lookup(unittest.TestCase):
         self.assertNotIn("dns.example.com", out.getvalue())
 
 
+class Carry(unittest.TestCase):
+    """Перенос накопленного: разбор вывода `nft list set` в update-fw.sh (shell-функция stat_elements)."""
+
+    @classmethod
+    def setUpClass(cls):
+        upd = (ROOT / "build" / "update-fw.sh").read_text()
+        match = re.search(r"^stat_elements\(\) \{\n.*?^\}\n", upd, re.S | re.M)
+        cls.func = match.group(0) if match else ""
+
+    def run_func(self, text):
+        self.assertTrue(self.func, "функция stat_elements не найдена")
+        result = subprocess.run(["bash", "-c", self.func + "\nstat_elements"], input=text, text=True,
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    def test_keeps_elements_with_and_without_timeout_word(self):
+        # вывод с вашего сервера: у новых записей между bytes и expires стоит «timeout 7d»
+        text = """table inet fw {
+	set ss4 {
+		elements = { 216.25.89.89 . 2083 counter packets 1 bytes 44 timeout 7d expires 6d23h59m30s725ms,
+			     216.25.89.83 . 8020 counter packets 0 bytes 0 expires 6d23h17m33s386ms,
+			     147.185.133.16 . 9335 counter packets 7 bytes 308 timeout 7d expires 6d23h59m15s143ms }
+	}
+}
+"""
+        self.assertEqual(self.run_func(text), [
+            "216.25.89.89 . 2083 counter packets 1 bytes 44 expires 6d23h59m30s725ms",
+            "216.25.89.83 . 8020 counter packets 0 bytes 0 expires 6d23h17m33s386ms",
+            "147.185.133.16 . 9335 counter packets 7 bytes 308 expires 6d23h59m15s143ms"])
+
+    def test_ipv6_and_garbage(self):
+        text = "elements = { 2001:db8::1 . 80 counter packets 3 bytes 180 timeout 7d expires 1d2h }\nError: no such set\n"
+        self.assertEqual(self.run_func(text), ["2001:db8::1 . 80 counter packets 3 bytes 180 expires 1d2h"])
+        self.assertEqual(self.run_func(""), [])
+
+    def test_restored_elements_are_accepted_by_nft(self):
+        if not shutil.which("nft"):
+            self.skipTest("нет nft")
+        lines = self.run_func("elements = { 1.2.3.4 . 443 counter packets 5 bytes 220 timeout 7d expires 6d1h }")
+        table = ("table inet fwt {\n set ss4 { type ipv4_addr . inet_service; size 4096; flags dynamic,timeout;"
+                 " timeout 7d; counter;\n  elements = { " + ", ".join(lines) + " } }\n}\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.nft"
+            path.write_text(table)
+            result = subprocess.run(["nft", "-c", "-f", str(path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class Rules(unittest.TestCase):
     """Что update-fw.sh кладёт в правила."""
 

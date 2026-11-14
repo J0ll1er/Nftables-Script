@@ -2168,6 +2168,12 @@ upd = replace_once(upd, '''P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
   echo "add table inet fw"
 ''', r'''P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
 # Статистика «Кто стучится»: наборы со счётчиками по паре «адрес + порт».
+# stat_elements: из вывода `nft list set` берёт записи для переноса. У разных версий nft между
+# счётчиком и сроком может стоять «timeout 7d»; в перенос оно не нужно (срок задаёт сам набор).
+stat_elements() {
+  grep -oE '[0-9a-fA-F:.]+ \. [0-9]+ counter packets [0-9]+ bytes [0-9]+( timeout [0-9a-z]+)? expires [0-9a-z]+' \
+    | sed -E 's/ timeout [0-9a-z]+//' | head -n 4096
+}
 stat_set() {
   echo "  set $1 { type $2 . inet_service; size 4096; flags dynamic,timeout; timeout 7d; counter;"
   [ -s "$TMP/stats.$1" ] && echo "    elements = { $(paste -sd, "$TMP/stats.$1") }"
@@ -2205,9 +2211,7 @@ upd = replace_once(upd, '''} > "$TMP/new.nft"
 STATS=1
 for stat in ss4 ss6 sn4 sn6; do
   : > "$TMP/stats.$stat"
-  nft -n list set inet fw "$stat" 2>/dev/null \
-    | grep -oE '[0-9a-fA-F:.]+ \. [0-9]+ counter packets [0-9]+ bytes [0-9]+ expires [0-9a-z]+' \
-    | head -n 4096 > "$TMP/stats.$stat" || true
+  nft -n list set inet fw "$stat" 2>/dev/null | stat_elements > "$TMP/stats.$stat" || true
 done
 emit_rules > "$TMP/new.nft"
 if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then

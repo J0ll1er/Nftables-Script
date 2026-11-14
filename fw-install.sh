@@ -820,6 +820,12 @@ fi
 set_def() { echo "  set $1 { type $2; flags interval; auto-merge;"; [ -s "$3" ] && echo "    elements = { $(paste -sd, "$3") }"; echo "  }"; }
 P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
 # Статистика «Кто стучится»: наборы со счётчиками по паре «адрес + порт».
+# stat_elements: из вывода `nft list set` берёт записи для переноса. У разных версий nft между
+# счётчиком и сроком может стоять «timeout 7d»; в перенос оно не нужно (срок задаёт сам набор).
+stat_elements() {
+  grep -oE '[0-9a-fA-F:.]+ \. [0-9]+ counter packets [0-9]+ bytes [0-9]+( timeout [0-9a-z]+)? expires [0-9a-z]+' \
+    | sed -E 's/ timeout [0-9a-z]+//' | head -n 4096
+}
 stat_set() {
   echo "  set $1 { type $2 . inet_service; size 4096; flags dynamic,timeout; timeout 7d; counter;"
   [ -s "$TMP/stats.$1" ] && echo "    elements = { $(paste -sd, "$TMP/stats.$1") }"
@@ -886,9 +892,7 @@ emit_rules() {
 STATS=1
 for stat in ss4 ss6 sn4 sn6; do
   : > "$TMP/stats.$stat"
-  nft -n list set inet fw "$stat" 2>/dev/null \
-    | grep -oE '[0-9a-fA-F:.]+ \. [0-9]+ counter packets [0-9]+ bytes [0-9]+ expires [0-9a-z]+' \
-    | head -n 4096 > "$TMP/stats.$stat" || true
+  nft -n list set inet fw "$stat" 2>/dev/null | stat_elements > "$TMP/stats.$stat" || true
 done
 emit_rules > "$TMP/new.nft"
 if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
@@ -5618,7 +5622,7 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    '8f964e852248f101f014689da49e42410adbb871b66788d43d63c02c21d00147' "$stage/update-fw.sh" \
+    'dd6bcea69843dd28ee07b899414b118f58d09b2b9cd4595fd92b2bb54ea5882b' "$stage/update-fw.sh" \
     'd0653cb1259cc8685cfc4a53d1ebdca70e4fecdae2822e7ccfcae167353a252e' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2

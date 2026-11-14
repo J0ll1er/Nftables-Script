@@ -79,7 +79,7 @@ DRY=0; [ "${1:-}" = "--dry" ] && DRY=1
 PENDING=${FW_PENDING:-0}; [ "$PENDING" = 0 ] || [ "$PENDING" = 1 ] || exit 2
 MODE=apply; [ "$DRY" = 1 ] && MODE=dry
 ERRLOG=$DIR/errors.log
-# note "WARN: …" или "ERR: …": в stderr и в журнал ошибок (fw-menu → 1 → «Журнал ошибок»).
+# note "WARN: …" или "ERR: …": в stderr и в журнал ошибок (fw-menu → 1 → 3 «Журнал ошибок»).
 logline() { printf '%s %s %s\n' "$(date '+%F %T')" "$MODE" "$1" >> "$ERRLOG" 2>/dev/null || true; }
 WARN_LOG=$(mktemp) || WARN_LOG=/dev/null
 trap 'rm -f "$WARN_LOG"' EXIT
@@ -819,7 +819,13 @@ fi
 # 5. Сборка nft
 set_def() { echo "  set $1 { type $2; flags interval; auto-merge;"; [ -s "$3" ] && echo "    elements = { $(paste -sd, "$3") }"; echo "  }"; }
 P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
-{
+# Статистика «Кто стучится»: наборы со счётчиками по паре «адрес + порт».
+stat_set() {
+  echo "  set $1 { type $2 . inet_service; size 4096; flags dynamic,timeout; timeout 7d; counter;"
+  [ -s "$TMP/stats.$1" ] && echo "    elements = { $(paste -sd, "$TMP/stats.$1") }"
+  echo "  }"
+}
+emit_rules() {
   echo "add table inet fw"
   echo "delete table inet fw"
   echo "table inet fw {"
@@ -829,6 +835,9 @@ P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
   set_def sc4 ipv4_addr "$TMP/sc4"; set_def sc6 ipv6_addr "$TMP/sc6"
   set_def ru4 ipv4_addr "$TMP/ru4"; set_def ru6 ipv6_addr "$TMP/ru6"
   set_def ap4 ipv4_addr "$TMP/ap4"; set_def ap6 ipv6_addr "$TMP/ap6"
+  if [ "$STATS" = 1 ]; then
+    stat_set ss4 ipv4_addr; stat_set ss6 ipv6_addr; stat_set sn4 ipv4_addr; stat_set sn6 ipv6_addr
+  fi
   echo "  chain input {"
   if [ "$HOOK" = prerouting ]; then
     # Для портов, опубликованных из Docker-контейнера в bridge-сети: такой
@@ -856,13 +865,40 @@ P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
   echo "    ip6 saddr @tr6 accept"
   echo "    ip saddr @lan4 accept comment \"LAN_ALLOW\""
   echo "    ip6 saddr @lan6 accept comment \"LAN_ALLOW\""
+  if [ "$STATS" = 1 ]; then
+    echo "    meta l4proto { tcp, udp } ip saddr @sc4 add @ss4 { ip saddr . th dport }"
+    echo "    meta l4proto { tcp, udp } ip6 saddr @sc6 add @ss6 { ip6 saddr . th dport }"
+  fi
   echo "    ip saddr @sc4 counter drop comment \"scanners\""
   echo "    ip6 saddr @sc6 counter drop comment \"scanners\""
+  if [ "$STATS" = 1 ]; then
+    echo "    meta l4proto { tcp, udp } th dport $P ip saddr != @ru4 add @sn4 { ip saddr . th dport }"
+    echo "    meta l4proto { tcp, udp } th dport $P ip6 saddr != @ru6 add @sn6 { ip6 saddr . th dport }"
+  fi
   echo "    meta l4proto { tcp, udp } th dport $P ip saddr != @ru4 counter drop comment \"non-RU\""
   echo "    meta l4proto { tcp, udp } th dport $P ip6 saddr != @ru6 counter drop comment \"non-RU\""
   echo "  }"
   echo "}"
-} > "$TMP/new.nft"
+}
+# Накопленную статистику переносим из действующей таблицы. Если что-то не
+# принялось, сначала собираем без перенесённых записей, затем без статистики:
+# правила важнее неё и всегда применяются.
+STATS=1
+for stat in ss4 ss6 sn4 sn6; do
+  : > "$TMP/stats.$stat"
+  nft -n list set inet fw "$stat" 2>/dev/null \
+    | grep -oE '[0-9a-fA-F:.]+ \. [0-9]+ counter packets [0-9]+ bytes [0-9]+ expires [0-9a-z]+' \
+    | head -n 4096 > "$TMP/stats.$stat" || true
+done
+emit_rules > "$TMP/new.nft"
+if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
+  for stat in ss4 ss6 sn4 sn6; do : > "$TMP/stats.$stat"; done
+  emit_rules > "$TMP/new.nft"
+  if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
+    STATS=0
+    emit_rules > "$TMP/new.nft"
+  fi
+fi
 
 nft -c -f "$TMP/new.nft" || fail_keep "nft -c не прошёл"
 echo "RU v4/v6: $(wc -l < "$TMP/ru4")/$(wc -l < "$TMP/ru6") | сканеры v4/v6: $(wc -l < "$TMP/sc4")/$(wc -l < "$TMP/sc6") | trusted: $(cat "$TMP/tr4" "$TMP/tr6" | wc -l) | API: ${API_PORTS:-off} <- $(cat "$TMP/ap4" "$TMP/ap6" | wc -l) адр. | списков $ok/${#SCAN_FILES[@]} (своих $custom_total) | из кэша $cached | ASN $asn_total, из кэша $asn_cached | без данных $missing"
@@ -1884,6 +1920,8 @@ def explain_rules(items):
         rule = item.get("rule")
         if not rule or rule.get("chain") != "input":
             continue
+        if any("set" in expression for expression in rule.get("expr", [])):
+            continue  # служебная строка статистики «Кто стучится», не правило отбора
         kind = rule_kind(rule)
         packets, size = rule_counter(rule)
         if groups and groups[-1]["kind"] == kind and kind in {"api_lock", "api_allow", "trusted", "lan", "scanners", "non_ru", "other"}:
@@ -2101,6 +2139,88 @@ def boxed(title, function, headings=()):
             finish()
     wrapper.__wrapped__ = function
     return wrapper
+
+
+HIT_SETS = (("scanners", "ss4"), ("scanners", "ss6"), ("non_ru", "sn4"), ("non_ru", "sn6"))
+HIT_RE = re.compile(r"([0-9a-fA-F:.]+) \. (\d+) counter packets (\d+) bytes (\d+)")
+PORT_NAMES = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "почта (SMTP)", 53: "DNS", 80: "HTTP", 110: "почта (POP3)",
+    143: "почта (IMAP)", 443: "HTTPS", 445: "SMB, общие папки Windows", 587: "почта (SMTP)",
+    993: "почта (IMAPS)", 1433: "MS SQL", 1521: "Oracle", 1723: "PPTP VPN", 2375: "Docker без защиты",
+    3306: "MySQL", 3389: "RDP, удалённый рабочий стол", 5060: "SIP, телефония", 5432: "PostgreSQL",
+    5900: "VNC, удалённый экран", 6379: "Redis", 8080: "HTTP (запасной)", 8443: "HTTPS (запасной)",
+    9200: "Elasticsearch", 11211: "Memcached", 27017: "MongoDB",
+}
+
+
+def parse_hits(text):
+    """Строки «адрес . порт counter packets N bytes M» из вывода `nft list set`."""
+    return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
+
+
+def summarize_hits(rows, top=5):
+    by_port, by_source, ports_of = {}, {}, {}
+    for address, port, packets, _size in rows:
+        by_port[port] = by_port.get(port, 0) + packets
+        by_source[address] = by_source.get(address, 0) + packets
+        ports_of.setdefault(address, set()).add(port)
+    ports = sorted(by_port.items(), key=lambda item: (-item[1], item[0]))[:top]
+    sources = sorted(by_source.items(), key=lambda item: (-item[1], item[0]))[:top]
+    return {"packets": sum(by_port.values()), "sources": len(by_source), "ports": ports,
+            "top_sources": [(address, packets, len(ports_of[address])) for address, packets in sources]}
+
+
+def port_label(port):
+    return PORT_NAMES.get(port, "")
+
+
+def hits_bar(value, maximum, width=16):
+    if maximum <= 0 or value <= 0:
+        filled = 0
+    else:
+        filled = max(1, round(width * value / maximum))
+    return "█" * filled + "░" * (width - filled)
+
+
+HITS_HEADINGS = ("Сканеры и сети ведомств", "Не из России", "Что здесь не видно")
+
+
+def show_hits():
+    print("\nКто стучится: пакеты, отброшенные файрволом (счёт ведётся с включения статистики, хранится до 7 дней)")
+    groups = (("scanners", "Сканеры и сети ведомств (все порты)"),
+              ("non_ru", "Не из России на защищённых портах"))
+    collected = {"scanners": [], "non_ru": []}
+    seen = False
+    for kind, name in HIT_SETS:
+        text = probe_output("nft", "-n", "list", "set", "inet", "fw", name)
+        if text:
+            seen = True
+            collected[kind].extend(parse_hits(text))
+    if not seen:
+        print("\nСтатистика не ведётся: правила загружены без неё (старая версия nft или ядра) или ещё не обновлены.")
+        print("Примените правила заново: «Проверить и применить правила» → «Применить правила и включить таймер».")
+        return
+    if not any(collected.values()):
+        print("\nПока никого: статистика включена, но отброшенных пакетов ещё нет. Загляните позже.")
+    for kind, title in groups:
+        rows = collected[kind]
+        if not rows:
+            continue
+        summary = summarize_hits(rows)
+        print(f"\n{title}")
+        print(f"Всего пакетов: {summary['packets']}, разных адресов: {summary['sources']}")
+        print("Куда стучатся (порты):")
+        biggest = summary["ports"][0][1]
+        for port, packets in summary["ports"]:
+            label = port_label(port)
+            print(f"  {port:>5}  {hits_bar(packets, biggest)}  {packets:>6}" + (f"  {label}" if label else ""))
+        print("Кто стучится (адреса):")
+        biggest = summary["top_sources"][0][1]
+        for address, packets, count in summary["top_sources"]:
+            print(f"  {address:<39} {hits_bar(packets, biggest, 10)} {packets:>6}  портов: {count}")
+    print("\nЧто здесь не видно")
+    print("Порт SSH файрвол не фильтрует, поэтому попытки входа по SSH сюда не попадают (смотрите журнал sshd).")
+    print("Считаются пакеты, а не подключения: сканер может прислать их несколько на один порт.")
 
 
 def show_status():
@@ -3496,6 +3616,7 @@ def main():
     entries = (
         ("Статус и наблюдение", (
             ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),
+            ("Кто стучится", boxed("Кто стучится", show_hits, HITS_HEADINGS)),
             ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),
             ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),
         )),
@@ -5265,8 +5386,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    '26891de4bba0d8c72bd78d65012cdc10b8bad29dd21598369dcb93cdb65b3232' "$stage/update-fw.sh" \
-    'f4af71bcff40f8235ab9fcdd8aeffee41a23da96a3753e47f6f685ed220900df' "$stage/fw-menu" \
+    '8f964e852248f101f014689da49e42410adbb871b66788d43d63c02c21d00147' "$stage/update-fw.sh" \
+    'a786dc9b7bd5d1d7fdc416852344b2f534eac46082c1ec0b073bf014912f5b5c' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

@@ -62,7 +62,7 @@ upd = replace_once(
     'fail_save() { echo "ERR: правила применены, но $1" >&2; exit 1; }\n',
     'MODE=apply; [ "$DRY" = 1 ] && MODE=dry\n'
     'ERRLOG=$DIR/errors.log\n'
-    '# note "WARN: …" или "ERR: …": в stderr и в журнал ошибок (fw-menu → 1 → «Журнал ошибок»).\n'
+    '# note "WARN: …" или "ERR: …": в stderr и в журнал ошибок (fw-menu → 1 → 3 «Журнал ошибок»).\n'
     'logline() { printf \'%s %s %s\\n\' "$(date \'+%F %T\')" "$MODE" "$1" >> "$ERRLOG" 2>/dev/null || true; }\n'
     'note() { echo "$1" >&2; logline "$1"; }\n'
     'fail_keep() { note "ERR: $1 — правила не тронуты"; exit 1; }\n'
@@ -2118,6 +2118,7 @@ OLD_ENTRIES_HEAD = '    entries = (\n        ("Статус файрвола", b
 NEW_ENTRIES_HEAD = (
     '    entries = (\n        ("Статус и наблюдение", (\n'
     '            ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),\n'
+    '            ("Кто стучится", boxed("Кто стучится", show_hits, HITS_HEADINGS)),\n'
     '            ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),\n'
     '            ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),\n'
     '        )),\n')
@@ -2155,6 +2156,162 @@ NEW_TAIL = """        ("Версии и обновление скрипта", (
     try:
         show_menu("""
 menu = replace_once(menu, OLD_TAIL, NEW_TAIL, "порядок пунктов и заголовок")
+
+# ------------------------------------------------------ «Кто стучится» (1.6.0)
+# Статистика: динамические наборы nft ss4/ss6 (сканеры) и sn4/sn6 (не из России
+# на защищённых портах) считают пакеты по паре «адрес + порт». Правила drop не
+# меняются: перед ними добавлена отдельная строка без вердикта. Накопленное
+# переносится в новую таблицу при каждом обновлении; если nft или ядро не умеют
+# такие наборы, правила собираются как раньше, без статистики.
+upd = replace_once(upd, '''P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
+{
+  echo "add table inet fw"
+''', r'''P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
+# Статистика «Кто стучится»: наборы со счётчиками по паре «адрес + порт».
+stat_set() {
+  echo "  set $1 { type $2 . inet_service; size 4096; flags dynamic,timeout; timeout 7d; counter;"
+  [ -s "$TMP/stats.$1" ] && echo "    elements = { $(paste -sd, "$TMP/stats.$1") }"
+  echo "  }"
+}
+emit_rules() {
+  echo "add table inet fw"
+''', "статистика: начало сборки")
+upd = replace_once(upd, '''  set_def ap4 ipv4_addr "$TMP/ap4"; set_def ap6 ipv6_addr "$TMP/ap6"
+''', r'''  set_def ap4 ipv4_addr "$TMP/ap4"; set_def ap6 ipv6_addr "$TMP/ap6"
+  if [ "$STATS" = 1 ]; then
+    stat_set ss4 ipv4_addr; stat_set ss6 ipv6_addr; stat_set sn4 ipv4_addr; stat_set sn6 ipv6_addr
+  fi
+''', "статистика: наборы")
+upd = replace_once(upd, r'''  echo "    ip saddr @sc4 counter drop comment \"scanners\""
+  echo "    ip6 saddr @sc6 counter drop comment \"scanners\""
+  echo "    meta l4proto { tcp, udp } th dport $P ip saddr != @ru4 counter drop comment \"non-RU\""
+''', r'''  if [ "$STATS" = 1 ]; then
+    echo "    meta l4proto { tcp, udp } ip saddr @sc4 add @ss4 { ip saddr . th dport }"
+    echo "    meta l4proto { tcp, udp } ip6 saddr @sc6 add @ss6 { ip6 saddr . th dport }"
+  fi
+  echo "    ip saddr @sc4 counter drop comment \"scanners\""
+  echo "    ip6 saddr @sc6 counter drop comment \"scanners\""
+  if [ "$STATS" = 1 ]; then
+    echo "    meta l4proto { tcp, udp } th dport $P ip saddr != @ru4 add @sn4 { ip saddr . th dport }"
+    echo "    meta l4proto { tcp, udp } th dport $P ip6 saddr != @ru6 add @sn6 { ip6 saddr . th dport }"
+  fi
+  echo "    meta l4proto { tcp, udp } th dport $P ip saddr != @ru4 counter drop comment \"non-RU\""
+''', "статистика: правила")
+upd = replace_once(upd, '''} > "$TMP/new.nft"
+''', r'''}
+# Накопленную статистику переносим из действующей таблицы. Если что-то не
+# принялось, сначала собираем без перенесённых записей, затем без статистики:
+# правила важнее неё и всегда применяются.
+STATS=1
+for stat in ss4 ss6 sn4 sn6; do
+  : > "$TMP/stats.$stat"
+  nft -n list set inet fw "$stat" 2>/dev/null \
+    | grep -oE '[0-9a-fA-F:.]+ \. [0-9]+ counter packets [0-9]+ bytes [0-9]+ expires [0-9a-z]+' \
+    | head -n 4096 > "$TMP/stats.$stat" || true
+done
+emit_rules > "$TMP/new.nft"
+if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
+  for stat in ss4 ss6 sn4 sn6; do : > "$TMP/stats.$stat"; done
+  emit_rules > "$TMP/new.nft"
+  if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
+    STATS=0
+    emit_rules > "$TMP/new.nft"
+  fi
+fi
+''', "статистика: сборка и откат")
+
+menu = replace_once(menu, "def show_status():\n", r'''HIT_SETS = (("scanners", "ss4"), ("scanners", "ss6"), ("non_ru", "sn4"), ("non_ru", "sn6"))
+HIT_RE = re.compile(r"([0-9a-fA-F:.]+) \. (\d+) counter packets (\d+) bytes (\d+)")
+PORT_NAMES = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "почта (SMTP)", 53: "DNS", 80: "HTTP", 110: "почта (POP3)",
+    143: "почта (IMAP)", 443: "HTTPS", 445: "SMB, общие папки Windows", 587: "почта (SMTP)",
+    993: "почта (IMAPS)", 1433: "MS SQL", 1521: "Oracle", 1723: "PPTP VPN", 2375: "Docker без защиты",
+    3306: "MySQL", 3389: "RDP, удалённый рабочий стол", 5060: "SIP, телефония", 5432: "PostgreSQL",
+    5900: "VNC, удалённый экран", 6379: "Redis", 8080: "HTTP (запасной)", 8443: "HTTPS (запасной)",
+    9200: "Elasticsearch", 11211: "Memcached", 27017: "MongoDB",
+}
+
+
+def parse_hits(text):
+    """Строки «адрес . порт counter packets N bytes M» из вывода `nft list set`."""
+    return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
+
+
+def summarize_hits(rows, top=5):
+    by_port, by_source, ports_of = {}, {}, {}
+    for address, port, packets, _size in rows:
+        by_port[port] = by_port.get(port, 0) + packets
+        by_source[address] = by_source.get(address, 0) + packets
+        ports_of.setdefault(address, set()).add(port)
+    ports = sorted(by_port.items(), key=lambda item: (-item[1], item[0]))[:top]
+    sources = sorted(by_source.items(), key=lambda item: (-item[1], item[0]))[:top]
+    return {"packets": sum(by_port.values()), "sources": len(by_source), "ports": ports,
+            "top_sources": [(address, packets, len(ports_of[address])) for address, packets in sources]}
+
+
+def port_label(port):
+    return PORT_NAMES.get(port, "")
+
+
+def hits_bar(value, maximum, width=16):
+    if maximum <= 0 or value <= 0:
+        filled = 0
+    else:
+        filled = max(1, round(width * value / maximum))
+    return "█" * filled + "░" * (width - filled)
+
+
+HITS_HEADINGS = ("Сканеры и сети ведомств", "Не из России", "Что здесь не видно")
+
+
+def show_hits():
+    print("\nКто стучится: пакеты, отброшенные файрволом (счёт ведётся с включения статистики, хранится до 7 дней)")
+    groups = (("scanners", "Сканеры и сети ведомств (все порты)"),
+              ("non_ru", "Не из России на защищённых портах"))
+    collected = {"scanners": [], "non_ru": []}
+    seen = False
+    for kind, name in HIT_SETS:
+        text = probe_output("nft", "-n", "list", "set", "inet", "fw", name)
+        if text:
+            seen = True
+            collected[kind].extend(parse_hits(text))
+    if not seen:
+        print("\nСтатистика не ведётся: правила загружены без неё (старая версия nft или ядра) или ещё не обновлены.")
+        print("Примените правила заново: «Проверить и применить правила» → «Применить правила и включить таймер».")
+        return
+    if not any(collected.values()):
+        print("\nПока никого: статистика включена, но отброшенных пакетов ещё нет. Загляните позже.")
+    for kind, title in groups:
+        rows = collected[kind]
+        if not rows:
+            continue
+        summary = summarize_hits(rows)
+        print(f"\n{title}")
+        print(f"Всего пакетов: {summary['packets']}, разных адресов: {summary['sources']}")
+        print("Куда стучатся (порты):")
+        biggest = summary["ports"][0][1]
+        for port, packets in summary["ports"]:
+            label = port_label(port)
+            print(f"  {port:>5}  {hits_bar(packets, biggest)}  {packets:>6}" + (f"  {label}" if label else ""))
+        print("Кто стучится (адреса):")
+        biggest = summary["top_sources"][0][1]
+        for address, packets, count in summary["top_sources"]:
+            print(f"  {address:<39} {hits_bar(packets, biggest, 10)} {packets:>6}  портов: {count}")
+    print("\nЧто здесь не видно")
+    print("Порт SSH файрвол не фильтрует, поэтому попытки входа по SSH сюда не попадают (смотрите журнал sshd).")
+    print("Считаются пакеты, а не подключения: сканер может прислать их несколько на один порт.")
+
+
+''' + "def show_status():\n", "функции «Кто стучится»")
+menu = replace_once(menu, """        rule = item.get("rule")
+        if not rule or rule.get("chain") != "input":
+            continue
+""", """        rule = item.get("rule")
+        if not rule or rule.get("chain") != "input":
+            continue
+        if any("set" in expression for expression in rule.get("expr", [])):
+            continue  # служебная строка статистики «Кто стучится», не правило отбора
+""", "статус: скрыть строки статистики")
 
 # ---------------------------------------------------------------- сборка
 new_text = text

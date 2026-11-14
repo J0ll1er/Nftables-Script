@@ -151,6 +151,72 @@ class Hits(unittest.TestCase):
         self.assertIn('("Кто стучится", boxed("Кто стучится", show_hits', source)
 
 
+class Owners(unittest.TestCase):
+    def setUp(self):
+        self.menu = importlib.util.module_from_spec(SPEC)
+        LOADER.exec_module(self.menu)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.menu.DIRECTORY = Path(self.tmp.name)
+        cache = Path(self.tmp.name) / "scanner-cache"
+        cache.mkdir()
+        (cache / "censys_v4.txt").write_text("162.216.149.0/24\n198.51.100.0/24\n")
+        (cache / "paloaltonetworks_v4.txt").write_text("# c\n147.185.132.0/24\n")
+        (cache / "skipa_cidr.txt").write_text("198.51.100.0/24\nмусор\n")
+        (cache / "custom_ab12cd34_my.txt").write_text("203.0.113.0/24\n")
+        (Path(self.tmp.name) / "asn_AS12345.cache").write_text("192.0.2.0/24\n")
+        (Path(self.tmp.name) / "extra.txt").write_text("192.0.3.5\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_labels_of_known_files(self):
+        label = self.menu.source_label
+        self.assertEqual(label("censys_v4.txt"), "Censys")
+        self.assertEqual(label("shodan_v4.txt"), "Shodan")
+        self.assertEqual(label("paloaltonetworks_v4.txt"), "Palo Alto Networks")
+        self.assertEqual(label("skipa_cidr.txt"), "СКИПА")
+        self.assertEqual(label("custom_ab12cd34_my.txt"), "свой список")
+        self.assertEqual(label("asn_AS12345.cache"), "AS12345")
+        self.assertEqual(label("extra.txt"), "ваш список")
+
+    def test_owner_found_by_lists(self):
+        sources = self.menu.load_scanner_sources()
+        owner = self.menu.owner_of
+        self.assertEqual(owner("162.216.149.179", sources), "Censys")
+        self.assertEqual(owner("147.185.132.72", sources), "Palo Alto Networks")
+        self.assertEqual(owner("198.51.100.9", sources), "Censys, СКИПА")
+        self.assertEqual(owner("192.0.2.77", sources), "AS12345")
+        self.assertEqual(owner("192.0.3.5", sources), "ваш список")
+        self.assertEqual(owner("8.8.8.8", sources), "")
+        self.assertEqual(owner("2001:db8::1", sources), "")
+
+    def test_sources_survive_missing_directory(self):
+        self.menu.DIRECTORY = Path(self.tmp.name) / "нет"
+        self.assertEqual(self.menu.load_scanner_sources(), [])
+
+    def test_short_host(self):
+        short = self.menu.short_host
+        self.assertEqual(short("ec2-1-2-3-4.compute-1.amazonaws.com"), "amazonaws.com")
+        self.assertEqual(short("host.example.co.uk"), "example.co.uk")
+        self.assertEqual(short("localhost"), "localhost")
+        self.assertEqual(short(""), "")
+
+    def test_screen_shows_owner_and_reverse_name(self):
+        menu = self.menu
+        menu.probe_output = lambda *c: (
+            "elements = { 162.216.149.179 . 22 counter packets 5 bytes 1 expires 1d }" if c[-1] == "ss4" else
+            "elements = { 20.98.155.81 . 443 counter packets 1 bytes 1 expires 1d }" if c[-1] == "sn4" else "")
+        menu.reverse_name = lambda address: "vm.compute.azure.com"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            menu.show_hits()
+        text = out.getvalue()
+        line = next(item for item in text.splitlines() if "162.216.149.179" in item)
+        self.assertIn("Censys", line)
+        line = next(item for item in text.splitlines() if "20.98.155.81" in item)
+        self.assertIn("azure.com", line)
+
+
 class Rules(unittest.TestCase):
     """Что update-fw.sh кладёт в правила."""
 

@@ -2272,6 +2272,82 @@ def hits_bar_view(value, maximum, width, color):
     return tint("32", head, True) + tint("90", tail, True)
 
 
+SOURCE_LABELS = {
+    "skipa_cidr.txt": "СКИПА", "skipa.list": "СКИПА", "antiscanner.list": "антисканер",
+    "censys_v4.txt": "Censys", "shodan_v4.txt": "Shodan", "paloaltonetworks_v4.txt": "Palo Alto Networks",
+    "shadowserver_v4.txt": "Shadowserver", "driftnet_v4.txt": "Driftnet", "onyphe_v4.txt": "ONYPHE",
+    "zoomeye_v4.txt": "ZoomEye", "leakix_v4.txt": "LeakIX", "rapid7_v4.txt": "Rapid7",
+    "fofa_v4.txt": "FOFA", "quake_v4.txt": "Quake", "extra.txt": "ваш список",
+}
+
+
+def source_label(name):
+    if name in SOURCE_LABELS:
+        return SOURCE_LABELS[name]
+    if name.startswith("custom_"):
+        return "свой список"
+    match = re.fullmatch(r"asn_(AS\d+)\.cache", name)
+    return match.group(1) if match else name
+
+
+def load_scanner_sources():
+    """Копии списков сканеров, сохранённые скриптом: [(подпись, [сети])]. Ошибки чтения пропускаются."""
+    files = []
+    try:
+        files += sorted((DIRECTORY / "scanner-cache").iterdir())
+        files += sorted(DIRECTORY.glob("asn_AS*.cache"))
+        files.append(DIRECTORY / "extra.txt")
+    except OSError:
+        pass
+    sources = []
+    for path in files:
+        networks = []
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                value = line.partition("#")[0].strip()
+                if not value:
+                    continue
+                try:
+                    networks.append(ipaddress.ip_network(value, strict=False))
+                except ValueError:
+                    continue
+        except OSError:
+            continue
+        if networks:
+            sources.append((source_label(path.name), networks))
+    return sources
+
+
+def owner_of(address, sources):
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return ""
+    found = []
+    for label, networks in sources:
+        if label not in found and any(network.version == ip.version and ip in network for network in networks):
+            found.append(label)
+    return ", ".join(found[:2])
+
+
+def short_host(name):
+    labels = [part for part in name.strip(".").split(".") if part]
+    if len(labels) <= 2:
+        return ".".join(labels)
+    keep = 3 if len(labels[-1]) == 2 and labels[-2] in {"co", "com", "net", "org", "ac", "gov"} else 2
+    return ".".join(labels[-keep:])
+
+
+def reverse_name(address):
+    """Имя из обратной DNS-записи (домен провайдера), если ответ пришёл быстро."""
+    try:
+        result = subprocess.run(["getent", "hosts", address], text=True, capture_output=True, timeout=2, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    fields = result.stdout.split()
+    return short_host(fields[1]) if result.returncode == 0 and len(fields) > 1 else ""
+
+
 HITS_HEADINGS = ("Сканеры и сети ведомств", "Не из России", "Что здесь не видно")
 
 
@@ -2281,6 +2357,7 @@ def show_hits():
     groups = (("scanners", "Сканеры и сети ведомств (все порты)"),
               ("non_ru", "Не из России на защищённых портах"))
     collected = {"scanners": [], "non_ru": []}
+    sources = load_scanner_sources()
     seen = False
     for kind, name in HIT_SETS:
         text = probe_output("nft", "-n", "list", "set", "inet", "fw", name)
@@ -2305,10 +2382,17 @@ def show_hits():
         for port, packets in summary["ports"]:
             label = port_label(port)
             print(f"  {port:>5}  {hits_bar_view(packets, biggest, 10, color)}  {packets:>6}" + (f"  {label}" if label else ""))
-        print("Кто стучится (адреса):")
+        print("Кто стучится (адреса, чей адрес):")
         biggest = summary["top_sources"][0][1]
-        for address, packets, count in summary["top_sources"]:
-            print(f"  {address:<39} {hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")
+        owners = []
+        for address, _packets, _count in summary["top_sources"]:
+            owner = owner_of(address, sources) if kind == "scanners" else ""
+            owners.append(owner or reverse_name(address) or "неизвестно")
+        width = min(39, max(len(address) for address, _p, _c in summary["top_sources"]))
+        owner_width = min(26, max(len(owner) for owner in owners))
+        for (address, packets, count), owner in zip(summary["top_sources"], owners):
+            print(f"  {address:<{width}}  {owner[:owner_width]:<{owner_width}}  "
+                  f"{hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")
     print("\nЧто здесь не видно")
     print("Порт SSH файрвол не фильтрует, поэтому попытки входа по SSH сюда не попадают (смотрите журнал sshd).")
     print("Считаются пакеты, а не подключения: сканер может прислать их несколько на один порт.")

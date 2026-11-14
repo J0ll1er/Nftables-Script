@@ -2372,11 +2372,31 @@ def lookup_owner(address):
     return owner
 
 
+def screen_columns():
+    """Ширина настоящего терминала (вывод внутри рамки идёт через pty, поэтому берём stderr или stdin)."""
+    for fd in (2, 0, 1):
+        try:
+            columns = os.get_terminal_size(fd).columns
+        except OSError:
+            continue
+        if columns > 0:
+            return columns
+    try:
+        return max(20, int(os.environ.get("COLUMNS", "")))
+    except ValueError:
+        return 100
+
+
+COMPACT_BELOW = 100
+
+
 HITS_HEADINGS = ("Сканеры и сети ведомств", "Не из России", "Что здесь не видно")
 
 
 def show_hits():
     color = menu_color()
+    columns = screen_columns()
+    compact = columns < COMPACT_BELOW
     print("\nКто стучится: пакеты, отброшенные файрволом (счёт ведётся с включения статистики, хранится до 7 дней)")
     groups = (("scanners", "Сканеры и сети ведомств (все порты)"),
               ("non_ru", "Не из России на защищённых портах"))
@@ -2405,7 +2425,12 @@ def show_hits():
         biggest = summary["ports"][0][1]
         for port, packets in summary["ports"]:
             label = port_label(port)
-            print(f"  {port:>5}  {hits_bar_view(packets, biggest, 10, color)}  {packets:>6}" + (f"  {label}" if label else ""))
+            if compact:
+                room = columns - 4 - 27 - 2
+                label = label if len(label) <= room else label[:max(0, room - 1)].rstrip(" ,") + "…" if room > 1 else ""
+                print(f"  {port:>5}  {hits_bar_view(packets, biggest, 6, color)}  {packets:>5}" + (f"  {label}" if label else ""))
+            else:
+                print(f"  {port:>5}  {hits_bar_view(packets, biggest, 10, color)}  {packets:>6}" + (f"  {label}" if label else ""))
         print("Кто стучится (адреса, чей адрес):")
         biggest = summary["top_sources"][0][1]
         owners = []
@@ -2416,8 +2441,15 @@ def show_hits():
         owner_width = min(40, max(len(owner) for owner in owners))
         owners = [owner if len(owner) <= owner_width else owner[:owner_width - 1].rstrip() + "…" for owner in owners]
         for (address, packets, count), owner in zip(summary["top_sources"], owners):
-            print(f"  {address:<{width}}  {owner[:owner_width]:<{owner_width}}  "
-                  f"{hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")
+            if compact:
+                # узкий экран: адрес, полоска и число в первой строке, владелец под ними
+                extra = f"  портов: {count}" if count > 1 else ""
+                print(f"  {address:<{width}}  {hits_bar_view(packets, biggest, 6, color)} {packets:>5}{extra}")
+                room = columns - 4 - 4
+                print("    " + (owner if len(owner) <= room else owner[:room - 1].rstrip() + "…"))
+            else:
+                print(f"  {address:<{width}}  {owner[:owner_width]:<{owner_width}}  "
+                      f"{hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")
     print("\nЧто здесь не видно")
     print("Порт SSH файрвол не фильтрует, поэтому попытки входа по SSH сюда не попадают (смотрите журнал sshd).")
     print("Считаются пакеты, а не подключения: сканер может прислать их несколько на один порт.")
@@ -5587,7 +5619,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '8f964e852248f101f014689da49e42410adbb871b66788d43d63c02c21d00147' "$stage/update-fw.sh" \
-    '1f268ebeae72799431300e50f24c358648cb26370a8b7c5d72ef8184fda2adf7' "$stage/fw-menu" \
+    'd0653cb1259cc8685cfc4a53d1ebdca70e4fecdae2822e7ccfcae167353a252e' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

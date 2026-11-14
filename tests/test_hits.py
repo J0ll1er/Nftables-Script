@@ -43,6 +43,7 @@ class Hits(unittest.TestCase):
         self.menu = importlib.util.module_from_spec(SPEC)
         LOADER.exec_module(self.menu)
         self.menu.lookup_owner = lambda address: ""
+        self.menu.screen_columns = lambda: 120
 
     def fake_nft(self, outputs):
         def probe(*command):
@@ -153,10 +154,66 @@ class Hits(unittest.TestCase):
         self.assertIn('("Кто стучится", boxed("Кто стучится", show_hits', source)
 
 
+class Narrow(unittest.TestCase):
+    """Экран на телефоне: около 58 колонок, рамка оставляет строке columns - 4."""
+    ROWS = ("elements = { 185.93.89.10 . 443 counter packets 59 bytes 1 expires 1d, "
+            "185.12.59.118 . 443 counter packets 7 bytes 1 expires 1d, "
+            "192.248.150.180 . 3389 counter packets 1 bytes 1 expires 1d }")
+
+    def setUp(self):
+        self.menu = importlib.util.module_from_spec(SPEC)
+        LOADER.exec_module(self.menu)
+        owners = {"185.93.89.10": "LimitedNetwork-AS Limited…, AE, AS213790",
+                  "185.12.59.118": "BLIX Blix Solutions AS, NO, AS50304",
+                  "192.248.150.180": "The Constant Company, LLC, GB, AS20473"}
+        self.menu.lookup_owner = lambda address: owners.get(address, "")
+        self.menu.probe_output = lambda *c: self.ROWS if c[-1] == "sn4" else ""
+
+    def render(self, columns):
+        self.menu.screen_columns = lambda: columns
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.menu.show_hits()
+        return out.getvalue().splitlines()
+
+    def test_no_line_is_longer_than_the_box_on_a_phone(self):
+        lines = self.render(58)
+        too_long = [line for line in lines if len(line) > 54 and "Кто стучится: пакеты" not in line
+                    and not line.startswith(("Порт SSH", "Считаются"))]
+        self.assertEqual(too_long, [])
+
+    def test_owner_goes_under_the_address(self):
+        lines = self.render(58)
+        index = next(i for i, line in enumerate(lines) if "185.93.89.10" in line)
+        self.assertNotIn("LimitedNetwork", lines[index])
+        self.assertIn("LimitedNetwork-AS Limited…, AE, AS213790", lines[index + 1])
+        self.assertIn("59", lines[index])
+
+    def test_wide_screen_keeps_everything_on_one_line(self):
+        lines = self.render(120)
+        line = next(item for item in lines if "185.93.89.10" in item)
+        self.assertIn("LimitedNetwork-AS Limited…, AE, AS213790", line)
+        self.assertIn("портов: 1", line)
+
+    def test_port_label_is_shortened_not_wrapped_on_a_phone(self):
+        self.menu.probe_output = lambda *c: ("elements = { 1.2.3.4 . 3389 counter packets 30 bytes 1 expires 1d }"
+                                             if c[-1] == "sn4" else "")
+        line = next(item for item in self.render(58) if item.strip().startswith("3389"))
+        self.assertLessEqual(len(line), 54)
+
+    def test_screen_columns_falls_back_to_wide(self):
+        menu = importlib.util.module_from_spec(SPEC)
+        LOADER.exec_module(menu)
+        columns = menu.screen_columns()
+        self.assertIsInstance(columns, int)
+        self.assertGreater(columns, 0)
+
+
 class Owners(unittest.TestCase):
     def setUp(self):
         self.menu = importlib.util.module_from_spec(SPEC)
         LOADER.exec_module(self.menu)
+        self.menu.screen_columns = lambda: 120
         self.tmp = tempfile.TemporaryDirectory()
         self.menu.DIRECTORY = Path(self.tmp.name)
         cache = Path(self.tmp.name) / "scanner-cache"
@@ -239,6 +296,7 @@ class Lookup(unittest.TestCase):
         LOADER.exec_module(self.menu)
         self.tmp = tempfile.TemporaryDirectory()
         self.menu.DIRECTORY = Path(self.tmp.name)
+        self.menu.screen_columns = lambda: 120
         self.calls = []
 
         def fetch(address):

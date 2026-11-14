@@ -84,6 +84,15 @@ class Hits(unittest.TestCase):
         self.assertEqual(self.menu.hits_bar(0, 20, 10).count("█"), 0)
         self.assertGreaterEqual(self.menu.hits_bar(1, 1000, 10).count("█"), 1)
 
+    def test_colored_bar_keeps_width_and_is_plain_without_color(self):
+        plain = self.menu.hits_bar(5, 20, 10)
+        self.assertEqual(self.menu.hits_bar_view(5, 20, 10, False), plain)
+        colored = self.menu.hits_bar_view(5, 20, 10, True)
+        stripped = colored.replace("\033[36m", "").replace("\033[90m", "").replace("\033[0m", "")
+        self.assertEqual(stripped, plain)
+        self.assertIn("\033[36m", colored)
+        self.assertIn("\033[90m", colored)
+
     def show(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

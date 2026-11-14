@@ -2182,10 +2182,19 @@ def hits_bar(value, maximum, width=16):
     return "█" * filled + "░" * (width - filled)
 
 
+def hits_bar_view(value, maximum, width, color):
+    bar = hits_bar(value, maximum, width)
+    if not color:
+        return bar
+    filled = bar.count("█")
+    return tint("36", bar[:filled], True) + tint("90", bar[filled:], True)
+
+
 HITS_HEADINGS = ("Сканеры и сети ведомств", "Не из России", "Что здесь не видно")
 
 
 def show_hits():
+    color = menu_color()
     print("\nКто стучится: пакеты, отброшенные файрволом (счёт ведётся с включения статистики, хранится до 7 дней)")
     groups = (("scanners", "Сканеры и сети ведомств (все порты)"),
               ("non_ru", "Не из России на защищённых портах"))
@@ -2213,11 +2222,11 @@ def show_hits():
         biggest = summary["ports"][0][1]
         for port, packets in summary["ports"]:
             label = port_label(port)
-            print(f"  {port:>5}  {hits_bar(packets, biggest)}  {packets:>6}" + (f"  {label}" if label else ""))
+            print(f"  {port:>5}  {hits_bar_view(packets, biggest, 16, color)}  {packets:>6}" + (f"  {label}" if label else ""))
         print("Кто стучится (адреса):")
         biggest = summary["top_sources"][0][1]
         for address, packets, count in summary["top_sources"]:
-            print(f"  {address:<39} {hits_bar(packets, biggest, 10)} {packets:>6}  портов: {count}")
+            print(f"  {address:<39} {hits_bar_view(packets, biggest, 10, color)} {packets:>6}  портов: {count}")
     print("\nЧто здесь не видно")
     print("Порт SSH файрвол не фильтрует, поэтому попытки входа по SSH сюда не попадают (смотрите журнал sshd).")
     print("Считаются пакеты, а не подключения: сканер может прислать их несколько на один порт.")
@@ -5387,7 +5396,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '8f964e852248f101f014689da49e42410adbb871b66788d43d63c02c21d00147' "$stage/update-fw.sh" \
-    'a786dc9b7bd5d1d7fdc416852344b2f534eac46082c1ec0b073bf014912f5b5c' "$stage/fw-menu" \
+    '949dfb0d575f4b2d1d836b1fe404e7067980856967738dacefcbac80da61b6b2' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

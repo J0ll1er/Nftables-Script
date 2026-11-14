@@ -2261,10 +2261,19 @@ def hits_bar(value, maximum, width=16):
     return "█" * filled + "░" * (width - filled)
 
 
+def hits_bar_view(value, maximum, width, color):
+    bar = hits_bar(value, maximum, width)
+    if not color:
+        return bar
+    filled = bar.count("█")
+    return tint("36", bar[:filled], True) + tint("90", bar[filled:], True)
+
+
 HITS_HEADINGS = ("Сканеры и сети ведомств", "Не из России", "Что здесь не видно")
 
 
 def show_hits():
+    color = menu_color()
     print("\nКто стучится: пакеты, отброшенные файрволом (счёт ведётся с включения статистики, хранится до 7 дней)")
     groups = (("scanners", "Сканеры и сети ведомств (все порты)"),
               ("non_ru", "Не из России на защищённых портах"))
@@ -2292,11 +2301,11 @@ def show_hits():
         biggest = summary["ports"][0][1]
         for port, packets in summary["ports"]:
             label = port_label(port)
-            print(f"  {port:>5}  {hits_bar(packets, biggest)}  {packets:>6}" + (f"  {label}" if label else ""))
+            print(f"  {port:>5}  {hits_bar_view(packets, biggest, 16, color)}  {packets:>6}" + (f"  {label}" if label else ""))
         print("Кто стучится (адреса):")
         biggest = summary["top_sources"][0][1]
         for address, packets, count in summary["top_sources"]:
-            print(f"  {address:<39} {hits_bar(packets, biggest, 10)} {packets:>6}  портов: {count}")
+            print(f"  {address:<39} {hits_bar_view(packets, biggest, 10, color)} {packets:>6}  портов: {count}")
     print("\nЧто здесь не видно")
     print("Порт SSH файрвол не фильтрует, поэтому попытки входа по SSH сюда не попадают (смотрите журнал sshd).")
     print("Считаются пакеты, а не подключения: сканер может прислать их несколько на один порт.")

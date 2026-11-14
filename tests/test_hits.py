@@ -79,18 +79,22 @@ class Hits(unittest.TestCase):
         self.assertEqual(self.menu.port_label(54321), "")
 
     def test_bar_is_proportional_and_fixed_width(self):
-        self.assertEqual(len(self.menu.hits_bar(5, 20, 10)), 10)
-        self.assertEqual(self.menu.hits_bar(20, 20, 10).count("█"), 10)
-        self.assertEqual(self.menu.hits_bar(0, 20, 10).count("█"), 0)
-        self.assertGreaterEqual(self.menu.hits_bar(1, 1000, 10).count("█"), 1)
+        bar = self.menu.hits_bar(6, 20, 10)
+        self.assertEqual(bar.count("▮") + bar.count("▯"), 10)
+        self.assertEqual(bar.count("▮"), 3)  # 6/20 от 10 палочек
+        self.assertEqual(self.menu.hits_bar(20, 20, 10).count("▮"), 10)
+        self.assertEqual(self.menu.hits_bar(0, 20, 10).count("▮"), 0)
+        self.assertGreaterEqual(self.menu.hits_bar(1, 1000, 10).count("▮"), 1)
+        # палочки разделены пробелами, поэтому ширина одинакова у любой полоски
+        self.assertEqual(len(self.menu.hits_bar(1, 20, 10)), len(self.menu.hits_bar(20, 20, 10)))
 
     def test_colored_bar_keeps_width_and_is_plain_without_color(self):
         plain = self.menu.hits_bar(5, 20, 10)
         self.assertEqual(self.menu.hits_bar_view(5, 20, 10, False), plain)
         colored = self.menu.hits_bar_view(5, 20, 10, True)
-        stripped = colored.replace("\033[36m", "").replace("\033[90m", "").replace("\033[0m", "")
+        stripped = colored.replace("\033[32m", "").replace("\033[90m", "").replace("\033[0m", "")
         self.assertEqual(stripped, plain)
-        self.assertIn("\033[36m", colored)
+        self.assertIn("\033[32m", colored)
         self.assertIn("\033[90m", colored)
 
     def show(self):

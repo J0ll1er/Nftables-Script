@@ -3,6 +3,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 from pathlib import Path
 import re
 import shutil
@@ -41,6 +42,7 @@ class Hits(unittest.TestCase):
     def setUp(self):
         self.menu = importlib.util.module_from_spec(SPEC)
         LOADER.exec_module(self.menu)
+        self.menu.lookup_owner = lambda address: ""
 
     def fake_nft(self, outputs):
         def probe(*command):
@@ -207,6 +209,7 @@ class Owners(unittest.TestCase):
             "elements = { 162.216.149.179 . 22 counter packets 5 bytes 1 expires 1d }" if c[-1] == "ss4" else
             "elements = { 20.98.155.81 . 443 counter packets 1 bytes 1 expires 1d }" if c[-1] == "sn4" else "")
         menu.reverse_name = lambda address: "vm.compute.azure.com"
+        menu.lookup_owner = lambda address: ""
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             menu.show_hits()
@@ -215,6 +218,76 @@ class Owners(unittest.TestCase):
         self.assertIn("Censys", line)
         line = next(item for item in text.splitlines() if "20.98.155.81" in item)
         self.assertIn("azure.com", line)
+
+
+RIPE_ANSWER = json.dumps({"status": "ok", "data": {"resource": "20.96.0.0/14", "announced": True,
+    "asns": [{"asn": 8075, "holder": "MICROSOFT-CORP-MSN-AS-BLOCK"}]}})
+
+
+class Lookup(unittest.TestCase):
+    def setUp(self):
+        self.menu = importlib.util.module_from_spec(SPEC)
+        LOADER.exec_module(self.menu)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.menu.DIRECTORY = Path(self.tmp.name)
+        self.calls = []
+
+        def fetch(address):
+            self.calls.append(address)
+            return RIPE_ANSWER
+        self.menu.fetch_ripe = fetch
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_parse_answer(self):
+        self.assertEqual(self.menu.parse_ripe_owner(RIPE_ANSWER), "MICROSOFT-CORP-MSN-AS-BLOCK AS8075")
+
+    def test_parse_bad_answers_give_empty(self):
+        for bad in ("", "не json", "{}", '{"status": "error"}', '{"data": {"asns": []}}',
+                    '{"data": {"asns": [{"holder": "X"}]}}'):
+            self.assertEqual(self.menu.parse_ripe_owner(bad), "", bad)
+
+    def test_lookup_asks_once_then_uses_cache(self):
+        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "MICROSOFT-CORP-MSN-AS-BLOCK AS8075")
+        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "MICROSOFT-CORP-MSN-AS-BLOCK AS8075")
+        self.assertEqual(self.calls, ["20.98.155.81"])
+        self.assertTrue((Path(self.tmp.name) / "owner-cache.json").exists())
+
+    def test_expired_cache_is_asked_again(self):
+        self.menu.lookup_owner("20.98.155.81")
+        path = Path(self.tmp.name) / "owner-cache.json"
+        data = json.loads(path.read_text())
+        for entry in data.values():
+            entry[1] = 1
+        path.write_text(json.dumps(data))
+        self.menu.lookup_owner("20.98.155.81")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_failure_is_not_cached_and_does_not_raise(self):
+        self.menu.fetch_ripe = lambda address: ""
+        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "")
+        self.assertFalse((Path(self.tmp.name) / "owner-cache.json").exists())
+
+    def test_private_and_broken_addresses_are_not_sent(self):
+        for address in ("10.0.0.1", "127.0.0.1", "192.168.1.5", "не адрес"):
+            self.assertEqual(self.menu.lookup_owner(address), "")
+        self.assertEqual(self.calls, [])
+
+    def test_broken_cache_file_is_ignored(self):
+        (Path(self.tmp.name) / "owner-cache.json").write_text("{не json")
+        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "MICROSOFT-CORP-MSN-AS-BLOCK AS8075")
+
+    def test_screen_prefers_lists_then_registry_then_dns(self):
+        menu = self.menu
+        menu.probe_output = lambda *c: (
+            "elements = { 20.98.155.81 . 443 counter packets 1 bytes 1 expires 1d }" if c[-1] == "sn4" else "")
+        menu.reverse_name = lambda address: "dns.example.com"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            menu.show_hits()
+        self.assertIn("MICROSOFT-CORP-MSN-AS-BLOCK AS8075", out.getvalue())
+        self.assertNotIn("dns.example.com", out.getvalue())
 
 
 class Rules(unittest.TestCase):

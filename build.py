@@ -2348,6 +2348,64 @@ def reverse_name(address):
     return short_host(fields[1]) if result.returncode == 0 and len(fields) > 1 else ""
 
 
+OWNER_CACHE_FILE = "owner-cache.json"
+OWNER_CACHE_DAYS = 30
+OWNER_CACHE_LIMIT = 500
+
+
+def fetch_ripe(address):
+    """Ответ RIPEstat про адрес (номер AS и владелец); пусто, если сеть не ответила."""
+    url = f"https://stat.ripe.net/data/prefix-overview/data.json?resource={address}"
+    try:
+        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4", url],
+                                text=True, capture_output=True, timeout=6, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def parse_ripe_owner(text):
+    try:
+        asns = json.loads(text)["data"]["asns"]
+        first = asns[0]
+        return f"{str(first['holder']).strip()} AS{int(first['asn'])}"
+    except (ValueError, KeyError, IndexError, TypeError):
+        return ""
+
+
+def lookup_owner(address):
+    """Владелец адреса по RIPEstat; ответ запоминается на 30 дней. Любой сбой даёт пустую строку."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return ""
+    if not ip.is_global:
+        return ""
+    path = DIRECTORY / OWNER_CACHE_FILE
+    cache = {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            cache = loaded
+    except (OSError, ValueError):
+        pass
+    now = int(datetime.datetime.now().timestamp())
+    entry = cache.get(address)
+    if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], int) \
+            and now - entry[1] < OWNER_CACHE_DAYS * 86400 and isinstance(entry[0], str):
+        return entry[0]
+    owner = parse_ripe_owner(fetch_ripe(address))
+    if owner:
+        cache[address] = [owner, now]
+        fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list) and len(item[1]) == 2
+                       and isinstance(item[1][1], int) else 0)[:OWNER_CACHE_LIMIT]
+        try:
+            write_text_atomic(path, json.dumps(dict(fresh), ensure_ascii=False))
+        except OSError:
+            pass
+    return owner
+
+
 HITS_HEADINGS = ("Сканеры и сети ведомств", "Не из России", "Что здесь не видно")
 
 
@@ -2387,9 +2445,9 @@ def show_hits():
         owners = []
         for address, _packets, _count in summary["top_sources"]:
             owner = owner_of(address, sources) if kind == "scanners" else ""
-            owners.append(owner or reverse_name(address) or "неизвестно")
+            owners.append(owner or lookup_owner(address) or reverse_name(address) or "неизвестно")
         width = min(39, max(len(address) for address, _p, _c in summary["top_sources"]))
-        owner_width = min(26, max(len(owner) for owner in owners))
+        owner_width = min(34, max(len(owner) for owner in owners))
         for (address, packets, count), owner in zip(summary["top_sources"], owners):
             print(f"  {address:<{width}}  {owner[:owner_width]:<{owner_width}}  "
                   f"{hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")

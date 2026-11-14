@@ -2289,7 +2289,10 @@ def parse_ripe_owner(text):
     try:
         asns = json.loads(text)["data"]["asns"]
         first = asns[0]
-        return f"{str(first['holder']).strip()} AS{int(first['asn'])}"
+        holder = str(first["holder"]).strip()
+        # «ИМЯ-AS-BLOCK - Читаемое название»: показываем читаемую часть
+        holder = holder.split(" - ", 1)[1].strip() if " - " in holder and holder.split(" - ", 1)[1].strip() else holder
+        return f"{holder} AS{int(first['asn'])}"
     except (ValueError, KeyError, IndexError, TypeError):
         return ""
 
@@ -5541,7 +5544,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '8f964e852248f101f014689da49e42410adbb871b66788d43d63c02c21d00147' "$stage/update-fw.sh" \
-    '66480c705dd95aae118bbdca01c324f49c656a307993e38eb620f4a4a6bb0c74' "$stage/fw-menu" \
+    'c9ddacd8768c6c4dd8c23e743a7d49a1f90ba709e23507cfba6fbc69e0b86343' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

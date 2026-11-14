@@ -2368,7 +2368,10 @@ def parse_ripe_owner(text):
     try:
         asns = json.loads(text)["data"]["asns"]
         first = asns[0]
-        return f"{str(first['holder']).strip()} AS{int(first['asn'])}"
+        holder = str(first["holder"]).strip()
+        # «ИМЯ-AS-BLOCK - Читаемое название»: показываем читаемую часть
+        holder = holder.split(" - ", 1)[1].strip() if " - " in holder and holder.split(" - ", 1)[1].strip() else holder
+        return f"{holder} AS{int(first['asn'])}"
     except (ValueError, KeyError, IndexError, TypeError):
         return ""
 

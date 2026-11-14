@@ -221,7 +221,7 @@ class Owners(unittest.TestCase):
 
 
 RIPE_ANSWER = json.dumps({"status": "ok", "data": {"resource": "20.96.0.0/14", "announced": True,
-    "asns": [{"asn": 8075, "holder": "MICROSOFT-CORP-MSN-AS-BLOCK"}]}})
+    "asns": [{"asn": 8075, "holder": "MICROSOFT-CORP-MSN-AS-BLOCK - Microsoft Corporation"}]}})
 
 
 class Lookup(unittest.TestCase):
@@ -241,7 +241,11 @@ class Lookup(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_parse_answer(self):
-        self.assertEqual(self.menu.parse_ripe_owner(RIPE_ANSWER), "MICROSOFT-CORP-MSN-AS-BLOCK AS8075")
+        self.assertEqual(self.menu.parse_ripe_owner(RIPE_ANSWER), "Microsoft Corporation AS8075")
+
+    def test_parse_keeps_plain_holder_without_dash(self):
+        text = json.dumps({"data": {"asns": [{"asn": 24940, "holder": "HETZNER-AS"}]}})
+        self.assertEqual(self.menu.parse_ripe_owner(text), "HETZNER-AS AS24940")
 
     def test_parse_bad_answers_give_empty(self):
         for bad in ("", "не json", "{}", '{"status": "error"}', '{"data": {"asns": []}}',
@@ -249,8 +253,8 @@ class Lookup(unittest.TestCase):
             self.assertEqual(self.menu.parse_ripe_owner(bad), "", bad)
 
     def test_lookup_asks_once_then_uses_cache(self):
-        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "MICROSOFT-CORP-MSN-AS-BLOCK AS8075")
-        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "MICROSOFT-CORP-MSN-AS-BLOCK AS8075")
+        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "Microsoft Corporation AS8075")
+        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "Microsoft Corporation AS8075")
         self.assertEqual(self.calls, ["20.98.155.81"])
         self.assertTrue((Path(self.tmp.name) / "owner-cache.json").exists())
 
@@ -276,7 +280,7 @@ class Lookup(unittest.TestCase):
 
     def test_broken_cache_file_is_ignored(self):
         (Path(self.tmp.name) / "owner-cache.json").write_text("{не json")
-        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "MICROSOFT-CORP-MSN-AS-BLOCK AS8075")
+        self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "Microsoft Corporation AS8075")
 
     def test_screen_prefers_lists_then_registry_then_dns(self):
         menu = self.menu
@@ -286,7 +290,7 @@ class Lookup(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             menu.show_hits()
-        self.assertIn("MICROSOFT-CORP-MSN-AS-BLOCK AS8075", out.getvalue())
+        self.assertIn("Microsoft Corporation AS8075", out.getvalue())
         self.assertNotIn("dns.example.com", out.getvalue())
 
 

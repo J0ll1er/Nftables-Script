@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.5.0'
+FW_VERSION='1.6.0'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -79,7 +79,7 @@ DRY=0; [ "${1:-}" = "--dry" ] && DRY=1
 PENDING=${FW_PENDING:-0}; [ "$PENDING" = 0 ] || [ "$PENDING" = 1 ] || exit 2
 MODE=apply; [ "$DRY" = 1 ] && MODE=dry
 ERRLOG=$DIR/errors.log
-# note "WARN: …" или "ERR: …": в stderr и в журнал ошибок (fw-menu → «Журнал ошибок»).
+# note "WARN: …" или "ERR: …": в stderr и в журнал ошибок (fw-menu → 1 → «Журнал ошибок»).
 logline() { printf '%s %s %s\n' "$(date '+%F %T')" "$MODE" "$1" >> "$ERRLOG" 2>/dev/null || true; }
 WARN_LOG=$(mktemp) || WARN_LOG=/dev/null
 trap 'rm -f "$WARN_LOG"' EXIT
@@ -3147,7 +3147,7 @@ def show_error_log():
     print("Журнал очищен.")
 
 
-FW_VERSION = "1.5.0"
+FW_VERSION = "1.6.0"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
@@ -3227,7 +3227,7 @@ def show_versions():
     paint(33, f"Доступна новая версия: {newer[0]['version']} (новее установленной: {len(newer)})")
     for release in newer:
         print_release(release)
-    print("\nОбновить скрипт: пункт 7 → 2. Правила при обновлении не меняются.")
+    print("\nОбновить скрипт: пункт 5 → 2. Правила при обновлении не меняются.")
 
 
 def install_version(version):
@@ -3251,7 +3251,7 @@ def install_version(version):
     finally:
         shutil.rmtree(directory, ignore_errors=True)
     if result.returncode:
-        paint(31, "ОШИБКА — установщик завершился с ошибкой, причина выше. Вернуть прежнюю версию: пункт 7 → 3.")
+        paint(31, "ОШИБКА — установщик завершился с ошибкой, причина выше. Вернуть прежнюю версию: пункт 5 → 3.")
         return False
     paint(32, f"ИТОГ: ВСЁ В ПОРЯДКЕ — скрипт {version} установлен, действующие правила не менялись. "
               "Запусти fw-menu заново.")
@@ -3341,7 +3341,7 @@ def restore_file(source, target, mode):
 def rollback_local():
     backups = local_backups()
     if not backups:
-        print("Локальных копий в /root/fw-rollbacks нет. Выбери версию с GitHub (пункт 7 → 3 → 2).")
+        print("Локальных копий в /root/fw-rollbacks нет. Выбери версию с GitHub (пункт 5 → 3 → 2).")
         return
     print(f"Установлена версия: {FW_VERSION}")
     for number, backup in enumerate(backups, start=1):
@@ -3376,15 +3376,84 @@ def rollback_script():
     ))
 
 
+MAIN_MENU_TITLE = "Файрвол IPv4 / IPv6"
+
+
+def stdout_is_tty():
+    return sys.stdout.isatty()
+
+
+def menu_color():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def tint(code, text, color):
+    return f"\033[{code}m{text}\033[0m" if color else text
+
+
+def menu_header_text(color=None):
+    # Короткое состояние файрвола для шапки меню. Любой сбой не должен ломать меню.
+    color = menu_color() if color is None else color
+    codes = {"ok": "32", "warn": "33", "bad": "31", "off": "90"}
+    try:
+        try:
+            loaded = quiet("nft", "-t", "list", "table", "inet", "fw")
+        except (OSError, subprocess.SubprocessError):
+            loaded = False
+        rules = ("ok", "Правила работают") if loaded else ("bad", "Правила не загружены")
+        result = last_result()
+        last = {"ok": ("ok", "Последнее обновление: успешно"), "warn": ("warn", "Последнее обновление: есть замечания"),
+                "error": ("bad", "Последнее обновление: ошибка")}.get(result, ("off", "Последнее обновление: ещё не было"))
+        count = len(set(trusted_networks())) + len(trusted_names())
+        trusted = ("off", f"Доверенных: {count}")
+        try:
+            properties = systemd_properties("fw-update.timer", "ActiveState", "NextElapseUSecRealtime")
+        except (OSError, subprocess.SubprocessError):
+            properties = {}
+        match = re.search(r"[0-9]{4}-([0-9]{2})-([0-9]{2}) ([0-9]{2}:[0-9]{2}):[0-9]{2}", properties.get("NextElapseUSecRealtime", ""))
+        if properties.get("ActiveState") == "active" and match:
+            timer = ("ok", f"Следующее обновление: {match[2]}.{match[1]} в {match[3]}")
+        elif properties.get("ActiveState") == "active":
+            timer = ("warn", "Следующее обновление: не запланировано")
+        else:
+            timer = ("warn", "Таймер выключен")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+
+    def cell(item):
+        return f"{tint(codes[item[0]], '●', color)} {item[1]}"
+    columns = shutil.get_terminal_size((100, 24)).columns
+    pairs = ((rules, last), (trusted, timer))
+    if columns < 72:
+        return "\n".join(cell(item) for pair in pairs for item in pair)
+    width = max(2 + len(left[1]) for left, _ in pairs) + 3
+    return "\n".join(cell(left) + " " * (width - 2 - len(left[1])) + cell(right) for left, right in pairs)
+
+
 def show_menu(title, entries, exit_label="Назад"):
     choices = {str(number): entry for number, entry in enumerate(entries, start=1)}
     while True:
-        print(f"\n{title}")
-        for number, (label, _) in choices.items():
-            print(f"{number}. {label}")
-        print(f"0. {exit_label}")
+        if stdout_is_tty():
+            color = menu_color()
+            print()
+            header = menu_header_text(color) if title == MAIN_MENU_TITLE else ""
+            if header:
+                print_box(f"{title} · v{FW_VERSION}", header)
+            else:
+                print(tint("90", f"── {title} " + "─" * max(4, 54 - len(title)), color))
+            print()
+            for number, (label, _) in choices.items():
+                print(f"  {tint('1;36', number, color)}  {label}")
+            print(f"  {tint('90', '0', color)}  {tint('90', exit_label, color)}\n")
+            prompt = "Выбор › "
+        else:
+            print(f"\n{title}")
+            for number, (label, _) in choices.items():
+                print(f"{number}. {label}")
+            print(f"0. {exit_label}")
+            prompt = "Выбор: "
         try:
-            choice = input("Выбор: ").strip()
+            choice = input(prompt).strip()
             if choice == "0":
                 return
             if choice in choices:
@@ -3425,7 +3494,11 @@ def main():
         show_suggestion()
         return
     entries = (
-        ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),
+        ("Статус и наблюдение", (
+            ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),
+            ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),
+            ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),
+        )),
         ("Настроить доступ", (
             ("Добавить доверенные IP или подсети через пробел", add_trusted),
             ("Показать доверенные адреса", boxed("Доверенные адреса", show_trusted)),
@@ -3445,26 +3518,17 @@ def main():
             ("Настроить расписание обновления", configure_schedule),
             ("Показать пути к файлам на VPS", boxed("Пути к файлам", show_file_paths)),
         )),
-        ("Отключить или удалить", (
-            ("Удалить правила и автообновление", remove_rules),
-            ("Удалить скрипт и настройки", uninstall),
-        )),
-        ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),
         ("Версии и обновление скрипта", (
             ("Версии и что исправлено", boxed("Версии", show_versions)),
             ("Обновить скрипт до последней версии", update_script),
             ("Откатить скрипт к другой версии", rollback_script),
         )),
-        ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),
+        ("Отключить или удалить", (
+            ("Удалить правила и автообновление", remove_rules),
+            ("Удалить скрипт и настройки", uninstall),
+        )),
     )
-    print(f"Версия скрипта — {FW_VERSION}")
     try:
-        try:
-            _, _, sizes = file_inventory()
-            total = sum(size for size in sizes.values() if size is not None)
-            print(f"Размер файлов файрвола — {format_size(total)}")
-        except OSError:
-            print("Размер файлов файрвола — не удалось определить")
         show_menu("Файрвол IPv4 / IPv6", entries, "Выход")
     except (EOFError, KeyboardInterrupt):
         print()
@@ -5201,8 +5265,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    'a3d61ded757a65d371633e26aae5e421b49b4f8f10b428ff745f474c1984e6a7' "$stage/update-fw.sh" \
-    '9f3e774122abe784720514f330d1ea60775dbbe4d294f4b02bcfbe5e70b80c66' "$stage/fw-menu" \
+    '26891de4bba0d8c72bd78d65012cdc10b8bad29dd21598369dcb93cdb65b3232' "$stage/update-fw.sh" \
+    'f4af71bcff40f8235ab9fcdd8aeffee41a23da96a3753e47f6f685ed220900df' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

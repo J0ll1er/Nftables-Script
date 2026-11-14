@@ -62,7 +62,7 @@ upd = replace_once(
     'fail_save() { echo "ERR: правила применены, но $1" >&2; exit 1; }\n',
     'MODE=apply; [ "$DRY" = 1 ] && MODE=dry\n'
     'ERRLOG=$DIR/errors.log\n'
-    '# note "WARN: …" или "ERR: …": в stderr и в журнал ошибок (fw-menu → «Журнал ошибок»).\n'
+    '# note "WARN: …" или "ERR: …": в stderr и в журнал ошибок (fw-menu → 1 → «Журнал ошибок»).\n'
     'logline() { printf \'%s %s %s\\n\' "$(date \'+%F %T\')" "$MODE" "$1" >> "$ERRLOG" 2>/dev/null || true; }\n'
     'note() { echo "$1" >&2; logline "$1"; }\n'
     'fail_keep() { note "ERR: $1 — правила не тронуты"; exit 1; }\n'
@@ -1246,7 +1246,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 VERSIONS_CODE = r'''FW_VERSION = "@@VERSION@@"
 FW_REPO = "J0ll1er/Nftables-Script"
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -1327,7 +1327,7 @@ def show_versions():
     paint(33, f"Доступна новая версия: {newer[0]['version']} (новее установленной: {len(newer)})")
     for release in newer:
         print_release(release)
-    print("\nОбновить скрипт: пункт 7 → 2. Правила при обновлении не меняются.")
+    print("\nОбновить скрипт: пункт 5 → 2. Правила при обновлении не меняются.")
 
 
 def install_version(version):
@@ -1351,7 +1351,7 @@ def install_version(version):
     finally:
         shutil.rmtree(directory, ignore_errors=True)
     if result.returncode:
-        paint(31, "ОШИБКА — установщик завершился с ошибкой, причина выше. Вернуть прежнюю версию: пункт 7 → 3.")
+        paint(31, "ОШИБКА — установщик завершился с ошибкой, причина выше. Вернуть прежнюю версию: пункт 5 → 3.")
         return False
     paint(32, f"ИТОГ: ВСЁ В ПОРЯДКЕ — скрипт {version} установлен, действующие правила не менялись. "
               "Запусти fw-menu заново.")
@@ -1441,7 +1441,7 @@ def restore_file(source, target, mode):
 def rollback_local():
     backups = local_backups()
     if not backups:
-        print("Локальных копий в /root/fw-rollbacks нет. Выбери версию с GitHub (пункт 7 → 3 → 2).")
+        print("Локальных копий в /root/fw-rollbacks нет. Выбери версию с GitHub (пункт 5 → 3 → 2).")
         return
     print(f"Установлена версия: {FW_VERSION}")
     for number, backup in enumerate(backups, start=1):
@@ -2021,8 +2021,140 @@ menu = replace_once(menu, '    if os.geteuid() != 0:\n        raise SystemExit("
 menu = replace_once(menu, '    if os.geteuid() != 0:\n        raise SystemExit("Запусти fw-menu от root.")\n',
     '    if sys.argv[1:] == ["--version"]:\n        print(FW_VERSION)\n        return\n'
     '    if os.geteuid() != 0:\n        raise SystemExit("Запусти fw-menu от root.")\n', "--version")
-menu = replace_once(menu, '    try:\n        try:\n            _, _, sizes = file_inventory()\n',
-    '    print(f"Версия скрипта — {FW_VERSION}")\n    try:\n        try:\n            _, _, sizes = file_inventory()\n', "версия в заголовке")
+
+# Меню 1.6.0: шесть пунктов, подменю «Статус и наблюдение», шапка с состоянием.
+OLD_SHOW_MENU = """def show_menu(title, entries, exit_label="Назад"):
+    choices = {str(number): entry for number, entry in enumerate(entries, start=1)}
+    while True:
+        print(f"\\n{title}")
+        for number, (label, _) in choices.items():
+            print(f"{number}. {label}")
+        print(f"0. {exit_label}")
+        try:
+            choice = input("Выбор: ").strip()
+"""
+NEW_SHOW_MENU = r"""MAIN_MENU_TITLE = "Файрвол IPv4 / IPv6"
+
+
+def stdout_is_tty():
+    return sys.stdout.isatty()
+
+
+def menu_color():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def tint(code, text, color):
+    return f"\033[{code}m{text}\033[0m" if color else text
+
+
+def menu_header_text(color=None):
+    # Короткое состояние файрвола для шапки меню. Любой сбой не должен ломать меню.
+    color = menu_color() if color is None else color
+    codes = {"ok": "32", "warn": "33", "bad": "31", "off": "90"}
+    try:
+        try:
+            loaded = quiet("nft", "-t", "list", "table", "inet", "fw")
+        except (OSError, subprocess.SubprocessError):
+            loaded = False
+        rules = ("ok", "Правила работают") if loaded else ("bad", "Правила не загружены")
+        result = last_result()
+        last = {"ok": ("ok", "Последнее обновление: успешно"), "warn": ("warn", "Последнее обновление: есть замечания"),
+                "error": ("bad", "Последнее обновление: ошибка")}.get(result, ("off", "Последнее обновление: ещё не было"))
+        count = len(set(trusted_networks())) + len(trusted_names())
+        trusted = ("off", f"Доверенных: {count}")
+        try:
+            properties = systemd_properties("fw-update.timer", "ActiveState", "NextElapseUSecRealtime")
+        except (OSError, subprocess.SubprocessError):
+            properties = {}
+        match = re.search(r"[0-9]{4}-([0-9]{2})-([0-9]{2}) ([0-9]{2}:[0-9]{2}):[0-9]{2}", properties.get("NextElapseUSecRealtime", ""))
+        if properties.get("ActiveState") == "active" and match:
+            timer = ("ok", f"Следующее обновление: {match[2]}.{match[1]} в {match[3]}")
+        elif properties.get("ActiveState") == "active":
+            timer = ("warn", "Следующее обновление: не запланировано")
+        else:
+            timer = ("warn", "Таймер выключен")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+
+    def cell(item):
+        return f"{tint(codes[item[0]], '●', color)} {item[1]}"
+    columns = shutil.get_terminal_size((100, 24)).columns
+    pairs = ((rules, last), (trusted, timer))
+    if columns < 72:
+        return "\n".join(cell(item) for pair in pairs for item in pair)
+    width = max(2 + len(left[1]) for left, _ in pairs) + 3
+    return "\n".join(cell(left) + " " * (width - 2 - len(left[1])) + cell(right) for left, right in pairs)
+
+
+def show_menu(title, entries, exit_label="Назад"):
+    choices = {str(number): entry for number, entry in enumerate(entries, start=1)}
+    while True:
+        if stdout_is_tty():
+            color = menu_color()
+            print()
+            header = menu_header_text(color) if title == MAIN_MENU_TITLE else ""
+            if header:
+                print_box(f"{title} · v{FW_VERSION}", header)
+            else:
+                print(tint("90", f"── {title} " + "─" * max(4, 54 - len(title)), color))
+            print()
+            for number, (label, _) in choices.items():
+                print(f"  {tint('1;36', number, color)}  {label}")
+            print(f"  {tint('90', '0', color)}  {tint('90', exit_label, color)}\n")
+            prompt = "Выбор › "
+        else:
+            print(f"\n{title}")
+            for number, (label, _) in choices.items():
+                print(f"{number}. {label}")
+            print(f"0. {exit_label}")
+            prompt = "Выбор: "
+        try:
+            choice = input(prompt).strip()
+"""
+menu = replace_once(menu, OLD_SHOW_MENU, NEW_SHOW_MENU, "новый вид меню")
+
+OLD_ENTRIES_HEAD = '    entries = (\n        ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),\n'
+NEW_ENTRIES_HEAD = (
+    '    entries = (\n        ("Статус и наблюдение", (\n'
+    '            ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),\n'
+    '            ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),\n'
+    '            ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),\n'
+    '        )),\n')
+menu = replace_once(menu, OLD_ENTRIES_HEAD, NEW_ENTRIES_HEAD, "подменю наблюдения")
+OLD_TAIL = """        ("Отключить или удалить", (
+            ("Удалить правила и автообновление", remove_rules),
+            ("Удалить скрипт и настройки", uninstall),
+        )),
+        ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),
+        ("Версии и обновление скрипта", (
+            ("Версии и что исправлено", boxed("Версии", show_versions)),
+            ("Обновить скрипт до последней версии", update_script),
+            ("Откатить скрипт к другой версии", rollback_script),
+        )),
+        ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),
+    )
+    try:
+        try:
+            _, _, sizes = file_inventory()
+            total = sum(size for size in sizes.values() if size is not None)
+            print(f"Размер файлов файрвола — {format_size(total)}")
+        except OSError:
+            print("Размер файлов файрвола — не удалось определить")
+        show_menu("""
+NEW_TAIL = """        ("Версии и обновление скрипта", (
+            ("Версии и что исправлено", boxed("Версии", show_versions)),
+            ("Обновить скрипт до последней версии", update_script),
+            ("Откатить скрипт к другой версии", rollback_script),
+        )),
+        ("Отключить или удалить", (
+            ("Удалить правила и автообновление", remove_rules),
+            ("Удалить скрипт и настройки", uninstall),
+        )),
+    )
+    try:
+        show_menu("""
+menu = replace_once(menu, OLD_TAIL, NEW_TAIL, "порядок пунктов и заголовок")
 
 # ---------------------------------------------------------------- сборка
 new_text = text

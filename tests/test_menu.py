@@ -104,30 +104,29 @@ left = menu.ERROR_LOG.read_text(encoding="utf-8").splitlines()
 check(left == ["2026-11-11 11:00:00 apply WARN: поздняя запись"], "поздняя запись пережила очистку")
 check(oct(menu.ERROR_LOG.stat().st_mode & 0o777) == "0o600", "права журнала после очистки 0600")
 
-# 6. пункт меню шестой, нумерация прежняя; седьмой — версии
+# 6. меню 1.6.0: шесть пунктов, журнал и «что ещё» в подменю «Статус и наблюдение»
 captured = {}
 original_show = menu.show_menu
 
 
 def spy(title, entries, exit_label="Назад"):
-    captured["titles"] = [label for label, _ in entries]
-    captured["sixth"] = entries[5][1]
-    captured["seventh"] = entries[6][1]
-    captured["eighth"] = entries[-1][1]
+    captured["entries"] = entries
 
 
 menu.show_menu = spy
 with redirect_stdout(io.StringIO()):
     menu.main()
 menu.show_menu = original_show
-titles = captured["titles"]
-check(titles[:5] == ["Статус файрвола", "Настроить доступ", "Настроить блокировки",
-                     "Проверить и применить правила", "Отключить или удалить"],
-      "пункты 1–5 на прежних местах")
-check(len(titles) == 8 and titles[5] == "Журнал ошибок", "шестой пункт — «Журнал ошибок»")
-check(getattr(captured["sixth"], "__wrapped__", captured["sixth"]) is menu.show_error_log, "шестой пункт вызывает show_error_log")
-check(titles[7] == "Что ещё есть на сервере" and getattr(captured["eighth"], "__wrapped__", captured["eighth"]) is menu.show_server_overview, "восьмой пункт — «Что ещё есть на сервере»")
-check(titles[6] == "Версии и обновление скрипта" and isinstance(captured["seventh"], tuple), "седьмой пункт — «Версии и обновление скрипта»")
+titles = [label for label, _ in captured["entries"]]
+check(titles == ["Статус и наблюдение", "Настроить доступ", "Настроить блокировки",
+                 "Проверить и применить правила", "Версии и обновление скрипта", "Отключить или удалить"],
+      "шесть пунктов меню в новом порядке")
+observe = dict(captured["entries"][0][1])
+check(getattr(observe["Журнал ошибок"], "__wrapped__", observe["Журнал ошибок"]) is menu.show_error_log,
+      "«Журнал ошибок» в подменю вызывает show_error_log")
+check(getattr(observe["Что ещё есть на сервере"], "__wrapped__", observe["Что ещё есть на сервере"]) is menu.show_server_overview,
+      "«Что ещё есть на сервере» в подменю вызывает show_server_overview")
+check(isinstance(dict(captured["entries"])["Версии и обновление скрипта"], tuple), "«Версии и обновление скрипта» — подменю")
 
 # 7. список файлов знает про журнал
 menu.ERROR_LOG.unlink()

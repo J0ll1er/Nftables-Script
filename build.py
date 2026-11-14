@@ -2376,6 +2376,29 @@ def parse_ripe_owner(text):
         return ""
 
 
+def fetch_whois(address):
+    """Запись о блоке адресов у регистратора через RIPEstat; пусто, если сеть не ответила."""
+    url = f"https://stat.ripe.net/data/whois/data.json?resource={address}"
+    try:
+        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4", url],
+                                text=True, capture_output=True, timeout=6, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def parse_whois_owner(text):
+    """(название, страна) из первой записи; у регистраторов поля называются по-разному."""
+    try:
+        fields = {}
+        for item in json.loads(text)["data"]["records"][0]:
+            fields.setdefault(str(item["key"]).lower(), str(item["value"]).strip())
+    except (ValueError, KeyError, IndexError, TypeError):
+        return "", ""
+    name = next((fields[key] for key in ("descr", "orgname", "owner", "netname") if fields.get(key)), "")
+    return name, fields.get("country", "")
+
+
 def lookup_owner(address):
     """Владелец адреса по RIPEstat; ответ запоминается на 30 дней. Любой сбой даёт пустую строку."""
     try:
@@ -2397,7 +2420,13 @@ def lookup_owner(address):
     if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], int) \
             and now - entry[1] < OWNER_CACHE_DAYS * 86400 and isinstance(entry[0], str):
         return entry[0]
-    owner = parse_ripe_owner(fetch_ripe(address))
+    answer = fetch_ripe(address)
+    owner = parse_ripe_owner(answer)
+    if owner:
+        # название из записи блока (регистратор) точнее владельца AS: берём его, если оно есть
+        name, country = parse_whois_owner(fetch_whois(address))
+        if name:
+            owner = ", ".join(part for part in (name, country, owner.rpartition(" ")[2]) if part)
     if owner:
         cache[address] = [owner, now]
         fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list) and len(item[1]) == 2
@@ -2450,7 +2479,8 @@ def show_hits():
             owner = owner_of(address, sources) if kind == "scanners" else ""
             owners.append(owner or lookup_owner(address) or reverse_name(address) or "неизвестно")
         width = min(39, max(len(address) for address, _p, _c in summary["top_sources"]))
-        owner_width = min(34, max(len(owner) for owner in owners))
+        owner_width = min(40, max(len(owner) for owner in owners))
+        owners = [owner if len(owner) <= owner_width else owner[:owner_width - 1].rstrip() + "…" for owner in owners]
         for (address, packets, count), owner in zip(summary["top_sources"], owners):
             print(f"  {address:<{width}}  {owner[:owner_width]:<{owner_width}}  "
                   f"{hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")

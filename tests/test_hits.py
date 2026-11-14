@@ -224,6 +224,15 @@ RIPE_ANSWER = json.dumps({"status": "ok", "data": {"resource": "20.96.0.0/14", "
     "asns": [{"asn": 8075, "holder": "MICROSOFT-CORP-MSN-AS-BLOCK - Microsoft Corporation"}]}})
 
 
+WHOIS_ANSWER = json.dumps({"status": "ok", "data": {"records": [[
+    {"key": "inetnum", "value": "172.110.223.0/24"}, {"key": "netname", "value": "dedires"},
+    {"key": "country", "value": "HK"}, {"key": "org", "value": "ORG-DL455-RIPE"}]],
+    "irr_records": [[{"key": "route", "value": "172.110.223.0/24"}]]}})
+WHOIS_ARIN = json.dumps({"data": {"records": [[
+    {"key": "NetName", "value": "AMAZO-4"}, {"key": "OrgName", "value": "Amazon Technologies Inc."},
+    {"key": "Country", "value": "US"}]]}})
+
+
 class Lookup(unittest.TestCase):
     def setUp(self):
         self.menu = importlib.util.module_from_spec(SPEC)
@@ -236,6 +245,7 @@ class Lookup(unittest.TestCase):
             self.calls.append(address)
             return RIPE_ANSWER
         self.menu.fetch_ripe = fetch
+        self.menu.fetch_whois = lambda address: ""
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -246,6 +256,44 @@ class Lookup(unittest.TestCase):
     def test_parse_keeps_plain_holder_without_dash(self):
         text = json.dumps({"data": {"asns": [{"asn": 24940, "holder": "HETZNER-AS"}]}})
         self.assertEqual(self.menu.parse_ripe_owner(text), "HETZNER-AS AS24940")
+
+    def test_parse_whois_takes_best_name_and_country(self):
+        self.assertEqual(self.menu.parse_whois_owner(WHOIS_ANSWER), ("dedires", "HK"))
+        self.assertEqual(self.menu.parse_whois_owner(WHOIS_ARIN), ("Amazon Technologies Inc.", "US"))
+        descr = json.dumps({"data": {"records": [[{"key": "netname", "value": "X-NET"},
+                {"key": "descr", "value": "Blix Solutions AS"}, {"key": "descr", "value": "второе"}]]}})
+        self.assertEqual(self.menu.parse_whois_owner(descr), ("Blix Solutions AS", ""))
+
+    def test_parse_whois_bad_answers(self):
+        for bad in ("", "x", "{}", '{"data": {"records": []}}', '{"data": {"records": [[]]}}'):
+            self.assertEqual(self.menu.parse_whois_owner(bad), ("", ""), bad)
+
+    def test_owner_combines_registry_name_country_and_as(self):
+        self.menu.fetch_whois = lambda address: WHOIS_ANSWER
+        self.assertEqual(self.menu.lookup_owner("172.110.223.81"), "dedires, HK, AS8075")
+
+    def test_owner_without_whois_falls_back_to_as_holder(self):
+        self.assertEqual(self.menu.lookup_owner("172.110.223.81"), "Microsoft Corporation AS8075")
+
+    def test_whois_not_asked_when_registry_is_down(self):
+        asked = []
+        self.menu.fetch_ripe = lambda address: ""
+        self.menu.fetch_whois = lambda address: asked.append(address) or WHOIS_ANSWER
+        self.assertEqual(self.menu.lookup_owner("172.110.223.81"), "")
+        self.assertEqual(asked, [])
+
+    def test_long_owner_is_cut_with_ellipsis_on_screen(self):
+        menu = self.menu
+        long = "Очень длинное название организации которое не помещается AS1"
+        menu.lookup_owner = lambda address: long
+        menu.probe_output = lambda *c: (
+            "elements = { 20.98.155.81 . 443 counter packets 1 bytes 1 expires 1d }" if c[-1] == "sn4" else "")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            menu.show_hits()
+        line = next(item for item in out.getvalue().splitlines() if "20.98.155.81" in item)
+        self.assertIn("…", line)
+        self.assertNotIn(long, line)
 
     def test_parse_bad_answers_give_empty(self):
         for bad in ("", "не json", "{}", '{"status": "error"}', '{"data": {"asns": []}}',

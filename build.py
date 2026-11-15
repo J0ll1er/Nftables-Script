@@ -2224,6 +2224,8 @@ if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
 fi
 ''', "статистика: сборка и откат")
 
+menu = replace_once(menu, "import datetime\nimport fcntl\n", "import concurrent.futures\nimport datetime\nimport fcntl\n", "импорт потоков")
+menu = replace_once(menu, "import tempfile\nimport textwrap\n", "import tempfile\nimport textwrap\nimport threading\n", "импорт блокировки")
 menu = replace_once(menu, "def show_status():\n", r'''HIT_SETS = (("scanners", "ss4"), ("scanners", "ss6"), ("non_ru", "sn4"), ("non_ru", "sn6"))
 HIT_RE = re.compile(r"([0-9a-fA-F:.]+) \. (\d+) counter packets (\d+) bytes (\d+)")
 PORT_NAMES = {
@@ -2255,6 +2257,40 @@ def summarize_hits(rows, top=5):
 
 def port_label(port):
     return PORT_NAMES.get(port, "")
+
+
+OWNER_LOOKUPS = 15  # владельца узнаём у стольких самых активных адресов; остальные идут одной строкой
+OWNER_WORKERS = 6
+OTHER_ADDRESSES = "другие адреса"
+
+
+def group_by_owner(rows, owner_for):
+    """Строки счётчиков -> группы по владельцу: адреса, попытки, три главных порта. Самые активные первыми."""
+    groups = {}
+    for address, port, packets, _size in rows:
+        group = groups.setdefault(owner_for(address), {"addresses": set(), "packets": 0, "by_port": {}})
+        group["addresses"].add(address)
+        group["packets"] += packets
+        group["by_port"][port] = group["by_port"].get(port, 0) + packets
+    result = []
+    for owner, group in groups.items():
+        ports = sorted(group["by_port"].items(), key=lambda item: (-item[1], item[0]))[:3]
+        result.append({"owner": owner, "addresses": len(group["addresses"]), "packets": group["packets"],
+                       "ports": [port for port, _count in ports]})
+    result.sort(key=lambda group: (-group["packets"], group["owner"]))
+    return result
+
+
+def fit_ports(prefix, count, ports, room):
+    """«N адр.  порты: 443, 8443» целиком, а если не влезает в room, то с меньшим числом портов."""
+    head = f"  {count} адр."
+    shown = list(ports)
+    while shown:
+        text = f"{head}  порты: {', '.join(str(port) for port in shown)}"
+        if len(prefix) + len(text) <= room:
+            return text
+        shown.pop()
+    return head
 
 
 def hits_bar(value, maximum, width=10):
@@ -2355,6 +2391,7 @@ def reverse_name(address):
 OWNER_CACHE_FILE = "owner-cache.json"
 OWNER_CACHE_DAYS = 30
 OWNER_CACHE_LIMIT = 500
+OWNER_CACHE_LOCK = threading.Lock()
 OWNER_TEXT_WIDTH = 40
 
 
@@ -2445,13 +2482,19 @@ def lookup_owner(address):
                 name = name[:max(8, room - 1)].rstrip(" ,-") + "…"
             owner = f"{name}, {tail}"
     if owner:
-        cache[address] = [owner, now]
-        fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list) and len(item[1]) == 2
-                       and isinstance(item[1][1], int) else 0)[:OWNER_CACHE_LIMIT]
-        try:
-            write_text_atomic(path, json.dumps(dict(fresh), ensure_ascii=False))
-        except OSError:
-            pass
+        with OWNER_CACHE_LOCK:
+            try:  # запросы идут параллельно: перед записью перечитываем файл, чтобы не потерять чужие записи
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                cache = loaded if isinstance(loaded, dict) else cache
+            except (OSError, ValueError):
+                pass
+            cache[address] = [owner, now]
+            fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list)
+                           and len(item[1]) == 2 and isinstance(item[1][1], int) else 0)[:OWNER_CACHE_LIMIT]
+            try:
+                write_text_atomic(path, json.dumps(dict(fresh), ensure_ascii=False))
+            except OSError:
+                pass
     return owner
 
 
@@ -2473,16 +2516,37 @@ def screen_columns():
 COMPACT_BELOW = 100
 
 
-HITS_HEADINGS = ("Сканеры и сети ведомств", "Не из России", "Что здесь не видно")
+HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Чего здесь нет")
+
+
+def resolve_owners(addresses, kind, sources):
+    """{адрес: владелец}: списки сканеров, затем RIPEstat (с кэшем), затем DNS. Запросы идут параллельно,
+    любой сбой даёт «неизвестно»."""
+    def one(address):
+        try:
+            owner = owner_of(address, sources) if kind == "scanners" else ""
+            return owner or lookup_owner(address) or reverse_name(address) or "неизвестно"
+        except Exception:
+            return "неизвестно"
+    if not addresses:
+        return {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=OWNER_WORKERS) as pool:
+        return dict(zip(addresses, pool.map(one, addresses)))
 
 
 def show_hits():
     color = menu_color()
     columns = screen_columns()
     compact = columns < COMPACT_BELOW
-    print("\nКто стучится: пакеты, отброшенные файрволом (счёт ведётся с включения статистики, хранится до 7 дней)")
-    groups = (("scanners", "Сканеры и сети ведомств (все порты)"),
-              ("non_ru", "Не из России на защищённых портах"))
+
+    def say(text):  # длинные пояснения переносятся по ширине экрана (рамка оставляет columns - 4)
+        print(textwrap.fill(text, width=max(30, columns - 4)))
+
+    print()
+    say("Кто стучится: попытки подключения, которые файрвол отклонил. "
+        "Счёт идёт с включения статистики, данные хранятся до 7 дней.")
+    groups = (("scanners", "Сканеры и сети ведомств (любые порты)"),
+              ("non_ru", "Из других стран (на защищённых портах)"))
     collected = {"scanners": [], "non_ru": []}
     sources = load_scanner_sources()
     seen = False
@@ -2492,18 +2556,20 @@ def show_hits():
             seen = True
             collected[kind].extend(parse_hits(text))
     if not seen:
-        print("\nСтатистика не ведётся: правила загружены без неё (старая версия nft или ядра) или ещё не обновлены.")
-        print("Примените правила заново: «Проверить и применить правила» → «Применить правила и включить таймер».")
+        print()
+        say("Статистика не ведётся: правила загружены без неё (старая версия nft или ядра) или ещё не обновлены.")
+        say("Примените правила заново: «Проверить и применить правила» → «Применить правила и включить таймер».")
         return
     if not any(collected.values()):
-        print("\nПока никого: статистика включена, но отброшенных пакетов ещё нет. Загляните позже.")
+        print()
+        say("Пока никого: статистика включена, но отклонённых попыток ещё нет. Загляните позже.")
     for kind, title in groups:
         rows = collected[kind]
         if not rows:
             continue
         summary = summarize_hits(rows)
         print(f"\n{title}")
-        print(f"Всего пакетов: {summary['packets']}, разных адресов: {summary['sources']}")
+        print(f"Попыток: {summary['packets']}, с разных адресов: {summary['sources']}")
         print("Куда стучатся (порты):")
         biggest = summary["ports"][0][1]
         for port, packets in summary["ports"]:
@@ -2514,12 +2580,36 @@ def show_hits():
                 print(f"  {port:>5}  {hits_bar_view(packets, biggest, 6, color)}  {packets:>5}" + (f"  {label}" if label else ""))
             else:
                 print(f"  {port:>5}  {hits_bar_view(packets, biggest, 10, color)}  {packets:>6}" + (f"  {label}" if label else ""))
-        print("Кто стучится (адреса, чей адрес):")
+        by_address = {}
+        for address, _port, packets, _size in rows:
+            by_address[address] = by_address.get(address, 0) + packets
+        busiest = [address for address, _packets in sorted(by_address.items(), key=lambda item: (-item[1], item[0]))]
+        owner_of_address = resolve_owners(busiest[:OWNER_LOOKUPS], kind, sources)
+        owner_groups = group_by_owner(rows, lambda address: owner_of_address.get(address, OTHER_ADDRESSES))
+        named = [group for group in owner_groups if group["owner"] != OTHER_ADDRESSES]
+        rest = [group for group in owner_groups if group["owner"] == OTHER_ADDRESSES]
+        shown = named[:5] + rest
+        print("По владельцам:")
+        biggest = max(group["packets"] for group in (named[:5] or shown))  # «другие адреса» масштаб не задают
+        owner_width = min(40, max(len(group["owner"]) for group in shown))
+        for group in shown:
+            owner = group["owner"] if len(group["owner"]) <= owner_width else group["owner"][:owner_width - 1].rstrip() + "…"
+            leftover = group["owner"] == OTHER_ADDRESSES  # без полоски: сумма остатка не сравнима с владельцами
+            if compact:
+                room = columns - 4
+                print("  " + (owner if len(owner) <= room - 2 else owner[:room - 3].rstrip() + "…"))
+                prefix = f"    {hits_bar(group['packets'], biggest, 6)} {group['packets']:>5}"
+                tail = fit_ports(prefix, group["addresses"], group["ports"], room)
+                bar = " " * len(hits_bar(0, 1, 6)) if leftover else hits_bar_view(group["packets"], biggest, 6, color)
+                print(f"    {bar} {group['packets']:>5}{tail}")
+            else:
+                prefix = f"  {owner:<{owner_width}}  {hits_bar(group['packets'], biggest, 8)} {group['packets']:>6}"
+                tail = fit_ports(prefix, group["addresses"], group["ports"], 10 ** 6)
+                bar = " " * len(hits_bar(0, 1, 8)) if leftover else hits_bar_view(group["packets"], biggest, 8, color)
+                print(f"  {owner:<{owner_width}}  {bar} {group['packets']:>6}{tail}")
+        print("Самые активные адреса:")
         biggest = summary["top_sources"][0][1]
-        owners = []
-        for address, _packets, _count in summary["top_sources"]:
-            owner = owner_of(address, sources) if kind == "scanners" else ""
-            owners.append(owner or lookup_owner(address) or reverse_name(address) or "неизвестно")
+        owners = [owner_of_address.get(address, "неизвестно") for address, _p, _c in summary["top_sources"]]
         width = min(39, max(len(address) for address, _p, _c in summary["top_sources"]))
         owner_width = min(40, max(len(owner) for owner in owners))
         owners = [owner if len(owner) <= owner_width else owner[:owner_width - 1].rstrip() + "…" for owner in owners]
@@ -2533,9 +2623,9 @@ def show_hits():
             else:
                 print(f"  {address:<{width}}  {owner[:owner_width]:<{owner_width}}  "
                       f"{hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")
-    print("\nЧто здесь не видно")
-    print("Порт SSH файрвол не фильтрует, поэтому попытки входа по SSH сюда не попадают (смотрите журнал sshd).")
-    print("Считаются пакеты, а не подключения: сканер может прислать их несколько на один порт.")
+    print("\nЧего здесь нет")
+    say("Попытки входа по SSH сюда не попадают: порт SSH файрвол не фильтрует (смотрите журнал sshd).")
+    say("Считаются отдельные пакеты, а не подключения: один сканер может прислать несколько пакетов на один порт.")
 
 
 ''' + "def show_status():\n", "функции «Кто стучится»")

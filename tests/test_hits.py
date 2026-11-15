@@ -111,7 +111,7 @@ class Hits(unittest.TestCase):
                        "sn4": SET_TEXT.replace("198.51.100.7", "192.0.2.50"), "sn6": ""})
         text = self.show()
         self.assertIn("Сканеры и сети ведомств", text)
-        self.assertIn("Не из России", text)
+        self.assertIn("Из других стран", text)
         self.assertIn("22222", text)
         self.assertIn("RDP", text)
         self.assertIn("198.51.100.7", text)
@@ -178,8 +178,7 @@ class Narrow(unittest.TestCase):
 
     def test_no_line_is_longer_than_the_box_on_a_phone(self):
         lines = self.render(58)
-        too_long = [line for line in lines if len(line) > 54 and "Кто стучится: пакеты" not in line
-                    and not line.startswith(("Порт SSH", "Считаются"))]
+        too_long = [line for line in lines if len(line) > 54]
         self.assertEqual(too_long, [])
 
     def test_owner_goes_under_the_address(self):
@@ -275,6 +274,100 @@ class Owners(unittest.TestCase):
         self.assertIn("Censys", line)
         line = next(item for item in text.splitlines() if "20.98.155.81" in item)
         self.assertIn("azure.com", line)
+
+
+class Grouped(unittest.TestCase):
+    """«По владельцам»: одна строка на владельца, простые слова на экране."""
+    ROWS = ("elements = { 185.93.89.10 . 443 counter packets 50 bytes 1 expires 1d, "
+            "185.93.89.11 . 443 counter packets 30 bytes 1 expires 1d, "
+            "185.93.89.11 . 8443 counter packets 5 bytes 1 expires 1d, "
+            "192.248.150.180 . 3389 counter packets 9 bytes 1 expires 1d }")
+    OWNERS = {"185.93.89.10": "LimitedNetwork, AE, AS213790", "185.93.89.11": "LimitedNetwork, AE, AS213790",
+              "192.248.150.180": "The Constant Company, GB, AS20473"}
+
+    def setUp(self):
+        self.menu = importlib.util.module_from_spec(SPEC)
+        LOADER.exec_module(self.menu)
+        self.calls = []
+
+        def lookup(address):
+            self.calls.append(address)
+            return self.OWNERS.get(address, "")
+        self.menu.lookup_owner = lookup
+        self.menu.reverse_name = lambda address: ""
+        self.menu.probe_output = lambda *c: self.ROWS if c[-1] == "sn4" else ""
+
+    def render(self, columns=120):
+        self.menu.screen_columns = lambda: columns
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.menu.show_hits()
+        return out.getvalue()
+
+    def test_group_sums_addresses_packets_and_ports(self):
+        rows = self.menu.parse_hits(self.ROWS)
+        groups = self.menu.group_by_owner(rows, lambda address: self.OWNERS[address])
+        self.assertEqual([group["owner"] for group in groups],
+                         ["LimitedNetwork, AE, AS213790", "The Constant Company, GB, AS20473"])
+        first = groups[0]
+        self.assertEqual((first["addresses"], first["packets"]), (2, 85))
+        self.assertEqual(first["ports"], [443, 8443])
+
+    def test_group_keeps_at_most_three_ports_ordered_by_packets(self):
+        rows = [("1.1.1.1", port, packets, 0) for port, packets in ((1, 1), (2, 9), (3, 5), (4, 7))]
+        group = self.menu.group_by_owner(rows, lambda address: "X")[0]
+        self.assertEqual(group["ports"], [2, 4, 3])
+
+    def test_screen_has_owner_section_with_counts(self):
+        text = self.render()
+        self.assertIn("По владельцам", text)
+        line = next(item for item in text.splitlines() if "LimitedNetwork" in item)
+        self.assertIn("2 адр.", line)
+        self.assertIn("443, 8443", line)
+        self.assertIn("85", line)
+
+    def test_owner_lines_fit_a_phone(self):
+        lines = self.render(58).splitlines()
+        start = next(i for i, line in enumerate(lines) if "По владельцам" in line)
+        for line in lines[start:start + 9]:
+            self.assertLessEqual(len(line), 54, line)
+        self.assertTrue(any("LimitedNetwork" in line for line in lines[start:]))
+
+    def test_only_the_busiest_addresses_are_looked_up(self):
+        many = ", ".join(f"10.0.{i // 250}.{i % 250 + 1} . 443 counter packets {1000 - i} bytes 1 expires 1d"
+                         for i in range(60))
+        self.menu.probe_output = lambda *c: f"elements = {{ {many} }}" if c[-1] == "sn4" else ""
+        self.menu.lookup_owner = lambda address: self.calls.append(address) or ""
+        text = self.render()
+        self.assertLessEqual(len(set(self.calls)), self.menu.OWNER_LOOKUPS)
+        self.assertIn("другие адреса", text)  # остаток не теряется, показывается одной строкой
+
+    def test_leftover_line_has_no_bar_and_does_not_set_the_scale(self):
+        many = ", ".join(f"10.0.{i // 250}.{i % 250 + 1} . 443 counter packets {1000 - i} bytes 1 expires 1d"
+                         for i in range(60))
+        self.menu.probe_output = lambda *c: f"elements = {{ {many} }}" if c[-1] == "sn4" else ""
+        self.menu.lookup_owner = lambda address: "Один владелец, XX, AS1"
+        lines = self.render().splitlines()
+        rest = next(item for item in lines if item.strip().startswith("другие адреса"))
+        self.assertNotIn("▮", rest)
+        self.assertNotIn("▯", rest)
+        named = next(item for item in lines if item.strip().startswith("Один владелец"))
+        self.assertEqual(named.count("▮"), 8)  # самый активный владелец занимает всю полоску
+
+    def test_failed_lookup_does_not_break_the_screen(self):
+        def broken(address):
+            raise RuntimeError("сеть упала")
+        self.menu.lookup_owner = broken
+        text = self.render()
+        self.assertIn("неизвестно", text)
+        self.assertNotIn("Traceback", text)
+
+    def test_plain_words_instead_of_jargon(self):
+        text = self.render()
+        for word in ("Попыток:", "с разных адресов", "Из других стран", "Чего здесь нет"):
+            self.assertIn(word, text)
+        for old in ("Всего пакетов", "пакеты, отброшенные", "Что здесь не видно", "чей адрес"):
+            self.assertNotIn(old, text)
 
 
 RIPE_ANSWER = json.dumps({"status": "ok", "data": {"resource": "20.96.0.0/14", "announced": True,
@@ -391,6 +484,13 @@ class Lookup(unittest.TestCase):
         for bad in ("", "не json", "{}", '{"status": "error"}', '{"data": {"asns": []}}',
                     '{"data": {"asns": [{"holder": "X"}]}}'):
             self.assertEqual(self.menu.parse_ripe_owner(bad), "", bad)
+
+    def test_parallel_lookups_keep_every_cache_entry(self):
+        addresses = [f"20.98.{i}.1" for i in range(24)]
+        owners = self.menu.resolve_owners(addresses, "non_ru", [])
+        self.assertEqual(len(owners), 24)
+        cache = json.loads((Path(self.tmp.name) / self.menu.OWNER_CACHE_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(sorted(cache), sorted(addresses))
 
     def test_lookup_asks_once_then_uses_cache(self):
         self.assertEqual(self.menu.lookup_owner("20.98.155.81"), "Microsoft Corporation AS8075")

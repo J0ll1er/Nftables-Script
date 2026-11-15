@@ -576,6 +576,19 @@ upd = replace_once(
 
 # ----------------------------------------------------------------- fw-menu
 menu = parts["menu"][2]
+menu = replace_once(menu, """def probe_output(*command):
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=4, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+""", """def probe_output(*command, timeout=4, on_timeout=""):
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return on_timeout
+    except OSError:
+        return ""
+""", "probe_output: необязательный таймаут")
 
 menu = replace_once(
     menu,
@@ -2243,6 +2256,9 @@ def parse_hits(text):
     return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
 
 
+HITS_READ_TIMEOUT = 30  # полный набор (65536 записей) на слабом сервере читается дольше обычных 4 секунд
+
+
 def set_is_full(text):
     """Набор статистики заполнен: ядро не добавляет новые записи, пока старые не истекут."""
     match = re.search(r"^\s*size (\d+)\s*$", text, re.M)
@@ -2557,19 +2573,34 @@ def show_hits():
     full = set()
     sources = load_scanner_sources()
     seen = False
-    for kind, name in HIT_SETS:
-        text = probe_output("nft", "-n", "list", "set", "inet", "fw", name)
-        if text:
+    slow = []
+
+    def read_set(item):
+        return probe_output("nft", "-n", "list", "set", "inet", "fw", item[1],
+                            timeout=HITS_READ_TIMEOUT, on_timeout=None)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(HIT_SETS)) as pool:
+        answers = list(pool.map(read_set, HIT_SETS))  # параллельно: самый долгий ответ, а не сумма
+    for (kind, name), text in zip(HIT_SETS, answers):
+        if text is None:
+            slow.append(name)
+        elif text:
             seen = True
             collected[kind].extend(parse_hits(text))
             if set_is_full(text):
                 full.add(kind)
+    if slow:
+        print()
+        say(f"Часть статистики не прочитана ({', '.join(slow)}): nft не ответил за {HITS_READ_TIMEOUT} с. "
+            "Блокировка от этого не зависит, откройте экран позже.")
+    if not seen and slow:
+        return
     if not seen:
         print()
         say("Статистика не ведётся: правила загружены без неё (старая версия nft или ядра) или ещё не обновлены.")
         say("Примените правила заново: «Проверить и применить правила» → «Применить правила и включить таймер».")
         return
-    if not any(collected.values()):
+    if not any(collected.values()) and not slow:
         print()
         say("Пока никого: статистика включена, но отклонённых попыток ещё нет. Загляните позже.")
     for kind, title in groups:

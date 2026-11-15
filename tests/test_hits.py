@@ -46,7 +46,7 @@ class Hits(unittest.TestCase):
         self.menu.screen_columns = lambda: 120
 
     def fake_nft(self, outputs):
-        def probe(*command):
+        def probe(*command, **_):
             return outputs.get(command[-1], "")
         self.menu.probe_output = probe
 
@@ -148,6 +148,56 @@ class Hits(unittest.TestCase):
         self.fake_nft({"ss4": SET_TEXT, "ss6": SET_TEXT_V6, "sn4": "", "sn6": ""})
         self.assertNotIn("закончилось", self.show())
 
+    def slow_nft(self, slow, outputs):
+        # как probe_output при таймауте: для «медленных» наборов возвращает on_timeout
+        self.asked = []
+
+        def probe(*command, timeout=4, on_timeout=""):
+            self.asked.append(timeout)
+            return on_timeout if command[-1] in slow else outputs.get(command[-1], "")
+        self.menu.probe_output = probe
+        self.menu.reverse_name = lambda address: ""
+
+    def test_slow_set_is_reported_and_other_group_still_shown(self):
+        self.slow_nft({"ss4"}, {"sn4": SET_TEXT.replace("198.51.100.7", "192.0.2.50")})
+        text = self.show()
+        self.assertIn("не прочитана (ss4)", text)
+        self.assertIn("Блокировка от этого не зависит", text)
+        self.assertIn("Из других стран", text)
+        self.assertNotIn("Сканеры и сети ведомств (любые порты)", text)
+        self.assertNotIn("не ведётся", text)
+
+    def test_all_sets_slow_is_not_called_missing_statistics(self):
+        # раньше таймаут выглядел как пустой ответ: «Статистика не ведётся… примените правила заново»
+        self.slow_nft({"ss4", "ss6", "sn4", "sn6"}, {})
+        text = self.show()
+        self.assertIn("не прочитана (ss4, ss6, sn4, sn6)", text)
+        self.assertNotIn("не ведётся", text)
+        self.assertNotIn("Примените правила заново", text)
+        self.assertNotIn("Пока никого", text)
+
+    def test_unread_set_is_not_reported_as_nobody_knocking(self):
+        empty = "table inet fw {\n\tset sn4 {\n\t\ttype ipv4_addr . inet_service\n\t}\n}\n"
+        self.slow_nft({"ss4"}, {"sn4": empty})
+        text = self.show()
+        self.assertIn("не прочитана (ss4)", text)
+        self.assertNotIn("Пока никого", text)
+
+    def test_sets_are_read_with_a_long_timeout(self):
+        # полный набор на 65536 записей на слабом сервере читается дольше обычных 4 секунд
+        self.slow_nft(set(), {"ss4": SET_TEXT})
+        self.show()
+        self.assertEqual(len(self.asked), 4)
+        self.assertTrue(all(timeout >= 30 for timeout in self.asked), self.asked)
+
+    def test_probe_output_timeout_is_optional(self):
+        if not shutil.which("sleep"):
+            self.skipTest("нет sleep")
+        self.assertEqual(self.menu.probe_output("sleep", "2", timeout=0.2), "")  # по умолчанию как раньше
+        self.assertIsNone(self.menu.probe_output("sleep", "2", timeout=0.2, on_timeout=None))
+        self.assertEqual(self.menu.probe_output("/nonexistent/cmd", on_timeout=None), "")
+        self.assertEqual(self.menu.probe_output("echo", "hi"), "hi\n")
+
     def test_screen_when_sets_missing_explains_in_words(self):
         self.fake_nft({})
         text = self.show()
@@ -191,7 +241,7 @@ class Narrow(unittest.TestCase):
                   "185.12.59.118": "BLIX Blix Solutions AS, NO, AS50304",
                   "192.248.150.180": "The Constant Company, LLC, GB, AS20473"}
         self.menu.lookup_owner = lambda address: owners.get(address, "")
-        self.menu.probe_output = lambda *c: self.ROWS if c[-1] == "sn4" else ""
+        self.menu.probe_output = lambda *c, **_: self.ROWS if c[-1] == "sn4" else ""
 
     def render(self, columns):
         self.menu.screen_columns = lambda: columns
@@ -219,7 +269,7 @@ class Narrow(unittest.TestCase):
         self.assertIn("портов: 1", line)
 
     def test_port_label_is_shortened_not_wrapped_on_a_phone(self):
-        self.menu.probe_output = lambda *c: ("elements = { 1.2.3.4 . 3389 counter packets 30 bytes 1 expires 1d }"
+        self.menu.probe_output = lambda *c, **_: ("elements = { 1.2.3.4 . 3389 counter packets 30 bytes 1 expires 1d }"
                                              if c[-1] == "sn4" else "")
         line = next(item for item in self.render(58) if item.strip().startswith("3389"))
         self.assertLessEqual(len(line), 54)
@@ -285,7 +335,7 @@ class Owners(unittest.TestCase):
 
     def test_screen_shows_owner_and_reverse_name(self):
         menu = self.menu
-        menu.probe_output = lambda *c: (
+        menu.probe_output = lambda *c, **_: (
             "elements = { 162.216.149.179 . 22 counter packets 5 bytes 1 expires 1d }" if c[-1] == "ss4" else
             "elements = { 20.98.155.81 . 443 counter packets 1 bytes 1 expires 1d }" if c[-1] == "sn4" else "")
         menu.reverse_name = lambda address: "vm.compute.azure.com"
@@ -319,7 +369,7 @@ class Grouped(unittest.TestCase):
             return self.OWNERS.get(address, "")
         self.menu.lookup_owner = lookup
         self.menu.reverse_name = lambda address: ""
-        self.menu.probe_output = lambda *c: self.ROWS if c[-1] == "sn4" else ""
+        self.menu.probe_output = lambda *c, **_: self.ROWS if c[-1] == "sn4" else ""
 
     def render(self, columns=120):
         self.menu.screen_columns = lambda: columns
@@ -360,7 +410,7 @@ class Grouped(unittest.TestCase):
     def test_only_the_busiest_addresses_are_looked_up(self):
         many = ", ".join(f"10.0.{i // 250}.{i % 250 + 1} . 443 counter packets {1000 - i} bytes 1 expires 1d"
                          for i in range(60))
-        self.menu.probe_output = lambda *c: f"elements = {{ {many} }}" if c[-1] == "sn4" else ""
+        self.menu.probe_output = lambda *c, **_: f"elements = {{ {many} }}" if c[-1] == "sn4" else ""
         self.menu.lookup_owner = lambda address: self.calls.append(address) or ""
         text = self.render()
         self.assertLessEqual(len(set(self.calls)), self.menu.OWNER_LOOKUPS)
@@ -369,7 +419,7 @@ class Grouped(unittest.TestCase):
     def test_leftover_line_has_no_bar_and_does_not_set_the_scale(self):
         many = ", ".join(f"10.0.{i // 250}.{i % 250 + 1} . 443 counter packets {1000 - i} bytes 1 expires 1d"
                          for i in range(60))
-        self.menu.probe_output = lambda *c: f"elements = {{ {many} }}" if c[-1] == "sn4" else ""
+        self.menu.probe_output = lambda *c, **_: f"elements = {{ {many} }}" if c[-1] == "sn4" else ""
         self.menu.lookup_owner = lambda address: "Один владелец, XX, AS1"
         lines = self.render().splitlines()
         rest = next(item for item in lines if item.strip().startswith("другие адреса"))
@@ -510,7 +560,7 @@ class Lookup(unittest.TestCase):
         menu = self.menu
         long = "Очень длинное название организации которое не помещается AS1"
         menu.lookup_owner = lambda address: long
-        menu.probe_output = lambda *c: (
+        menu.probe_output = lambda *c, **_: (
             "elements = { 20.98.155.81 . 443 counter packets 1 bytes 1 expires 1d }" if c[-1] == "sn4" else "")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -563,7 +613,7 @@ class Lookup(unittest.TestCase):
 
     def test_screen_prefers_lists_then_registry_then_dns(self):
         menu = self.menu
-        menu.probe_output = lambda *c: (
+        menu.probe_output = lambda *c, **_: (
             "elements = { 20.98.155.81 . 443 counter packets 1 bytes 1 expires 1d }" if c[-1] == "sn4" else "")
         menu.reverse_name = lambda address: "dns.example.com"
         out = io.StringIO()

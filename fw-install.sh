@@ -1503,10 +1503,12 @@ def run(*command):
     return subprocess.run(command, check=False).returncode == 0
 
 
-def probe_output(*command):
+def probe_output(*command, timeout=4, on_timeout=""):
     try:
-        result = subprocess.run(command, text=True, capture_output=True, timeout=4, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+        result = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return on_timeout
+    except OSError:
         return ""
     return result.stdout if result.returncode == 0 else ""
 
@@ -2164,6 +2166,9 @@ def parse_hits(text):
     return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
 
 
+HITS_READ_TIMEOUT = 30  # полный набор (65536 записей) на слабом сервере читается дольше обычных 4 секунд
+
+
 def set_is_full(text):
     """Набор статистики заполнен: ядро не добавляет новые записи, пока старые не истекут."""
     match = re.search(r"^\s*size (\d+)\s*$", text, re.M)
@@ -2478,19 +2483,34 @@ def show_hits():
     full = set()
     sources = load_scanner_sources()
     seen = False
-    for kind, name in HIT_SETS:
-        text = probe_output("nft", "-n", "list", "set", "inet", "fw", name)
-        if text:
+    slow = []
+
+    def read_set(item):
+        return probe_output("nft", "-n", "list", "set", "inet", "fw", item[1],
+                            timeout=HITS_READ_TIMEOUT, on_timeout=None)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(HIT_SETS)) as pool:
+        answers = list(pool.map(read_set, HIT_SETS))  # параллельно: самый долгий ответ, а не сумма
+    for (kind, name), text in zip(HIT_SETS, answers):
+        if text is None:
+            slow.append(name)
+        elif text:
             seen = True
             collected[kind].extend(parse_hits(text))
             if set_is_full(text):
                 full.add(kind)
+    if slow:
+        print()
+        say(f"Часть статистики не прочитана ({', '.join(slow)}): nft не ответил за {HITS_READ_TIMEOUT} с. "
+            "Блокировка от этого не зависит, откройте экран позже.")
+    if not seen and slow:
+        return
     if not seen:
         print()
         say("Статистика не ведётся: правила загружены без неё (старая версия nft или ядра) или ещё не обновлены.")
         say("Примените правила заново: «Проверить и применить правила» → «Применить правила и включить таймер».")
         return
-    if not any(collected.values()):
+    if not any(collected.values()) and not slow:
         print()
         say("Пока никого: статистика включена, но отклонённых попыток ещё нет. Загляните позже.")
     for kind, title in groups:
@@ -5725,7 +5745,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '74e363f348eb110d5a331bbcb6cb5954e5154ea28267d31190636d220c4fc65d' "$stage/update-fw.sh" \
-    'efc337987eb0673250b151565fefa1c5c8e3298ae1a5edba15840481fda13c0b' "$stage/fw-menu" \
+    'adc7a7f512b4901aed2188d33f29025508cf2cdab4f685b427630cb01bd23db7' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

@@ -824,10 +824,10 @@ P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
 # счётчиком и сроком может стоять «timeout 7d»; в перенос оно не нужно (срок задаёт сам набор).
 stat_elements() {
   grep -oE '[0-9a-fA-F:.]+ \. [0-9]+ counter packets [0-9]+ bytes [0-9]+( timeout [0-9a-z]+)? expires [0-9a-z]+' \
-    | sed -E 's/ timeout [0-9a-z]+//' | head -n 4096
+    | sed -E 's/ timeout [0-9a-z]+//' | head -n 65536
 }
 stat_set() {
-  echo "  set $1 { type $2 . inet_service; size 4096; flags dynamic,timeout; timeout 7d; counter;"
+  echo "  set $1 { type $2 . inet_service; size 65536; flags dynamic,timeout; timeout 7d; counter;"
   [ -s "$TMP/stats.$1" ] && echo "    elements = { $(paste -sd, "$TMP/stats.$1") }"
   echo "  }"
 }
@@ -2164,6 +2164,12 @@ def parse_hits(text):
     return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
 
 
+def set_is_full(text):
+    """Набор статистики заполнен: ядро не добавляет новые записи, пока старые не истекут."""
+    match = re.search(r"^\s*size (\d+)\s*$", text, re.M)
+    return bool(match) and int(match.group(1)) > 0 and len(HIT_RE.findall(text)) >= int(match.group(1))
+
+
 def summarize_hits(rows, top=5):
     by_port, by_source, ports_of = {}, {}, {}
     for address, port, packets, _size in rows:
@@ -2331,10 +2337,10 @@ def parse_ripe_owner(text):
     try:
         asns = json.loads(text)["data"]["asns"]
         first = asns[0]
-        holder = str(first["holder"]).strip()
+        holder = str(first["holder"] or "").strip()  # у части AS владелец не указан (null)
         # «ИМЯ-AS-BLOCK - Читаемое название»: показываем читаемую часть
         holder = holder.split(" - ", 1)[1].strip() if " - " in holder and holder.split(" - ", 1)[1].strip() else holder
-        return f"{holder} AS{int(first['asn'])}"
+        return f"{holder} AS{int(first['asn'])}" if holder else f"AS{int(first['asn'])}"
     except (ValueError, KeyError, IndexError, TypeError):
         return ""
 
@@ -2469,6 +2475,7 @@ def show_hits():
     groups = (("scanners", "Сканеры и сети ведомств (любые порты)"),
               ("non_ru", "Из других стран (на защищённых портах)"))
     collected = {"scanners": [], "non_ru": []}
+    full = set()
     sources = load_scanner_sources()
     seen = False
     for kind, name in HIT_SETS:
@@ -2476,6 +2483,8 @@ def show_hits():
         if text:
             seen = True
             collected[kind].extend(parse_hits(text))
+            if set_is_full(text):
+                full.add(kind)
     if not seen:
         print()
         say("Статистика не ведётся: правила загружены без неё (старая версия nft или ядра) или ещё не обновлены.")
@@ -2491,6 +2500,9 @@ def show_hits():
         summary = summarize_hits(rows)
         print(f"\n{title}")
         print(f"Попыток: {summary['packets']}, с разных адресов: {summary['sources']}")
+        if kind in full:
+            say("Внимание: место для статистики закончилось. Новые адреса и порты не записываются, "
+                "пока старые записи не устареют (до 7 дней). Блокировка при этом работает как обычно.")
         print("Куда стучатся (порты):")
         biggest = summary["ports"][0][1]
         for port, packets in summary["ports"]:
@@ -5712,8 +5724,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    'dd6bcea69843dd28ee07b899414b118f58d09b2b9cd4595fd92b2bb54ea5882b' "$stage/update-fw.sh" \
-    'e773cfc7073d908e559ec0639841613cd04ec3d8da3fa0fe085bbc4aa82a73cb' "$stage/fw-menu" \
+    '74e363f348eb110d5a331bbcb6cb5954e5154ea28267d31190636d220c4fc65d' "$stage/update-fw.sh" \
+    'efc337987eb0673250b151565fefa1c5c8e3298ae1a5edba15840481fda13c0b' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

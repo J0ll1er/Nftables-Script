@@ -124,6 +124,30 @@ class Hits(unittest.TestCase):
         text = self.show()
         self.assertIn("пока никого", text.lower())
 
+    def test_full_set_is_detected_by_size_line(self):
+        full = SET_TEXT.replace("size 4096", "size 3")
+        self.assertTrue(self.menu.set_is_full(full))
+        self.assertFalse(self.menu.set_is_full(SET_TEXT))  # 3 записи из 4096
+        self.assertFalse(self.menu.set_is_full(SET_TEXT_V6))  # строки size нет: не гадаем
+        self.assertFalse(self.menu.set_is_full(SET_TEXT.replace("size 4096", "size 0")))
+        self.assertFalse(self.menu.set_is_full(""))
+
+    def test_screen_warns_when_stat_set_is_full(self):
+        # полный набор ядро не пополняет: новые сканеры молча не попадают в статистику
+        self.menu.reverse_name = lambda address: ""
+        self.fake_nft({"ss4": SET_TEXT.replace("size 4096", "size 3"), "ss6": "",
+                       "sn4": SET_TEXT.replace("198.51.100.7", "192.0.2.50"), "sn6": ""})
+        text = self.show()
+        scanners, _, other = text.partition("Из других стран")
+        self.assertIn("место для статистики закончилось", scanners)
+        self.assertIn("Блокировка при этом работает", scanners)
+        self.assertNotIn("место для статистики закончилось", other)
+
+    def test_screen_has_no_warning_when_there_is_room(self):
+        self.menu.reverse_name = lambda address: ""
+        self.fake_nft({"ss4": SET_TEXT, "ss6": SET_TEXT_V6, "sn4": "", "sn6": ""})
+        self.assertNotIn("закончилось", self.show())
+
     def test_screen_when_sets_missing_explains_in_words(self):
         self.fake_nft({})
         text = self.show()
@@ -408,6 +432,12 @@ class Lookup(unittest.TestCase):
         text = json.dumps({"data": {"asns": [{"asn": 24940, "holder": "HETZNER-AS"}]}})
         self.assertEqual(self.menu.parse_ripe_owner(text), "HETZNER-AS AS24940")
 
+    def test_parse_without_holder_shows_only_as_number(self):
+        # RIPEstat иногда отдаёт holder: null; на экране не должно быть «None AS64500»
+        for holder in (None, "", "  "):
+            text = json.dumps({"data": {"asns": [{"asn": 64500, "holder": holder}]}})
+            self.assertEqual(self.menu.parse_ripe_owner(text), "AS64500")
+
     def test_parse_whois_takes_best_name_and_country(self):
         self.assertEqual(self.menu.parse_whois_owner(WHOIS_ANSWER), ("dedires", "HK"))
         self.assertEqual(self.menu.parse_whois_owner(WHOIS_ARIN), ("Amazon Technologies Inc.", "US"))
@@ -423,6 +453,15 @@ class Lookup(unittest.TestCase):
     def test_parse_whois_bad_answers(self):
         for bad in ("", "x", "{}", '{"data": {"records": []}}', '{"data": {"records": [[]]}}'):
             self.assertEqual(self.menu.parse_whois_owner(bad), ("", ""), bad)
+
+    def test_owner_without_holder_uses_registry_name_or_as_number(self):
+        self.menu.fetch_ripe = lambda address: json.dumps({"data": {"asns": [{"asn": 64500, "holder": None}]}})
+        self.assertEqual(self.menu.lookup_owner("8.8.4.4"), "AS64500")
+        whois = json.dumps({"data": {"records": [[{"key": "netname", "value": "example-net"},
+                                                  {"key": "country", "value": "NL"}]]}})
+        self.menu.fetch_whois = lambda address: whois
+        self.assertEqual(self.menu.lookup_owner("9.9.9.9"), "example-net, NL, AS64500")
+        self.assertNotIn("None", (self.menu.DIRECTORY / "owner-cache.json").read_text())
 
     def test_owner_combines_registry_name_country_and_as(self):
         self.menu.fetch_whois = lambda address: WHOIS_ANSWER
@@ -550,6 +589,19 @@ class Carry(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.splitlines()
 
+    def test_carries_more_than_the_old_limit_of_4096(self):
+        # за неделю набирается порядка 19 тысяч пар: старый предел в 4096 обрезал бы перенос
+        lines = [f"10.{i // 65536}.{i // 256 % 256}.{i % 256} . 443 counter packets 1 bytes 40 expires 6d"
+                 for i in range(20000)]
+        out = self.run_func("elements = { " + ",\n".join(lines) + " }")
+        self.assertEqual(len(out), 20000)
+
+    def test_carry_is_capped_at_the_set_size(self):
+        lines = [f"10.{i // 65536}.{i // 256 % 256}.{i % 256} . 443 counter packets 1 bytes 40 expires 6d"
+                 for i in range(70000)]
+        out = self.run_func("elements = { " + ",\n".join(lines) + " }")
+        self.assertEqual(len(out), 65536)
+
     def test_keeps_elements_with_and_without_timeout_word(self):
         # вывод с вашего сервера: у новых записей между bytes и expires стоит «timeout 7d»
         text = """table inet fw {
@@ -583,6 +635,41 @@ class Carry(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class FullSet(unittest.TestCase):
+    """Настоящее ядро: набор на 2 записи после 5 разных портов заполнен, а drop считает все пакеты."""
+    RULES = """table inet fwt {
+ set ss4 { type ipv4_addr . inet_service; size 2; flags dynamic,timeout; timeout 7d; counter; }
+ chain input { type filter hook input priority -10; policy accept;
+  meta l4proto { tcp, udp } ip saddr 127.0.0.1 th dport 9001-9005 add @ss4 { ip saddr . th dport }
+  ip saddr 127.0.0.1 udp dport 9001-9005 counter drop comment "scanners"
+ }
+}
+"""
+
+    def test_kernel_stops_adding_and_menu_sees_it(self):
+        if not (shutil.which("nft") and shutil.which("unshare")):
+            self.skipTest("нет nft или unshare")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.nft"
+            path.write_text(self.RULES)
+            lo_up = ("import fcntl, socket, struct; s = socket.socket(); "
+                     "fcntl.ioctl(s, 0x8914, struct.pack('16sH14s', b'lo', 0x41, b''))")  # без команды ip
+            script = (f'python3 -c "{lo_up}" && nft -f "$1" || exit 77; '
+                      'for p in 9001 9002 9003 9004 9005; do echo x > /dev/udp/127.0.0.1/$p; done; '
+                      'nft -n list set inet fwt ss4 && nft list chain inet fwt input')
+            result = subprocess.run(["unshare", "-n", "bash", "-c", script, "t", str(path)],
+                                    capture_output=True, text=True)
+        if result.returncode == 77:
+            self.skipTest("нет прав на сетевое пространство или nft")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        menu = importlib.util.module_from_spec(SPEC)
+        LOADER.exec_module(menu)
+        listing = result.stdout.split("table inet fwt {\n\tchain")[0]
+        self.assertEqual(len(menu.parse_hits(listing)), 2)  # третья и дальше пары не записались
+        self.assertTrue(menu.set_is_full(listing))
+        self.assertIn("packets 5", result.stdout)  # а drop посчитал все пять пакетов
+
+
 class Rules(unittest.TestCase):
     """Что update-fw.sh кладёт в правила."""
 
@@ -599,6 +686,11 @@ class Rules(unittest.TestCase):
         self.assertIn('counter drop comment \\"non-RU\\""', self.upd)
         self.assertLess(self.upd.index(" add @ss4 "), self.upd.index('ip saddr @sc4 counter drop'))
         self.assertLess(self.upd.index(" add @sn4 "), self.upd.index('ip saddr != @ru4 counter drop'))
+
+    def test_stat_sets_have_room_for_a_week_of_scanners(self):
+        self.assertIn("size 65536;", self.upd)
+        self.assertNotIn("size 4096;", self.upd)
+        self.assertIn("head -n 65536", self.upd)
 
     def test_stats_are_optional_and_never_block_the_rules(self):
         self.assertIn("STATS=", self.upd)

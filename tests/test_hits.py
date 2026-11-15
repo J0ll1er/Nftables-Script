@@ -230,6 +230,88 @@ class Hits(unittest.TestCase):
         self.assertIn('("Кто стучится", boxed("Кто стучится", show_hits', source)
 
 
+class Readable(unittest.TestCase):
+    """Экран «Куда стучатся» объясняет сам себя: что за числа, какая доля, куда делись остальные порты."""
+    PORTS = {80: 49, 443: 44, 22: 18, 143: 17, 25: 16, 27: 40, 600: 30, 1071: 20, 830: 10, 1050: 6}
+
+    def setUp(self):
+        self.menu = importlib.util.module_from_spec(SPEC)
+        LOADER.exec_module(self.menu)
+        self.menu.lookup_owner = lambda address: ""
+        self.menu.screen_columns = lambda: 120
+        rows = ", ".join(f"198.51.100.{n} . {port} counter packets {count} bytes 1 expires 1d"
+                         for n, (port, count) in enumerate(self.PORTS.items(), start=1))
+        self.text = "elements = { " + rows + " }"
+        self.menu.probe_output = lambda *c, **_: self.text if c[-1] == "sn4" else ""
+
+    def render(self, columns=120):
+        self.menu.screen_columns = lambda: columns
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.menu.show_hits()
+        return out.getvalue().splitlines()
+
+    def test_summary_counts_the_ports_that_are_not_shown(self):
+        summary = self.menu.summarize_hits(self.menu.parse_hits(self.text))
+        total = sum(self.PORTS.values())
+        top = sum(packets for _port, packets in summary["ports"])
+        self.assertEqual(summary["other_ports"], len(self.PORTS) - 5)
+        self.assertEqual(summary["other_packets"], total - top)
+
+    def test_no_rest_row_when_all_ports_fit(self):
+        summary = self.menu.summarize_hits(self.menu.parse_hits(
+            "elements = { 198.51.100.1 . 80 counter packets 5 bytes 1 expires 1d }"))
+        self.assertEqual((summary["other_ports"], summary["other_packets"]), (0, 0))
+
+    def test_share_is_a_whole_percent_and_never_zero_for_real_hits(self):
+        self.assertEqual(self.menu.share(49, 2807), "2%")
+        self.assertEqual(self.menu.share(1, 2807), "<1%")
+        self.assertEqual(self.menu.share(2807, 2807), "100%")
+        self.assertEqual(self.menu.share(0, 100), "0%")
+        self.assertEqual(self.menu.share(5, 0), "")
+
+    def test_heading_says_what_the_numbers_are(self):
+        text = "\n".join(self.render())
+        self.assertIn("число — сколько раз отклонена попытка на этот порт", text)
+
+    def test_every_port_row_has_count_and_share(self):
+        total = sum(self.PORTS.values())
+        lines = self.render()
+        row = next(line for line in lines if line.strip().startswith("80 "))
+        self.assertIn(" 49 ", row + " ")
+        self.assertIn(self.menu.share(49, total), row)
+
+    def test_rest_row_makes_the_numbers_add_up(self):
+        total = sum(self.PORTS.values())
+        top = sorted(self.PORTS.values(), reverse=True)[:5]
+        rest = total - sum(top)
+        lines = self.render()
+        row = next(line for line in lines if line.strip().startswith("ещё "))
+        self.assertIn(f"ещё {len(self.PORTS) - 5} портов", row)
+        self.assertIn(str(rest), row)
+        self.assertIn(self.menu.share(rest, total), row)
+
+    def test_rest_row_is_plain_without_a_bar(self):
+        row = next(line for line in self.render() if line.strip().startswith("ещё "))
+        self.assertNotIn("▮", row)
+        self.assertNotIn("▯", row)
+
+    def test_owner_and_address_blocks_have_a_legend(self):
+        text = "\n".join(self.render())
+        self.assertIn("По владельцам (попыток, адресов, чаще всего порты)", text)
+        self.assertIn("Самые активные адреса (попыток, на сколько портов стучался)", text)
+
+    def test_a_phone_keeps_every_line_inside_the_box(self):
+        too_long = [line for line in self.render(58) if len(line) > 54]
+        self.assertEqual(too_long, [])
+        text = "\n".join(self.render(58))
+        self.assertIn(f"ещё {len(self.PORTS) - 5} {self.menu.ports_word(len(self.PORTS) - 5)}", text)
+
+    def test_word_form_of_ports_is_correct(self):
+        for count, word in ((1, "порт"), (2, "порта"), (5, "портов"), (11, "портов"), (21, "порт"), (22, "порта")):
+            self.assertEqual(self.menu.ports_word(count), word, count)
+
+
 class Narrow(unittest.TestCase):
     """Экран на телефоне: около 58 колонок, рамка оставляет строке columns - 4."""
     ROWS = ("elements = { 185.93.89.10 . 443 counter packets 59 bytes 1 expires 1d, "

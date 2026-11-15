@@ -2350,12 +2350,28 @@ def summarize_hits(rows, top=5):
         ports_of.setdefault(address, set()).add(port)
     ports = sorted(by_port.items(), key=lambda item: (-item[1], item[0]))[:top]
     sources = sorted(by_source.items(), key=lambda item: (-item[1], item[0]))[:top]
+    shown_packets = sum(packets for _port, packets in ports)
     return {"packets": sum(by_port.values()), "sources": len(by_source), "ports": ports,
+            "other_ports": len(by_port) - len(ports), "other_packets": sum(by_port.values()) - shown_packets,
             "top_sources": [(address, packets, len(ports_of[address])) for address, packets in sources]}
 
 
 def port_label(port):
     return PORT_NAMES.get(port, "")
+
+
+def share(part, total):
+    """Доля в целых процентах; настоящая, но малая — «<1%», чтобы строка не казалась пустой."""
+    if total <= 0:
+        return ""
+    percent = round(100 * part / total)
+    return "<1%" if part > 0 and percent == 0 else f"{percent}%"
+
+
+def ports_word(count):
+    if count % 100 in range(11, 15):
+        return "портов"
+    return {1: "порт", 2: "порта", 3: "порта", 4: "порта"}.get(count % 10, "портов")
 
 
 OWNER_LOOKUPS = 15  # владельца узнаём у стольких самых активных адресов; остальные идут одной строкой
@@ -2690,16 +2706,24 @@ def show_hits():
         if kind in full:
             say("Внимание: место для статистики закончилось. Новые адреса и порты не записываются, "
                 "пока старые записи не устареют (до 7 дней). Блокировка при этом работает как обычно.")
-        print("Куда стучатся (порты):")
+        say("Куда стучатся (число — сколько раз отклонена попытка на этот порт, % — доля от всех попыток):")
         biggest = summary["ports"][0][1]
         for port, packets in summary["ports"]:
             label = port_label(port)
             if compact:
-                room = columns - 4 - 27 - 2
+                room = columns - 4 - 32 - 2
                 label = label if len(label) <= room else label[:max(0, room - 1)].rstrip(" ,") + "…" if room > 1 else ""
-                print(f"  {port:>5}  {hits_bar_view(packets, biggest, 6, color)}  {packets:>5}" + (f"  {label}" if label else ""))
+                print(f"  {port:>5}  {hits_bar_view(packets, biggest, 6, color)}  {packets:>5} "
+                      f"{share(packets, summary['packets']):>4}" + (f"  {label}" if label else ""))
             else:
-                print(f"  {port:>5}  {hits_bar_view(packets, biggest, 10, color)}  {packets:>6}" + (f"  {label}" if label else ""))
+                print(f"  {port:>5}  {hits_bar_view(packets, biggest, 10, color)}  {packets:>6} "
+                      f"{share(packets, summary['packets']):>4}" + (f"  {label}" if label else ""))
+        if summary["other_ports"]:
+            # Остальное одной строкой без полоски: так сумма строк равна «Попыток» и видно, куда ушла масса
+            name = f"ещё {summary['other_ports']} {ports_word(summary['other_ports'])}"
+            gap = 5 + 2 + len(hits_bar(0, 1, 6 if compact else 10))
+            print(f"  {name:<{gap}}  {summary['other_packets']:>{5 if compact else 6}} "
+                  f"{share(summary['other_packets'], summary['packets']):>4}")
         by_address = {}
         for address, _port, packets, _size in rows:
             by_address[address] = by_address.get(address, 0) + packets
@@ -2709,7 +2733,7 @@ def show_hits():
         named = [group for group in owner_groups if group["owner"] != OTHER_ADDRESSES]
         rest = [group for group in owner_groups if group["owner"] == OTHER_ADDRESSES]
         shown = named[:5] + rest
-        print("По владельцам:")
+        say("По владельцам (попыток, адресов, чаще всего порты):")
         biggest = max(group["packets"] for group in (named[:5] or shown))  # «другие адреса» масштаб не задают
         owner_width = min(40, max(len(group["owner"]) for group in shown))
         for group in shown:
@@ -2727,7 +2751,7 @@ def show_hits():
                 tail = fit_ports(prefix, group["addresses"], group["ports"], 10 ** 6)
                 bar = " " * len(hits_bar(0, 1, 8)) if leftover else hits_bar_view(group["packets"], biggest, 8, color)
                 print(f"  {owner:<{owner_width}}  {bar} {group['packets']:>6}{tail}")
-        print("Самые активные адреса:")
+        say("Самые активные адреса (попыток, на сколько портов стучался):")
         biggest = summary["top_sources"][0][1]
         owners = [owner_of_address.get(address, "неизвестно") for address, _p, _c in summary["top_sources"]]
         width = min(39, max(len(address) for address, _p, _c in summary["top_sources"]))

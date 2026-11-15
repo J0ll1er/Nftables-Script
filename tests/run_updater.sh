@@ -24,6 +24,8 @@ printf 'AS61280\nAS34500\n' > "$T/fw/asn.txt"
 [ -z "${TEST_CONF_APPEND:-}" ] || printf '%s\n' "$TEST_CONF_APPEND" >> "$T/fw/fw.conf"
 [ -z "${TEST_WIDE_OK:-}" ] || printf '%s\n' "$TEST_WIDE_OK" > "$T/fw/wide-ok.txt"
 [ -z "${TEST_TRUSTED:-}" ] || printf '%s\n' "$TEST_TRUSTED" >> "$T/fw/trusted.txt"
+# TEST_DDNS_CACHE="имя IP": кэш DDNS со свежей отметкой времени (нужен, когда DNS имени не знает).
+[ -z "${TEST_DDNS_CACHE:-}" ] || printf '%s %s\n' "$TEST_DDNS_CACHE" "$(date +%s)" > "$T/fw/ddns-cache.txt"
 [ "${TEST_LAN+x}" != x ] || printf 'LAN_ALLOW="%s"\n' "$TEST_LAN" >> "$T/fw/fw.conf"
 [ -z "${TEST_CACHE_NAME:-}" ] || printf '%s\n' "${TEST_CACHE_CONTENT:-192.0.2.1}" > "$T/fw/scanner-cache/$TEST_CACHE_NAME"
 [ -z "${TEST_CACHE_AGE_DAYS:-}" ] || python3 - "$T/fw/scanner-cache/$TEST_CACHE_NAME" "$TEST_CACHE_AGE_DAYS" <<'PY'

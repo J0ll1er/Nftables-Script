@@ -1,5 +1,6 @@
 """«Кто стучится»: разбор счётчиков nft, сводка и экран; сбор статистики в правилах."""
 import contextlib
+import datetime
 import importlib.machinery
 import importlib.util
 import io
@@ -9,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 import unittest
 
 
@@ -621,6 +623,65 @@ class Lookup(unittest.TestCase):
             menu.show_hits()
         self.assertIn("Microsoft Corporation AS8075", out.getvalue())
         self.assertNotIn("dns.example.com", out.getvalue())
+
+
+EVIL = "Evil Net\x1b]0;owned\x07\x1b[2J\x1b[31m\u202egpj.exe\r"
+
+
+class Sanitize(unittest.TestCase):
+    """Чужие тексты (whois, RIPEstat, PTR, имена процессов) не должны нести управляющие символы."""
+
+    def setUp(self):
+        self.menu = importlib.util.module_from_spec(SPEC)
+        LOADER.exec_module(self.menu)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.menu.DIRECTORY = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def assertClean(self, text):
+        bad = [char for char in text if unicodedata.category(char) in ("Cc", "Cf")]
+        self.assertEqual(bad, [], repr(text))
+
+    def test_ripe_holder_is_cleaned(self):
+        text = json.dumps({"data": {"asns": [{"asn": 64500, "holder": EVIL}]}})
+        owner = self.menu.parse_ripe_owner(text)
+        self.assertClean(owner)
+        self.assertIn("Evil Net", owner)
+
+    def test_whois_name_and_country_are_cleaned(self):
+        text = json.dumps({"data": {"records": [[{"key": "descr", "value": EVIL},
+                                                 {"key": "country", "value": "R\x1bU"}]]}})
+        name, country = self.menu.parse_whois_owner(text)
+        self.assertClean(name)
+        self.assertClean(country)
+        self.assertIn("Evil Net", name)
+
+    def test_poisoned_cache_entry_is_cleaned_on_read(self):
+        now = int(datetime.datetime.now().timestamp())
+        (Path(self.tmp.name) / "owner-cache.json").write_text(json.dumps({"8.8.4.4": [EVIL, now]}))
+        self.menu.fetch_ripe = lambda address: self.fail("кэш свежий, сеть не нужна")
+        self.assertClean(self.menu.lookup_owner("8.8.4.4"))
+
+    def test_reverse_name_is_cleaned(self):
+        class Result:
+            returncode = 0
+            stdout = "8.8.4.4 host.evil\x1b[2J.example.com\n"
+        self.menu.subprocess.run = lambda *args, **kwargs: Result()
+        self.assertClean(self.menu.reverse_name("8.8.4.4"))
+
+    def test_process_name_from_ss_is_cleaned(self):
+        line = 'tcp LISTEN 0 4096 0.0.0.0:8080 0.0.0.0:* users:(("evil\x1b[2Jd",pid=1,fd=3))'
+        for _, _, name, _ in self.menu.parse_listeners(line):
+            self.assertClean(name)
+
+    def test_box_keeps_colors_but_drops_other_escapes(self):
+        cells = self.menu.box_cells("\x1b[31mred\x1b[0m \x1b]0;title\x07\x1b[2Jtext")
+        text = "".join(char for char, _ in cells)
+        self.assertClean(text)
+        self.assertEqual(text, "red text")
+        self.assertEqual(cells[0][1], "\x1b[31m")
 
 
 class Carry(unittest.TestCase):

@@ -123,6 +123,39 @@ class UpdaterLimits(unittest.TestCase):
         self.assertIn("аномальный размер списка skipa_cidr.txt", output)
         self.assertIn("192.0.2.1", snapshot.read_text())
 
+    def test_ddns_name_in_trusted_does_not_stop_the_update(self):
+        # Имя в trusted.txt раньше шло в ipaddress.ip_network и обрывало каждое обновление:
+        # «не удалось проверить пересечения списков», правила замирали.
+        output, snapshot = self.run_case("ddns_trusted", TEST_LAN="", TEST_TRUSTED="home.example.invalid",
+            TEST_DDNS_CACHE="home.example.invalid 203.0.113.5", SCEN_LIST_CONTENT="203.0.113.0/24")
+        self.assertNotIn("не удалось проверить пересечения", output)
+        self.assertIn("удалено пересечений с trusted/LAN_ALLOW", output)
+        rules = snapshot.read_text()
+        self.assertNotIn("203.0.113.0/24", re.search(r"set sc4.*?\n  }", rules, re.S).group())
+        self.assertIn("203.0.113.5", re.search(r"set tr4.*?\n  }", rules, re.S).group())
+
+    def test_garbage_in_trusted_still_stops_the_update(self):
+        env = {**os.environ, "TEST_TRUSTED": "not_a_host!"}
+        result = subprocess.run(["bash", str(ROOT / "tests/run_updater.sh"), "trusted_garbage", "--dry"],
+                                cwd=ROOT, env=env, text=True, capture_output=True, check=True)
+        self.assertIn("код возврата: 1", result.stdout)
+        self.assertIn("не удалось проверить пересечения", result.stdout + result.stderr)
+
+    def test_too_wide_ru_network_is_rejected(self):
+        # Подменённая база с тем же числом строк, но 0.0.0.0/1 внутри, отключила бы геофильтр.
+        for wide in ("0.0.0.0/1 128.0.0.0/1", "::/1", "0.0.0.0/7", "2000::/15"):
+            name = "wide_geo_" + re.sub(r"\W", "_", wide)
+            env = {**os.environ, "TEST_GEO_WIDE": wide}
+            result = subprocess.run(["bash", str(ROOT / "tests/run_updater.sh"), name, "--dry"],
+                                    cwd=ROOT, env=env, text=True, capture_output=True, check=True)
+            output = result.stdout + result.stderr
+            self.assertIn("код возврата: 1", output, wide)
+            self.assertIn("слишком широкую сеть", output, wide)
+
+    def test_normal_ru_networks_still_pass(self):
+        # Реальные блоки (/8…/24 для IPv4, /16 и уже для IPv6) границу не задевают.
+        self.run_case("geo_boundary", TEST_GEO_WIDE="2.0.0.0/8")
+
     def test_trusted_overlap_is_removed(self):
         output, snapshot = self.run_case("trusted_overlap", TEST_LAN="",
             TEST_TRUSTED="203.0.113.5", SCEN_LIST_CONTENT="203.0.113.0/24")

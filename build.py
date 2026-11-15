@@ -256,11 +256,15 @@ printf '%s\\n' "$LAN_ALLOW" | tr ' ,' '\\n\\n' > "$TMP/lan_raw"
 if ! removed=$(python3 - "$TMP/scan_normalized" "$TMP/protected_raw" <<'PY'
 import ipaddress
 from pathlib import Path
+import re
 import sys
 blocked, protected = map(Path, sys.argv[1:])
+# DDNS-имя из trusted*.txt здесь пропускается: его IP уже добавлены строками из ddns_ips.
+# Любая другая строка, не похожая на адрес, по-прежнему останавливает обновление.
+HOST = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$")
 try:
     allowed = [ipaddress.ip_network(value) for line in protected.read_text().splitlines()
-               if (value := line.partition('#')[0].strip())]
+               if (value := line.partition('#')[0].strip()) and not HOST.match(value.lower())]
     lines = blocked.read_text().splitlines()
     kept = [line for line in lines if not any(
         (network := ipaddress.ip_network(line)).version == safe.version and network.overlaps(safe)
@@ -273,6 +277,24 @@ PY
 ); then fail_keep "не удалось проверить пересечения списков"; fi
 [ "$removed" -eq 0 ] || note "WARN: из списков сканеров удалено пересечений с trusted/LAN_ALLOW: $removed"
 ''', "защита trusted и LAN")
+# Широкая сеть в RU-списке (0.0.0.0/1, ::/1) отключила бы геофильтр, а число строк такую подмену не выдаёт.
+upd = replace_once(upd, '''  [ "$url" = "$ZKEEN_URL" ] || echo "Зеркало для геобазы: ${url#https://}"\n''',
+    '''  if ! reason=$(python3 - "$TMP/ru4" "$TMP/ru6" <<'PY'
+import ipaddress
+from pathlib import Path
+import sys
+LIMITS = {4: 8, 6: 16}  # самая широкая допустимая сеть: IPv4 не шире /8, IPv6 не шире /16
+for name in sys.argv[1:]:
+    for line in Path(name).read_text().splitlines():
+        network = ipaddress.ip_network(line, strict=False)
+        if network.prefixlen < LIMITS[network.version]:
+            sys.exit(f"содержит слишком широкую сеть {network}")
+PY
+  ); then
+    note "WARN: геобаза с ${url#https://} отклонена: $reason"
+    continue
+  fi
+  [ "$url" = "$ZKEEN_URL" ] || echo "Зеркало для геобазы: ${url#https://}"\n''', "ширина сетей RU")
 upd = replace_once(upd, '# 2. Сканеры: списки + ASN + extra\n',
     '''# Проверяем число RU v4 относительно последнего успешного применения.
 if [ -s "$DIR/geo.count" ]; then
@@ -576,6 +598,9 @@ upd = replace_once(
 
 # ----------------------------------------------------------------- fw-menu
 menu = parts["menu"][2]
+# Имя процесса из ss попадает на экран администратора: управляющие символы убираем (clean_text ниже, в блоке BOXED).
+menu = replace_once(menu, '''    return "xray" if raw.startswith("xray-linux") else raw''',
+    '''    return "xray" if raw.startswith("xray-linux") else clean_text(raw)''', "очистка имени процесса")
 menu = replace_once(menu, """def probe_output(*command):
     try:
         result = subprocess.run(command, text=True, capture_output=True, timeout=4, check=False)
@@ -811,20 +836,31 @@ def explain_rules(items):
 menu = replace_once(menu, "def show_status():\n", EXPLAIN + "def show_status():\n", "explain_rules")
 
 BOXED = r"""import threading
+import unicodedata
 
 BOX_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# Управляющие последовательности терминала: CSI («ESC [ …»), OSC («ESC ] … BEL/ST») и одиночные «ESC x».
+TERMINAL_ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?")
+
+
+def clean_text(value):
+    # Чужой текст (whois, RIPEstat, PTR, имя процесса) без управляющих последовательностей и символов
+    # категорий Cc/Cf (в том числе перевороты направления текста): на экран root попадает только видимое.
+    text = TERMINAL_ESCAPES.sub("", str(value))
+    return "".join(char for char in text if unicodedata.category(char) not in ("Cc", "Cf"))
 
 
 def box_cells(raw):
     # Строка в виде списка (символ, цвет). Цвет хранится как накопленные коды ANSI.
+    # Из остального текста убираются любые другие управляющие последовательности: цвет — единственное, что пропускаем.
     cells, color = [], ""
     position = 0
     for found in BOX_ANSI.finditer(raw):
-        cells.extend((char, color) for char in raw[position:found.start()])
+        cells.extend((char, color) for char in clean_text(raw[position:found.start()]))
         code = found.group(0)
         color = "" if code in ("\x1b[0m", "\x1b[m") else color + code
         position = found.end()
-    cells.extend((char, color) for char in raw[position:])
+    cells.extend((char, color) for char in clean_text(raw[position:]))
     return cells
 
 
@@ -2407,7 +2443,7 @@ def reverse_name(address):
     except (OSError, subprocess.SubprocessError):
         return ""
     fields = result.stdout.split()
-    return short_host(fields[1]) if result.returncode == 0 and len(fields) > 1 else ""
+    return short_host(clean_text(fields[1])) if result.returncode == 0 and len(fields) > 1 else ""
 
 
 OWNER_CACHE_FILE = "owner-cache.json"
@@ -2432,7 +2468,7 @@ def parse_ripe_owner(text):
     try:
         asns = json.loads(text)["data"]["asns"]
         first = asns[0]
-        holder = str(first["holder"] or "").strip()  # у части AS владелец не указан (null)
+        holder = clean_text(first["holder"] or "").strip()  # у части AS владелец не указан (null)
         # «ИМЯ-AS-BLOCK - Читаемое название»: показываем читаемую часть
         holder = holder.split(" - ", 1)[1].strip() if " - " in holder and holder.split(" - ", 1)[1].strip() else holder
         return f"{holder} AS{int(first['asn'])}" if holder else f"AS{int(first['asn'])}"
@@ -2456,7 +2492,7 @@ def parse_whois_owner(text):
     try:
         fields = {}
         for item in json.loads(text)["data"]["records"][0]:
-            fields.setdefault(str(item["key"]).lower(), str(item["value"]).strip())
+            fields.setdefault(clean_text(item["key"]).lower(), clean_text(item["value"]).strip())
     except (ValueError, KeyError, IndexError, TypeError):
         return "", ""
     # В descr у RIPE часто стоит адрес улицы («11 Hanbury St»): такое не берём, остаётся netname.
@@ -2486,7 +2522,7 @@ def lookup_owner(address):
     entry = cache.get(address)
     if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], int) \
             and now - entry[1] < OWNER_CACHE_DAYS * 86400 and isinstance(entry[0], str):
-        return entry[0]
+        return clean_text(entry[0])
     answer = fetch_ripe(address)
     owner = parse_ripe_owner(answer)
     if owner:

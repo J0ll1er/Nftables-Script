@@ -46,9 +46,25 @@ jobs:
           grep '^## ' CHANGELOG.md | sed 's/^## //; s/[[:space:]]*$//' | while read -r version; do
             [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
             git rev-parse -q --verify "refs/tags/v$version" >/dev/null || continue
-            if gh release view "v$version" >/dev/null 2>&1; then continue; fi
+            # Хеш установщика в описании релиза: fw-menu сверяет скачанный скрипт с ним (хеш лежит на api.github.com,
+            # сам скрипт — на raw.githubusercontent.com и jsDelivr, то есть в другом месте).
+            digest=$(git show "refs/tags/v$version:fw-install.sh" 2>/dev/null | sha256sum | cut -d' ' -f1)
+            if git cat-file -e "refs/tags/v$version:fw-install.sh" 2>/dev/null; then
+              hash_line="sha256 fw-install.sh: $digest"
+            else
+              hash_line=""
+            fi
+            if gh release view "v$version" >/dev/null 2>&1; then
+              body=$(gh release view "v$version" --json body --jq .body)
+              if [ -n "$hash_line" ] && ! grep -qE '^[[:space:]]*sha256 fw-install\.sh:' <<<"$body"; then
+                printf '%s\n\n%s\n' "$body" "$hash_line" > notes.md
+                gh release edit "v$version" --notes-file notes.md
+              fi
+              continue
+            fi
             awk -v v="$version" '$0 == "## " v {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
             [ -s notes.md ] || echo "Описание изменений — в CHANGELOG.md" > notes.md
+            [ -z "$hash_line" ] || printf '\n%s\n' "$hash_line" >> notes.md
             if [ "$version" = "$TOP" ]; then latest=true; else latest=false; fi
             gh release create "v$version" --title "$version" --notes-file notes.md --verify-tag --latest="$latest"
           done

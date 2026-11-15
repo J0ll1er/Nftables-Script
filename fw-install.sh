@@ -3655,8 +3655,11 @@ def show_error_log():
     print("Журнал очищен.")
 
 
+import hashlib
+
 FW_VERSION = "1.6.0"
 FW_REPO = "J0ll1er/Nftables-Script"
+HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
 
@@ -3690,6 +3693,25 @@ def fetch_ref(ref, path):
         except OSError as error:
             last_error = error
     raise OSError(str(last_error))
+
+
+def published_hash(version):
+    """(хеш установщика, причина). Хеш берётся из описания релиза на api.github.com: это другой хост,
+    чем у самого скрипта (raw.githubusercontent.com, jsDelivr), поэтому сбой или подмена кэша CDN
+    не подделывают оба сразу. Нет хеша — (None, причина)."""
+    base = os.environ.get("FW_TEST_BASE") if os.environ.get("FW_ALLOW_FILE") == "1" else None
+    url = (f"{base}/releases/v{version}.json" if base
+           else f"https://api.github.com/repos/{FW_REPO}/releases/tags/v{version}")
+    try:
+        body = json.loads(fetch_text(url, 300_000)).get("body") or ""
+    except (OSError, ValueError, AttributeError):
+        return None, "описание релиза на api.github.com не получено"
+    found = {value.lower() for value in HASH_LINE.findall(str(body))}
+    if len(found) > 1:
+        return "conflict", "противоречивые хеши в описании релиза"
+    if not found:
+        return None, "в описании релиза хеш не опубликован"
+    return found.pop(), ""
 
 
 def parse_changelog(text):
@@ -3747,6 +3769,25 @@ def install_version(version):
     if not installer.startswith("bash <<'INSTALL_FW'\n") or f"FW_VERSION='{version}'" not in installer:
         paint(31, f"ОШИБКА — скачанный файл не похож на установщик версии {version}. Ничего не изменено.")
         return False
+    expected, reason = published_hash(version)
+    actual = hashlib.sha256(installer.encode("utf-8")).hexdigest()
+    if expected == "conflict":
+        paint(31, f"ОШИБКА — {reason}: проверить скрипт нельзя, возможна подмена. Ничего не изменено.")
+        return False
+    if expected is None:
+        paint(33, f"Контрольная сумма версии {version} не опубликована ({reason}).")
+        print(f"Скачанный файл: sha256 {actual}")
+        print("Установка без проверки доверяет только GitHub. Сверь хеш вручную на странице релиза "
+              f"https://github.com/{FW_REPO}/releases/tag/v{version}")
+        if input("Установить без проверки? Введи «без проверки»: ").strip().casefold() != "без проверки":
+            print("Отменено. Ничего не изменено.")
+            return False
+    elif actual != expected:
+        paint(31, f"ОШИБКА — контрольная сумма не совпала: скачано {actual[:16]}…, в релизе {expected[:16]}…. "
+                  "Скрипт могли подменить или он повреждён. Ничего не изменено.")
+        return False
+    else:
+        paint(32, f"Контрольная сумма совпала (sha256 {actual[:16]}…).")
     directory = Path(tempfile.mkdtemp(prefix=".fw-update.", dir="/root"))
     try:
         path = directory / "fw-install.sh"
@@ -5775,7 +5816,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '32ccf6e6826f7c888c21d796466e3007968b2efbcca33d85ab2bb8f26d9472ac' "$stage/update-fw.sh" \
-    '37d6f4168b2fab389b70007ac63fa8dbf46c3b8a8aa1dc1e478d3e3ca5fea46c' "$stage/fw-menu" \
+    '2d62c27ace370870ee97f4345299d280bad2c4c839ebed95a7e5c66c8dbc25ab' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

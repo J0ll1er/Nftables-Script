@@ -3,7 +3,9 @@ import builtins
 import contextlib
 import importlib.machinery
 import importlib.util
+import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -26,6 +28,14 @@ CHANGELOG = """# Журнал изменений
 
 def fake_installer(version, marker):
     return f"bash <<'INSTALL_FW'\nFW_VERSION='{version}'\necho ok > '{marker}'\nINSTALL_FW\n"
+
+
+def publish_release(base, version, installer, body=None):
+    """Как GitHub API: JSON с описанием релиза, в котором строка с хешем установщика."""
+    digest = hashlib.sha256(installer.encode("utf-8")).hexdigest()
+    text = body if body is not None else f"Заметки\n\nsha256 fw-install.sh: {digest}\n"
+    (base / "releases").mkdir(exist_ok=True)
+    (base / "releases" / f"v{version}.json").write_text(json.dumps({"tag_name": f"v{version}", "body": text}))
 
 
 class Versions(unittest.TestCase):
@@ -90,11 +100,13 @@ class Versions(unittest.TestCase):
         marker = self.tmp / "installed"
         (self.base / "v1.1.0").mkdir()
         (self.base / "v1.1.0" / "fw-install.sh").write_text(fake_installer("1.1.0", marker))
+        publish_release(self.base, "1.1.0", fake_installer("1.1.0", marker))
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             self.assertTrue(self.menu.install_version("1.1.0"))
         self.assertTrue(marker.is_file())
         self.assertIn("скрипт 1.1.0 установлен", output.getvalue())
+        self.assertIn("Контрольная сумма совпала", output.getvalue())
 
     def test_install_version_rejects_mismatched_installer(self):
         marker = self.tmp / "installed"
@@ -106,6 +118,72 @@ class Versions(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertIn("не похож на установщик версии 1.1.0", output.getvalue())
 
+    def install(self, version="1.1.0", answers=(), served=None, body=None, publish=True):
+        """Установщик лежит на «raw», хеш — в «API». served — что реально скачивается."""
+        marker = self.tmp / "installed"
+        real = fake_installer(version, marker)
+        (self.base / f"v{version}").mkdir(exist_ok=True)
+        (self.base / f"v{version}" / "fw-install.sh").write_text(served if served is not None else real)
+        if publish:
+            publish_release(self.base, version, real, body)
+        result = []
+        output, _ = self.call(lambda: result.append(self.menu.install_version(version)), answers)
+        return result[0], output, marker
+
+    def test_tampered_installer_is_refused(self):
+        marker = self.tmp / "installed"
+        evil = fake_installer("1.1.0", marker) + "echo подмена\n"
+        done, output, marker = self.install(served=evil)
+        self.assertFalse(done)
+        self.assertFalse(marker.exists())
+        self.assertIn("контрольная сумма не совпала", output.lower())
+
+    def test_hash_is_not_taken_from_the_same_source_as_the_script(self):
+        # Хеш приходит из описания релиза (API), а не из файла рядом со скриптом.
+        marker = self.tmp / "installed"
+        evil = fake_installer("1.1.0", marker) + "echo подмена\n"
+        (self.base / "v1.1.0").mkdir()
+        (self.base / "v1.1.0" / "fw-install.sh").write_text(evil)
+        (self.base / "v1.1.0" / "fw-install.sh.sha256").write_text(hashlib.sha256(evil.encode()).hexdigest())
+        publish_release(self.base, "1.1.0", fake_installer("1.1.0", marker))
+        output, _ = self.call(lambda: self.menu.install_version("1.1.0"))
+        self.assertFalse(marker.exists())
+
+    def test_missing_hash_asks_and_default_is_no(self):
+        for answers in ([""], ["нет"], ["да"]):
+            done, output, marker = self.install(answers=answers, publish=False)
+            self.assertFalse(done, answers)
+            self.assertFalse(marker.exists(), answers)
+        self.assertIn("не опубликована", output)
+
+    def test_missing_hash_installs_only_on_explicit_phrase(self):
+        done, output, marker = self.install(answers=["без проверки"], publish=False)
+        self.assertTrue(done)
+        self.assertTrue(marker.is_file())
+        self.assertIn("без проверки", output)
+
+    def test_release_without_hash_line_is_treated_as_unpublished(self):
+        done, output, marker = self.install(body="Просто заметки, хеша нет", answers=[""])
+        self.assertFalse(done)
+        self.assertFalse(marker.exists())
+        self.assertIn("не опубликована", output)
+
+    def test_conflicting_hash_lines_are_refused_without_asking(self):
+        installer = fake_installer("1.1.0", self.tmp / "installed")
+        good = hashlib.sha256(installer.encode()).hexdigest()
+        body = f"sha256 fw-install.sh: {good}\nsha256 fw-install.sh: {'0' * 64}\n"
+        done, output, marker = self.install(body=body, answers=["без проверки"])
+        self.assertFalse(done)
+        self.assertFalse(marker.exists())
+        self.assertIn("противоречи", output)
+
+    def test_hash_in_uppercase_and_with_spaces_is_accepted(self):
+        installer = fake_installer("1.1.0", self.tmp / "installed")
+        body = f"Заметки\n  sha256 fw-install.sh:   {hashlib.sha256(installer.encode()).hexdigest().upper()}  \n"
+        done, output, marker = self.install(body=body)
+        self.assertTrue(done)
+        self.assertTrue(marker.is_file())
+
     def test_install_version_missing_tag(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -116,6 +194,7 @@ class Versions(unittest.TestCase):
         marker = self.tmp / "installed"
         (self.base / "v1.1.0").mkdir()
         (self.base / "v1.1.0" / "fw-install.sh").write_text(fake_installer("1.1.0", marker))
+        publish_release(self.base, "1.1.0", fake_installer("1.1.0", marker))
         self.call(self.menu.update_script, ["нет"])
         self.assertFalse(marker.exists())
         _, code = self.call(self.menu.update_script, ["да"])

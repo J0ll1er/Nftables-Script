@@ -1,0 +1,3027 @@
+#!/usr/bin/env python3
+"""Собирает новый fw-install.sh из orig-fw-install.sh: правки update-fw.sh и fw-menu,
+пересчёт трёх контрольных сумм."""
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+ORIG = ROOT / "orig-fw-install.sh"
+OUT = ROOT / "fw-install.sh"
+BUILD = ROOT / "build"
+
+text = ORIG.read_bytes().decode("utf-8")
+
+
+def heredoc(source, name):
+    start_line = f"<<'{name}'\n"
+    first = source.index(start_line)
+    body_start = first + len(start_line)
+    end = source.index(f"\n{name}\n", body_start - 1) + 1
+    return body_start, end
+
+
+def sha(data):
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def replace_once(source, old, new, label):
+    count = source.count(old)
+    if count != 1:
+        sys.exit(f"{label}: ожидалось одно совпадение, найдено {count}")
+    return source.replace(old, new)
+
+
+parts = {}
+for key, marker in (("update", "FW_UPDATER_FILE"), ("menu", "FW_MENU_FILE"), ("seed", "FW_SEED_FILE")):
+    a, b = heredoc(text, marker)
+    parts[key] = (a, b, text[a:b])
+
+old_hashes = {}
+checks = re.search(
+    r"printf '%s  %s\\n%s  %s\\n%s  %s\\n' \\\n\s+'([0-9a-f]{64})' \"\$stage/update-fw.sh\" \\\n"
+    r"\s+'([0-9a-f]{64})' \"\$stage/fw-menu\" \\\n\s+'([0-9a-f]{64})' \"\$stage/seed.txt\"",
+    text,
+)
+if not checks:
+    sys.exit("не нашёл строку с контрольными суммами")
+for key, value in zip(("update", "menu", "seed"), checks.groups()):
+    old_hashes[key] = value
+    if sha(parts[key][2]) != value:
+        sys.exit(f"исходная контрольная сумма {key} не сходится: проверь границы heredoc")
+print("исходные суммы сходятся")
+
+# ------------------------------------------------------------ update-fw.sh
+upd = parts["update"][2]
+
+
+upd = replace_once(
+    upd,
+    'fail_keep() { echo "ERR: $1 — правила не тронуты" >&2; exit 1; }\n'
+    'fail_save() { echo "ERR: правила применены, но $1" >&2; exit 1; }\n',
+    'MODE=apply; [ "$DRY" = 1 ] && MODE=dry\n'
+    'ERRLOG=$DIR/errors.log\n'
+    '# note "WARN: …" или "ERR: …": в stderr и в журнал ошибок (fw-menu → 1 → 3 «Журнал ошибок»).\n'
+    'logline() { printf \'%s %s %s\\n\' "$(date \'+%F %T\')" "$MODE" "$1" >> "$ERRLOG" 2>/dev/null || true; }\n'
+    'note() { echo "$1" >&2; logline "$1"; }\n'
+    'fail_keep() { note "ERR: $1 — правила не тронуты"; exit 1; }\n'
+    'fail_save() { note "ERR: правила применены, но $1"; exit 1; }\n',
+    "note()",
+)
+
+upd = replace_once(
+    upd,
+    'flock -x 9 || fail_keep "не удалось заблокировать обновление"\n',
+    'flock -x 9 || fail_keep "не удалось заблокировать обновление"\n'
+    '# Журнал ошибок: создаётся закрытым, хранит последние ~500 записей.\n'
+    '[ -e "$ERRLOG" ] || ( umask 077; : > "$ERRLOG" ) 2>/dev/null\n'
+    'if [ -f "$ERRLOG" ] && [ "$(wc -l < "$ERRLOG")" -gt 500 ]; then\n'
+    '  ( umask 077; tail -n 300 "$ERRLOG" > "$ERRLOG.new" ) && mv -f "$ERRLOG.new" "$ERRLOG"\n'
+    'fi\n',
+    "ротация журнала",
+)
+
+old_head = '''fetch_asn() {
+  local asn=$1 destination=$2 number=${1#AS} reason base
+  if curl -fsS --proto '=https' --retry 2 --retry-delay 1 --max-time 20 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=$asn" > "$TMP/asn.json"; then
+    if reason=$(asn_prefixes "$asn" "$TMP/asn.json" "$destination" 2>&1); then
+      return 0
+    fi
+    rm -f -- "$destination"
+    echo "WARN: ответ RIPEstat по $asn отклонён: $reason" >&2
+  else
+    echo "WARN: RIPEstat не ответил по $asn" >&2
+  fi
+  for base in \\
+'''
+new_head = '''RIPE_DOWN=0; SRC_RIPE=0; SRC_IPVERSE=0
+fetch_asn() {
+  local asn=$1 destination=$2 number=${1#AS} reason base
+  # Если RIPEstat не ответил, остальные ASN этого запуска сразу идут в запасной источник.
+  if [ "$RIPE_DOWN" = 0 ]; then
+    if curl -fsS --proto '=https' --connect-timeout 4 --max-time 10 --retry 1 --retry-delay 1 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=$asn" > "$TMP/asn.json"; then
+      if reason=$(asn_prefixes "$asn" "$TMP/asn.json" "$destination" 2>&1); then
+        SRC_RIPE=$((SRC_RIPE+1))
+        return 0
+      fi
+      rm -f -- "$destination"
+      note "WARN: ответ RIPEstat по $asn отклонён: $reason"
+    else
+      RIPE_DOWN=1
+      note "WARN: RIPEstat недоступен, перехожу на резервный источник (ipverse)"
+    fi
+  fi
+  for base in \\
+'''
+upd = replace_once(upd, old_head, new_head, "fetch_asn")
+
+upd = replace_once(
+    upd,
+    '      echo "Запасной источник для $asn: ipverse"\n      return 0\n',
+    '      SRC_IPVERSE=$((SRC_IPVERSE+1))\n      echo "Запасной источник для $asn: ipverse"\n      return 0\n',
+    "счётчик ipverse",
+)
+
+upd = replace_once(upd, "asn_total=0; asn_cached=0\n", "asn_total=0; asn_cached=0; asn_missing=0\n", "asn_missing init")
+upd = replace_once(
+    upd,
+    '    missing=$((missing+1))\n    echo "WARN: нет данных по $asn и кэша нет — в этот раз без него" >&2\n',
+    '    missing=$((missing+1)); asn_missing=$((asn_missing+1))\n    echo "WARN: нет данных по $asn и кэша нет — в этот раз без него" >&2\n',
+    "asn_missing счётчик",
+)
+
+ASN_SUMMARY = r'''if [ "$asn_total" -gt 0 ]; then
+  # Итог по ASN: что получено и откуда. Всё, кроме «все от RIPEstat», попадает и в журнал ошибок.
+  asn_fresh=$((SRC_RIPE+SRC_IPVERSE)); asn_warn=1
+  if [ "$SRC_RIPE" -eq "$asn_total" ]; then
+    asn_line="ASN: все $asn_total получены от RIPEstat"; asn_warn=0
+  elif [ "$RIPE_DOWN" = 1 ] && [ "$SRC_IPVERSE" -eq "$asn_total" ]; then
+    asn_line="ASN: RIPEstat недоступен — все $asn_total получены из резервного источника (ipverse)"
+  elif [ "$RIPE_DOWN" = 1 ] && [ "$asn_fresh" -eq 0 ] && [ "$asn_cached" -eq "$asn_total" ]; then
+    asn_line="ASN: RIPEstat и ipverse недоступны — взято из сохранённого кэша ($asn_cached), данные могут быть устаревшими"
+  elif [ "$RIPE_DOWN" = 1 ] && [ "$asn_fresh" -eq 0 ] && [ "$asn_missing" -eq "$asn_total" ]; then
+    asn_line="ASN: ни RIPEstat, ни ipverse не ответили, кэша нет — подсети этих ASN в правила не вошли"
+  elif [ "$RIPE_DOWN" = 1 ]; then
+    asn_line="ASN: RIPEstat недоступен — ipverse $SRC_IPVERSE, кэш $asn_cached, не получено $asn_missing"
+  else
+    asn_line="ASN: RIPEstat $SRC_RIPE, ipverse $SRC_IPVERSE, кэш $asn_cached, не получено $asn_missing"
+  fi
+  echo "$asn_line"
+  if [ "$asn_warn" = 1 ]; then logline "WARN: $asn_line"; fi
+fi
+cat "$DIR/extra.txt" >> "$TMP/scan_raw" 2>/dev/null
+'''
+upd = replace_once(upd, 'cat "$DIR/extra.txt" >> "$TMP/scan_raw" 2>/dev/null\n', ASN_SUMMARY, "строка статуса ASN")
+
+# Настройки, общие для новых и уже установленных экземпляров.
+LAN_DEFAULT = ""
+upd = replace_once(upd, 'API_PORTS="${API_PORTS:-}"; API_ALLOW="${API_ALLOW:-}"\n',
+    'API_PORTS="${API_PORTS:-}"; API_ALLOW="${API_ALLOW:-}"\n'
+    'LAN_ALLOW="${LAN_ALLOW-}"\n'
+    'MAX_GROWTH="${MAX_GROWTH:-3}"; MIN_KEEP="${MIN_KEEP:-0.2}"; MAX_CACHE_DAYS="${MAX_CACHE_DAYS:-14}"\n', "параметры списков")
+upd = replace_once(upd, 'TMP=$(mktemp -d) || fail_keep "не удалось создать временный каталог"\n',
+    '''python3 - "$MAX_GROWTH" "$MIN_KEEP" "$MAX_CACHE_DAYS" <<'PY' || fail_keep "неверные лимиты списков"
+import math
+import sys
+try:
+    growth, keep = map(float, sys.argv[1:3])
+    days = sys.argv[3]
+    assert math.isfinite(growth) and math.isfinite(keep)
+    assert growth >= 1 and 0 <= keep <= 1 and days.isdigit()
+except (ValueError, AssertionError):
+    sys.exit(1)
+PY
+TMP=$(mktemp -d) || fail_keep "не удалось создать временный каталог"
+''', "валидация лимитов")
+upd = replace_once(upd, 'DRY=0; [ "${1:-}" = "--dry" ] && DRY=1\n',
+    'DRY=0; [ "${1:-}" = "--dry" ] && DRY=1\n'
+    'PENDING=${FW_PENDING:-0}; [ "$PENDING" = 0 ] || [ "$PENDING" = 1 ] || exit 2\n', "режим pending")
+upd = replace_once(upd, 'flock -x 9 || fail_keep "не удалось заблокировать обновление"\n',
+    'flock -x 9 || fail_keep "не удалось заблокировать обновление"\n'
+    '# Проверка под lock каталога; перед fw-menu отпускаем его: меню может\n'
+    '# держать .apply.lock и ждать каталог при сборке pending.\n'
+    'if [ "$PENDING" = 0 ] && [ "$DRY" = 0 ]; then\n'
+    '  while :; do\n'
+    '    rollback_state=\n'
+    '    for state in "$DIR"/.rollback-*; do\n'
+    '      if [ -d "$state" ]; then rollback_state=$state; break; fi\n'
+    '    done\n'
+    '    [ -n "$rollback_state" ] || break\n'
+    '    token=${rollback_state##*/.rollback-}\n'
+    '    note "WARN: найдено неподтверждённое применение, откатываю"\n'
+    '    flock -u 9 || fail_keep "не удалось освободить блокировку обновления"\n'
+    '    /usr/local/sbin/fw-menu --rollback "$token" || fail_keep "не удалось откатить применение"\n'
+    '    flock -x 9 || fail_keep "не удалось заблокировать обновление"\n'
+    '  done\n'
+    'fi\n'
+    '# Таймерный запуск не меняет правила, пока меню ждёт подтверждения.\n'
+    'if [ "$PENDING" = 0 ] && [ "$DRY" = 0 ]; then\n'
+    '  exec 8>"$DIR/.apply.lock" || fail_keep "не открылся lock применения"\n'
+    '  flock -n -x 8 || fail_keep "ручное применение ещё не подтверждено"\n'
+    'fi\n', "блокировка таймера")
+upd = replace_once(upd, '# asn_prefixes ASN ОТВЕТ_RIPESTAT НАЗНАЧЕНИЕ\n',
+    '''# Отбирает только актуальный кэш и сравнивает размеры списков по числу строк.
+cache_fresh() {
+  [ -s "$1" ] || return 1
+  if ! python3 - "$1" "$MAX_CACHE_DAYS" <<'PY'
+from pathlib import Path
+import sys, time
+path = Path(sys.argv[1])
+sys.exit(0 if time.time() - path.stat().st_mtime <= int(sys.argv[2]) * 86400 else 1)
+PY
+  then
+    note "WARN: кэш ${1##*/} старше $MAX_CACHE_DAYS дней, пропускаю"
+    return 1
+  fi
+}
+growth_ok() {
+  local fresh=$1 cache=$2 label=$3
+  cache_fresh "$cache" || return 0
+  if ! python3 - "$fresh" "$cache" "$MAX_GROWTH" "$MIN_KEEP" <<'PY'
+from pathlib import Path
+import sys
+import ipaddress
+def sizes(path):
+    networks = [ipaddress.ip_network(line.partition('#')[0].strip(), strict=False)
+                for line in Path(path).read_text().splitlines() if line.partition('#')[0].strip()]
+    return (len(networks),
+            sum(network.num_addresses for network in networks if network.version == 4),
+            sum(max(1, network.num_addresses // (1 << 64)) for network in networks if network.version == 6))
+new, old = (sizes(p) for p in sys.argv[1:3])
+growth, keep = float(sys.argv[3]), float(sys.argv[4])
+sys.exit(0 if all(not previous or keep * previous <= current <= growth * previous
+                  for current, previous in zip(new, old)) else 1)
+PY
+  then
+    rm -f -- "$fresh"
+    note "WARN: аномальный размер списка $label, использую кэш"
+    return 1
+  fi
+}
+
+# asn_prefixes ASN ОТВЕТ_RIPESTAT НАЗНАЧЕНИЕ
+''', "лимиты кэша и роста")
+upd = replace_once(upd, 'if fetch_scanner_file "$spec" "$fresh"; then\n',
+    'if fetch_scanner_file "$spec" "$fresh" && growth_ok "$fresh" "$SCAN_CACHE/$name" "$label"; then\n', "рост списка")
+upd = replace_once(upd, 'elif [ -s "$SCAN_CACHE/$name" ]; then\n',
+    'elif cache_fresh "$SCAN_CACHE/$name"; then\n', "срок кэша сканеров")
+upd = replace_once(upd, 'elif [ -s "$asn_cache" ]; then\n',
+    'elif cache_fresh "$asn_cache"; then\n', "срок кэша ASN")
+upd = replace_once(upd, 'normalize_scanners "$TMP/scan_raw" "$TMP/scan_normalized" || fail_keep "список сканеров некорректен"\n',
+    '''normalize_scanners "$TMP/scan_raw" "$TMP/scan_normalized" || fail_keep "список сканеров некорректен"
+# Исключить из внешних блокировок сети, которые затрагивают доверенные или LAN.
+printf '%s\\n' "$LAN_ALLOW" | tr ' ,' '\\n\\n' > "$TMP/lan_raw"
+{ cat "$TMP/lan_raw"; cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" 2>/dev/null; } > "$TMP/protected_raw"
+if ! removed=$(python3 - "$TMP/scan_normalized" "$TMP/protected_raw" <<'PY'
+import ipaddress
+from pathlib import Path
+import re
+import sys
+blocked, protected = map(Path, sys.argv[1:])
+# DDNS-имя из trusted*.txt здесь пропускается: его IP уже добавлены строками из ddns_ips.
+# Любая другая строка, не похожая на адрес, по-прежнему останавливает обновление.
+HOST = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$")
+try:
+    allowed = [ipaddress.ip_network(value) for line in protected.read_text().splitlines()
+               if (value := line.partition('#')[0].strip()) and not HOST.match(value.lower())]
+    lines = blocked.read_text().splitlines()
+    kept = [line for line in lines if not any(
+        (network := ipaddress.ip_network(line)).version == safe.version and network.overlaps(safe)
+        for safe in allowed)]
+    blocked.write_text(''.join(line + '\\n' for line in kept))
+    print(len(lines) - len(kept))
+except (OSError, ValueError) as error:
+    sys.exit(str(error))
+PY
+); then fail_keep "не удалось проверить пересечения списков"; fi
+[ "$removed" -eq 0 ] || note "WARN: из списков сканеров удалено пересечений с trusted/LAN_ALLOW: $removed"
+''', "защита trusted и LAN")
+# Широкая сеть в RU-списке (0.0.0.0/1, ::/1) отключила бы геофильтр, а число строк такую подмену не выдаёт.
+upd = replace_once(upd, '''  [ "$url" = "$ZKEEN_URL" ] || echo "Зеркало для геобазы: ${url#https://}"\n''',
+    '''  if ! reason=$(python3 - "$TMP/ru4" "$TMP/ru6" <<'PY'
+import ipaddress
+from pathlib import Path
+import sys
+LIMITS = {4: 8, 6: 16}  # самая широкая допустимая сеть: IPv4 не шире /8, IPv6 не шире /16
+for name in sys.argv[1:]:
+    for line in Path(name).read_text().splitlines():
+        network = ipaddress.ip_network(line, strict=False)
+        if network.prefixlen < LIMITS[network.version]:
+            sys.exit(f"содержит слишком широкую сеть {network}")
+PY
+  ); then
+    note "WARN: геобаза с ${url#https://} отклонена: $reason"
+    continue
+  fi
+  [ "$url" = "$ZKEEN_URL" ] || echo "Зеркало для геобазы: ${url#https://}"\n''', "ширина сетей RU")
+upd = replace_once(upd, '# 2. Сканеры: списки + ASN + extra\n',
+    '''# Проверяем число RU v4 относительно последнего успешного применения.
+if [ -s "$DIR/geo.count" ]; then
+  previous=$(cat "$DIR/geo.count")
+  [[ "$previous" =~ ^[0-9]+$ ]] && [ "$previous" -gt 0 ] || fail_keep "geo.count повреждён"
+  python3 - "$n" "$previous" "$MAX_GROWTH" "$MIN_KEEP" <<'PY' || fail_keep "аномальное изменение числа RU IPv4 в геобазе ($previous → $n)"
+import sys
+current, previous, growth, keep = map(float, sys.argv[1:])
+sys.exit(0 if keep * previous <= current <= growth * previous else 1)
+PY
+fi
+
+# 2. Сканеры: списки + ASN + extra
+''', "рост геобазы")
+upd = replace_once(upd, '  set_def tr4 ipv4_addr "$TMP/tr4"; set_def tr6 ipv6_addr "$TMP/tr6"\n',
+    '  set_def tr4 ipv4_addr "$TMP/tr4"; set_def tr6 ipv6_addr "$TMP/tr6"\n'
+    '  split "$TMP/lan_raw" "$TMP/lan4" "$TMP/lan6"\n'
+    '  set_def lan4 ipv4_addr "$TMP/lan4"; set_def lan6 ipv6_addr "$TMP/lan6"\n', "набор LAN")
+upd = replace_once(upd, '  echo "    ip6 saddr @tr6 accept"\n',
+    '  echo "    ip6 saddr @tr6 accept"\n'
+    '  echo "    ip saddr @lan4 accept comment \\"LAN_ALLOW\\""\n'
+    '  echo "    ip6 saddr @lan6 accept comment \\"LAN_ALLOW\\""\n', "правила LAN")
+upd = replace_once(upd, 'cp "$TMP/new.nft" "$CACHE" || fail_save "не сохранилась копия правил"\n',
+    '''staged_rules=$(mktemp "$DIR/.fw.nft.XXXXXXXX") || fail_save "не создался временный файл правил"
+target=$CACHE; count_target=$DIR/geo.count
+if [ "$PENDING" = 1 ]; then target=$DIR/fw.nft.pending; count_target=$DIR/geo.count.pending; fi
+if ! cat "$TMP/new.nft" > "$staged_rules" || ! sync "$staged_rules" || ! mv -f "$staged_rules" "$target"; then
+  rm -f -- "$staged_rules"
+  fail_save "не сохранилась копия правил"
+fi
+printf '%s\\n' "$n" > "$count_target" || fail_save "не сохранилось число RU IPv4"
+''', "атомарный снимок")
+
+# Итоговая строка запуска: ВСЁ В ПОРЯДКЕ (зелёная) / ЕСТЬ ЗАМЕЧАНИЯ (жёлтая) / ОШИБКА (красная).
+upd = replace_once(upd, 'note() { echo "$1" >&2; logline "$1"; }\n'
+    'fail_keep() { note "ERR: $1 — правила не тронуты"; exit 1; }\n'
+    'fail_save() { note "ERR: правила применены, но $1"; exit 1; }\n',
+    r'''WARN_LOG=$(mktemp) || WARN_LOG=/dev/null
+trap 'rm -f "$WARN_LOG"' EXIT
+note() {
+  echo "$1" >&2; logline "$1"
+  case "$1" in WARN:*) echo "${1#WARN: }" >> "$WARN_LOG" 2>/dev/null || true ;; esac
+}
+# paint КОД ТЕКСТ [ПОТОК]: цвет только в терминале (не в журнале systemd) и без NO_COLOR.
+paint() {
+  if [ -t "${3:-1}" ] && [ -z "${NO_COLOR:-}" ]; then printf '\033[%sm%s\033[0m\n' "$1" "$2"
+  else printf '%s\n' "$2"; fi
+}
+record_result() { [ "$DRY" = 1 ] || printf '%s\n' "$1" > "$DIR/last-result" 2>/dev/null || true; }
+fail_keep() {
+  note "ERR: $1 — правила не тронуты"; record_result error
+  if [ "$DRY" = 1 ]; then paint 31 "ИТОГ: ОШИБКА — проверка не прошла, правила не менялись. Причина: $1" 2 >&2
+  else paint 31 "ИТОГ: ОШИБКА — правила не применены, действуют прежние. Причина: $1" 2 >&2; fi
+  exit 1
+}
+fail_save() {
+  note "ERR: правила применены, но $1"; record_result error
+  paint 31 "ИТОГ: ОШИБКА — правила применены, но $1; после перезагрузки они могут не подняться" 2 >&2
+  exit 1
+}
+verdict() {
+  local what=$1 count=0
+  [ -s "$WARN_LOG" ] && count=$(wc -l < "$WARN_LOG")
+  if [ "$count" -eq 0 ]; then
+    paint 32 "ИТОГ: ВСЁ В ПОРЯДКЕ — $what, все источники ответили"
+    record_result ok
+  else
+    paint 33 "ИТОГ: ЕСТЬ ЗАМЕЧАНИЯ — $what, но:"
+    head -n 6 "$WARN_LOG" | sed 's/^/  • /'
+    [ "$count" -le 6 ] || echo "  • … и ещё $((count-6)) (см. fw-menu → «Журнал ошибок»)"
+    record_result warn
+  fi
+}
+''', "итог запуска")
+upd = replace_once(upd, "trap 'rm -rf \"$TMP\"' EXIT\n", "trap 'rm -rf \"$TMP\"; rm -f \"$WARN_LOG\"' EXIT\n", "trap TMP и WARN_LOG")
+upd = replace_once(upd, 'if [ "$DRY" = 1 ]; then echo "DRY: синтаксис ок, ничего не применено"; exit 0; fi\n',
+    'if [ "$DRY" = 1 ]; then echo "DRY: синтаксис ок, ничего не применено"; verdict "проверка прошла, правила не менялись"; exit 0; fi\n', "итог dry")
+upd = replace_once(upd, 'echo "OK: применено"\n',
+    'echo "OK: применено"\n'
+    'if [ "$PENDING" = 1 ]; then verdict "правила загружены и ждут подтверждения"; else verdict "правила применены"; fi\n', "итог применения")
+# тихий curl: сбой отдельной попытки не печатаем, итог и резервные источники сообщают сами
+upd = upd.replace("curl -fsSL ", "curl -fsL ").replace("curl -fsS ", "curl -fs ")
+upd = upd.replace('note "WARN: из списков сканеров удалено пересечений', 'note "INFO: из списков сканеров удалено пересечений')
+
+# Слишком широкая сеть: пропускается только она сама, а не весь список; решение — в fw-menu (wide-ok.txt).
+WIDE_LOAD = """approved = set()
+okfile = os.environ.get("FW_WIDE_OK")
+report_path = os.environ.get("FW_WIDE_REPORT")
+label = os.environ.get("FW_WIDE_LABEL", "")
+skipped = []
+if okfile:
+    try:
+        for raw_ok in Path(okfile).read_text(encoding="utf-8").splitlines():
+            text_ok = raw_ok.partition("#")[0].strip()
+            if text_ok:
+                try:
+                    approved.add(ipaddress.ip_network(text_ok))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+"""
+WIDE_SAVE = """        with open(report_path, "a", encoding="utf-8") as report_file:
+            for item in skipped:
+                report_file.write(f"{label}\\t{item}\\n")
+"""
+upd = replace_once(upd, 'import ipaddress\nfrom pathlib import Path\nimport sys\n\nsource, destination = map(Path, sys.argv[1:3])\nminimum = {4: int(sys.argv[3]), 6: int(sys.argv[4])}\nby_version = {4: [], 6: []}\n',
+    'import ipaddress\nimport os\nfrom pathlib import Path\nimport sys\n\nsource, destination = map(Path, sys.argv[1:3])\nminimum = {4: int(sys.argv[3]), 6: int(sys.argv[4])}\nby_version = {4: [], 6: []}\n' + WIDE_LOAD, "широкие сети: загрузка (normalize)")
+upd = replace_once(upd, '''        network = ipaddress.ip_network(value)
+        if network.prefixlen < minimum[network.version]:
+            raise ValueError(f"слишком широкая сеть {network} (порог /{minimum[network.version]})")
+        by_version[network.version].append(network)
+''', '''        network = ipaddress.ip_network(value)
+        if network.prefixlen < minimum[network.version] and network not in approved:
+            if not report_path:
+                raise ValueError(f"слишком широкая сеть {network} (порог /{minimum[network.version]})")
+            skipped.append(network)
+            continue
+        by_version[network.version].append(network)
+''', "широкие сети: пропуск (normalize)")
+upd = replace_once(upd, '''    destination.write_text("".join(line + "\\n" for line in lines), encoding="utf-8")
+except (OSError, ValueError) as error:
+    sys.exit(str(error))
+''', '''    destination.write_text("".join(line + "\\n" for line in lines), encoding="utf-8")
+    if skipped and report_path:
+''' + WIDE_SAVE + '''except (OSError, ValueError) as error:
+    sys.exit(str(error))
+''', "широкие сети: отчёт (normalize)")
+upd = replace_once(upd, 'import ipaddress\nimport json\nfrom pathlib import Path\nimport sys\n\nasn, source, destination = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])\nminimum = {4: int(sys.argv[4]), 6: int(sys.argv[5])}\n',
+    'import ipaddress\nimport json\nimport os\nfrom pathlib import Path\nimport sys\n\nasn, source, destination = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])\nminimum = {4: int(sys.argv[4]), 6: int(sys.argv[5])}\n' + WIDE_LOAD + 'label = asn\n', "широкие сети: загрузка (ASN)")
+upd = replace_once(upd, '''        network = ipaddress.ip_network(item["prefix"])
+        if network.prefixlen < minimum[network.version]:
+            raise ValueError(f"слишком широкая сеть {network} (порог /{minimum[network.version]})")
+        lines.append(str(network))
+''', '''        network = ipaddress.ip_network(item["prefix"])
+        if network.prefixlen < minimum[network.version] and network not in approved:
+            if not report_path:
+                raise ValueError(f"слишком широкая сеть {network} (порог /{minimum[network.version]})")
+            skipped.append(network)
+            continue
+        lines.append(str(network))
+''', "широкие сети: пропуск (ASN)")
+upd = replace_once(upd, '''    destination.write_text("".join(line + "\\n" for line in sorted(set(lines))), encoding="utf-8")
+except (OSError, AttributeError, KeyError, TypeError, ValueError) as error:''', '''    destination.write_text("".join(line + "\\n" for line in sorted(set(lines))), encoding="utf-8")
+    if skipped and report_path:
+''' + WIDE_SAVE + '''except (OSError, AttributeError, KeyError, TypeError, ValueError) as error:''', "широкие сети: отчёт (ASN)")
+upd = replace_once(upd, 'TMP=$(mktemp -d) || fail_keep "не удалось создать временный каталог"\n',
+    'TMP=$(mktemp -d) || fail_keep "не удалось создать временный каталог"\n'
+    ': > "$TMP/wide"\n'
+    'export FW_WIDE_REPORT="$TMP/wide" FW_WIDE_OK="$DIR/wide-ok.txt"\n', "отчёт о широких сетях")
+upd = replace_once(upd, 'fetch_scanner_file() {\n  local spec=$1 destination=$2 url reason\n',
+    'fetch_scanner_file() {\n  local spec=$1 destination=$2 url reason\n  export FW_WIDE_LABEL="${spec##*/}"\n', "метка источника")
+upd = replace_once(upd, 'fetch_asn() {\n  local asn=$1 destination=$2 number=${1#AS} reason base\n',
+    'fetch_asn() {\n  local asn=$1 destination=$2 number=${1#AS} reason base\n  export FW_WIDE_LABEL="$asn"\n', "метка ASN")
+upd = replace_once(upd, '# normalize_scanners ИСТОЧНИК НАЗНАЧЕНИЕ [МИН_ПРЕФИКС_V4 МИН_ПРЕФИКС_V6]\n',
+    r"""# wide_finish: итог по слишком широким сетям. Они пропущены и не блокируются, пока их не подтвердят в fw-menu.
+wide_finish() {
+  local count
+  if [ -s "$TMP/wide" ]; then
+    sort -u "$TMP/wide" > "$TMP/wide.sorted"
+    count=$(wc -l < "$TMP/wide.sorted")
+    if cp "$TMP/wide.sorted" "$DIR/wide-pending.txt.new" && mv -f "$DIR/wide-pending.txt.new" "$DIR/wide-pending.txt"; then :; else
+      logline "WARN: не записался wide-pending.txt"
+    fi
+    note "WARN: пропущено слишком широких сетей: $count — они не блокируются, пока ты их не подтвердишь (fw-menu → «Проверить и применить правила»)"
+  else
+    rm -f "$DIR/wide-pending.txt"
+  fi
+}
+
+# normalize_scanners ИСТОЧНИК НАЗНАЧЕНИЕ [МИН_ПРЕФИКС_V4 МИН_ПРЕФИКС_V6]
+""", "функция wide_finish")
+upd = replace_once(upd, 'if [ "$DRY" = 1 ]; then echo "DRY: синтаксис ок, ничего не применено"',
+    'wide_finish\nif [ "$DRY" = 1 ]; then echo "DRY: синтаксис ок, ничего не применено"', "вызов wide_finish")
+
+upd, replaced = re.subn(r'echo ("WARN: .*?") >&2', r"note \1", upd)
+print(f"заменено echo WARN → note: {replaced}")
+leftover = [line for line in upd.splitlines() if ">&2" in line]
+# допустимо только внутри note()
+unexpected = [line for line in leftover if 'echo "$1" >&2' not in line and 'paint ' not in line]
+if unexpected:
+    sys.exit("остались прямые записи в stderr:\n" + "\n".join(unexpected))
+
+# DDNS-имена в trusted*.txt: при каждом обновлении превращаются в адреса.
+DDNS_BASH = r"""
+# DDNS: DDNS-адреса из trusted*.txt превращаются в IP. Ответ принимается только из глобальных адресов,
+# не больше 8 на DDNS-адрес; при сбое DNS берётся кэш не старше DDNS_CACHE_HOURS часов.
+DDNS_CACHE_HOURS="${DDNS_CACHE_HOURS:-72}"
+ddns_resolve() {
+  local names="$TMP/ddns_names" out
+  cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" 2>/dev/null > "$names"
+  : > "$TMP/ddns_ips"
+  grep -qE '[A-Za-z]' "$names" || return 0
+  if ! out=$(timeout 60 python3 - "$names" "$DIR/ddns-cache.txt" "$TMP/ddns_ips" "$DRY" "$DDNS_CACHE_HOURS" <<'PY_DDNS'
+import ipaddress
+import re
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+
+names_file, cache_file, out_file, dry, max_hours = sys.argv[1:6]
+max_age = int(max_hours) * 3600
+NAME = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+MAX_ADDRESSES = 8
+now = int(time.time())
+
+names = []
+for line in Path(names_file).read_text(encoding="utf-8", errors="replace").splitlines():
+    value = "".join(line.partition("#")[0].split()).lower()
+    if not value:
+        continue
+    try:
+        ipaddress.ip_network(value)
+        continue
+    except ValueError:
+        pass
+    if NAME.match(value) and value not in names:
+        names.append(value)
+
+cache = {}
+try:
+    for line in Path(cache_file).read_text(encoding="utf-8").splitlines():
+        name, address, stamp = line.split()
+        cache.setdefault(name, []).append((address, int(stamp)))
+except (OSError, ValueError):
+    cache = {}
+
+
+def resolve(name):
+    result = []
+
+    def work():
+        try:
+            for item in socket.getaddrinfo(name, None, proto=socket.IPPROTO_TCP):
+                result.append(item[4][0])
+        except (OSError, UnicodeError):
+            pass
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(8)
+    return list(result)
+
+
+new_cache = {}
+addresses = []
+for name in names:
+    found = []
+    for text in resolve(name):
+        try:
+            address = ipaddress.ip_address(text.split("%")[0])
+        except ValueError:
+            continue
+        if address.is_global and not address.is_multicast and str(address) not in found:
+            found.append(str(address))
+    if found and len(found) <= MAX_ADDRESSES:
+        new_cache[name] = [(address, now) for address in found]
+        addresses.extend(found)
+        continue
+    reason = "ответ пустой или без глобальных адресов" if not found else f"слишком много адресов ({len(found)})"
+    kept = [(address, stamp) for address, stamp in cache.get(name, []) if now - stamp <= max_age]
+    if kept:
+        new_cache[name] = kept
+        addresses.extend(address for address, _ in kept)
+        print(f"WARN: DDNS-адрес {name}: {reason}, использую прежние IP из кэша")
+    else:
+        print(f"WARN: DDNS-адрес {name}: {reason}, IP нет — в правила не попал")
+
+Path(out_file).write_text("".join(address + "\n" for address in dict.fromkeys(addresses)), encoding="utf-8")
+if dry != "1":
+    try:
+        Path(cache_file).write_text("".join(f"{name} {address} {stamp}\n"
+                                            for name, items in new_cache.items() for address, stamp in items),
+                                    encoding="utf-8")
+    except OSError:
+        print("WARN: не записался кэш DDNS-адресов")
+PY_DDNS
+  ); then
+    note "WARN: не удалось разрешить DDNS-адреса из trusted, использую только обычные адреса"
+    : > "$TMP/ddns_ips"
+    return 0
+  fi
+  [ -z "$out" ] || while IFS= read -r line; do note "$line"; done <<< "$out"
+}
+ddns_resolve
+"""
+
+upd = replace_once(
+    upd,
+    "# Исключить из внешних блокировок сети, которые затрагивают доверенные или LAN.\n",
+    DDNS_BASH.lstrip("\n") + "# Исключить из внешних блокировок сети, которые затрагивают доверенные или LAN.\n", "ddns_resolve")
+upd = replace_once(
+    upd, '{ cat "$TMP/lan_raw"; cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" 2>/dev/null; } > "$TMP/protected_raw"',
+    '{ cat "$TMP/lan_raw" "$TMP/ddns_ips"; cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" 2>/dev/null; } > "$TMP/protected_raw"',
+    "ddns в protected")
+upd = replace_once(
+    upd, 'cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" 2>/dev/null > "$TMP/tr_raw"',
+    'cat "$DIR/trusted.txt" "$DIR/trusted.local.txt" "$TMP/ddns_ips" 2>/dev/null > "$TMP/tr_raw"', "ddns в trusted")
+
+# ----------------------------------------------------------------- fw-menu
+menu = parts["menu"][2]
+# Имя процесса из ss попадает на экран администратора: управляющие символы убираем (clean_text ниже, в блоке BOXED).
+menu = replace_once(menu, '''    return "xray" if raw.startswith("xray-linux") else raw''',
+    '''    return "xray" if raw.startswith("xray-linux") else clean_text(raw)''', "очистка имени процесса")
+menu = replace_once(menu, """def probe_output(*command):
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=4, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+""", """def probe_output(*command, timeout=4, on_timeout=""):
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return on_timeout
+    except OSError:
+        return ""
+""", "probe_output: необязательный таймаут")
+
+menu = replace_once(
+    menu,
+    'SOURCES = DIRECTORY / "sources.txt"\n',
+    'SOURCES = DIRECTORY / "sources.txt"\nERROR_LOG = DIRECTORY / "errors.log"\n',
+    "ERROR_LOG",
+)
+menu = replace_once(menu, 'TIMER_FILE = Path("/etc/systemd/system/fw-update.timer")\n',
+    'TIMER_FILE = Path("/etc/systemd/system/fw-update.timer")\n'
+    'NFT_DROPIN = Path("/etc/systemd/system/nftables.service.d/10-fw-restore.conf")\n', "drop-in меню")
+menu = replace_once(menu, 'SCHEDULE_FILE = TIMER_FILE.with_name(TIMER_FILE.name + ".d") / "10-fw-menu-schedule.conf"\n',
+    'SCHEDULE_FILE = TIMER_FILE.with_name(TIMER_FILE.name + ".d") / "10-fw-menu-schedule.conf"\n'
+    'SETTING_FILES = ("fw.conf", "local.conf", "extra.txt", "trusted.txt", "trusted.local.txt",\n'
+    '                 "asn.txt", "sources.txt", "presets.conf")\n', "список настроек")
+menu = replace_once(menu, '    installed_files = [MENU_FILE, SERVICE_FILE, TIMER_FILE]\n',
+    '    installed_files = [MENU_FILE, SERVICE_FILE, TIMER_FILE]\n'
+    '    if NFT_DROPIN.is_file():\n        installed_files.append(NFT_DROPIN)\n', "удаление drop-in")
+menu = replace_once(menu, '        if path == SCHEDULE_FILE:\n',
+    '        if path in (SCHEDULE_FILE, NFT_DROPIN):\n', "восстановление drop-in")
+
+show_log = '''def show_error_log():
+    try:
+        lines = ERROR_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        lines = []
+    if not lines:
+        print("Журнал ошибок пуст.")
+        return
+    shown = lines[-30:]
+    print(f"Журнал ошибок {ERROR_LOG}: показаны последние {len(shown)} из {len(lines)}")
+    print("Формат: дата время режим сообщение. Режим dry — пробный запуск, apply — применение.")
+    for line in shown:
+        print(f"  {line}")
+    if input("Очистить журнал? Введи «да»: ").strip().casefold() != "да":
+        return
+    fd = os.open(DIRECTORY, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            current = ERROR_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            current = []
+        # Записи, появившиеся после показа, не стираются.
+        rest = current[len(lines):] if current[:len(lines)] == lines else current
+        write_text_atomic(ERROR_LOG, "".join(line + "\\n" for line in rest))
+    finally:
+        os.close(fd)
+    print("Журнал очищен.")
+
+
+'''
+menu = replace_once(menu, "def show_menu(title, entries, exit_label=\"Назад\"):\n",
+                    show_log + "def show_menu(title, entries, exit_label=\"Назад\"):\n", "show_error_log")
+
+menu = replace_once(
+    menu,
+    '            ("Удалить скрипт и настройки", uninstall),\n        )),\n    )\n',
+    '            ("Удалить скрипт и настройки", uninstall),\n        )),\n        ("Журнал ошибок", show_error_log),\n    )\n',
+    "пункт меню",
+)
+menu = replace_once(
+    menu,
+    '            ("Сохранённые правила nftables", DIRECTORY / "fw.nft"),\n',
+    '            ("Сохранённые правила nftables", DIRECTORY / "fw.nft"),\n'
+    '            ("Журнал ошибок обновления", ERROR_LOG),\n',
+    "инвентарь файлов",
+)
+menu = replace_once(
+    menu,
+    '        SOURCES: "свои списки не добавлены",\n',
+    '        SOURCES: "свои списки не добавлены",\n        ERROR_LOG: "ошибок не было",\n',
+    "optional",
+)
+
+EXPLAIN = r'''def port_values(value):
+    if isinstance(value, int):
+        return [str(value)]
+    if isinstance(value, dict) and "set" in value:
+        return [port for item in value["set"] for port in port_values(item)]
+    if isinstance(value, dict) and "range" in value:
+        return [f"{value['range'][0]}-{value['range'][1]}"]
+    raise ValueError("неожиданный формат порта")
+
+
+def rule_ports(expressions):
+    ports = []
+    for expression in expressions:
+        match = expression.get("match") or {}
+        payload = (match.get("left") or {}).get("payload") or {}
+        if payload.get("field") == "dport":
+            ports.extend(port_values(match["right"]))
+    return ports
+
+
+def rule_protocols(expressions):
+    names = set()
+    for expression in expressions:
+        match = expression.get("match") or {}
+        left = match.get("left") or {}
+        if (left.get("meta") or {}).get("key") == "l4proto":
+            right = match["right"]
+            names.update(right["set"] if isinstance(right, dict) else [right])
+        payload = left.get("payload") or {}
+        if payload.get("field") == "dport" and payload.get("protocol") in {"tcp", "udp"}:
+            names.add(payload["protocol"])
+    return sorted(names)
+
+
+def rule_kind(rule):
+    comments = {"api-lock": "api_lock", "api-allow": "api_allow", "LAN_ALLOW": "lan", "scanners": "scanners", "non-RU": "non_ru"}
+    if rule.get("comment") in comments:
+        return comments[rule["comment"]]
+    expressions = rule.get("expr", [])
+    lefts = [(expression.get("match") or {}).get("left") or {} for expression in expressions]
+    if any("fib" in left for left in lefts):
+        return "transit"
+    if '"@tr4"' in json.dumps(expressions) or '"@tr6"' in json.dumps(expressions):
+        return "trusted"
+    if any((left.get("meta") or {}).get("key") in {"iif", "iifname"} for left in lefts):
+        return "loopback"
+    if any("ct" in left for left in lefts):
+        return "established"
+    return "other"
+
+
+def rule_counter(rule):
+    for expression in rule.get("expr", []):
+        if "counter" in expression:
+            return expression["counter"]["packets"], expression["counter"]["bytes"]
+    return 0, 0
+
+
+def dropped_text(group):
+    text = f"отброшено пакетов: {group['packets']}"
+    return text + (f", {format_size(group['size'])}" if group["packets"] else "")
+
+
+def ports_phrase(ports, single, plural):
+    return f"{single if len(ports) == 1 else plural} {', '.join(ports)}"
+
+
+def protocols_phrase(protocols):
+    return " и ".join(name.upper() for name in protocols)
+
+
+def explain_rules(items):
+    """Правила таблицы inet fw простым языком по JSON из `nft -j`."""
+    sets = {item["set"]["name"]: len(item["set"].get("elem", [])) for item in items if "set" in item}
+    chain = next(item["chain"] for item in items if "chain" in item and item["chain"]["name"] == "input")
+    groups = []
+    for item in items:
+        rule = item.get("rule")
+        if not rule or rule.get("chain") != "input":
+            continue
+        kind = rule_kind(rule)
+        packets, size = rule_counter(rule)
+        if groups and groups[-1]["kind"] == kind and kind in {"api_lock", "api_allow", "trusted", "lan", "scanners", "non_ru", "other"}:
+            groups[-1]["packets"] += packets
+            groups[-1]["size"] += size
+            groups[-1]["count"] += 1
+            continue
+        groups.append({"kind": kind, "packets": packets, "size": size, "count": 1,
+                       "ports": rule_ports(rule.get("expr", [])),
+                       "protocols": rule_protocols(rule.get("expr", []))})
+    kinds = [group["kind"] for group in groups]
+
+    print("\nСписки адресов (записей после объединения подсетей):")
+    rows = [("Доверенные, пропускаются всегда", "tr4", "tr6"),
+            ("LAN_ALLOW, пропускаются всегда", "lan4", "lan6"),
+            ("Сканеры и сети ведомств, блокируются", "sc4", "sc6"),
+            ("Российские адреса, допускаются на защищённые порты", "ru4", "ru6")]
+    if "api_lock" in kinds:
+        rows.append(("Допущенные к порту управления", "ap4", "ap6"))
+    for label, v4, v6 in rows:
+        print(f"  {label} ".ljust(60, ".") + f" IPv4: {sets.get(v4, 0)}, IPv6: {sets.get(v6, 0)}")
+
+    steps = []
+    base_merged = "loopback" in kinds and "established" in kinds
+    api_lock = next((group for group in groups if group["kind"] == "api_lock"), None)
+    for group in groups:
+        kind = group["kind"]
+        if kind == "loopback":
+            steps.append("Подключения самого сервера и ответы на соединения, которые он открыл, — пропускаются."
+                         if base_merged else "Подключения самого сервера — пропускаются.")
+        elif kind == "established":
+            if not base_merged:
+                steps.append("Ответы на соединения, которые открыл сам сервер, — пропускаются.")
+        elif kind == "transit":
+            steps.append("Трафик, адресованный не этому серверу (транзит), — не проверяется, пропускается.")
+        elif kind == "api_lock":
+            steps.append(f"{ports_phrase(group['ports'], 'Порт управления', 'Порты управления')} "
+                         f"({protocols_phrase(group['protocols']) or 'TCP'}): адреса не из списка допущенных "
+                         f"отбрасываются ({dropped_text(group)}), допущенные — пропускаются.")
+        elif kind == "api_allow":
+            if api_lock is None:
+                steps.append(f"{ports_phrase(group['ports'], 'Порт управления', 'Порты управления')} — пропускается.")
+        elif kind == "trusted":
+            steps.append("Доверенные адреса — пропускаются на все порты.")
+        elif kind == "lan":
+            steps.append("Адреса LAN_ALLOW — пропускаются до списков сканеров и геофильтра.")
+        elif kind == "scanners":
+            steps.append(f"Сканеры и сети ведомств — отбрасываются на всех портах ({dropped_text(group)}).")
+        elif kind == "non_ru":
+            steps.append(f"{ports_phrase(group['ports'], 'Порт', 'Порты')} ({protocols_phrase(group['protocols'])}): "
+                         f"адреса не из России — отбрасываются ({dropped_text(group)}).")
+        else:
+            steps.append(f"Прочие правила: {group['count']} шт. Их смысл смотри в техническом виде.")
+    steps.append("Всё остальное — пропускается." if chain.get("policy") == "accept"
+                 else "Всё остальное — отбрасывается.")
+
+    print("\nКак проверяется каждое новое входящее подключение")
+    print("(сверху вниз, срабатывает первое подходящее):")
+    if chain.get("hook") == "prerouting":
+        print("  Фильтр стоит до маршрутизации (prerouting), поэтому действует и на порты Docker-контейнеров.")
+    for number, text in enumerate(steps, 1):
+        print(textwrap.fill(f"{number}. {text}", width=92, initial_indent="  ", subsequent_indent="     "))
+
+
+'''
+menu = replace_once(menu, "def show_status():\n", EXPLAIN + "def show_status():\n", "explain_rules")
+
+BOXED = r"""import threading
+import unicodedata
+
+BOX_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# Управляющие последовательности терминала: CSI («ESC [ …»), OSC («ESC ] … BEL/ST») и одиночные «ESC x».
+TERMINAL_ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?")
+
+
+def clean_text(value):
+    # Чужой текст (whois, RIPEstat, PTR, имя процесса) без управляющих последовательностей и символов
+    # категорий Cc/Cf (в том числе перевороты направления текста): на экран root попадает только видимое.
+    text = TERMINAL_ESCAPES.sub("", str(value))
+    return "".join(char for char in text if unicodedata.category(char) not in ("Cc", "Cf"))
+
+
+def box_cells(raw):
+    # Строка в виде списка (символ, цвет). Цвет хранится как накопленные коды ANSI.
+    # Из остального текста убираются любые другие управляющие последовательности: цвет — единственное, что пропускаем.
+    cells, color = [], ""
+    position = 0
+    for found in BOX_ANSI.finditer(raw):
+        cells.extend((char, color) for char in clean_text(raw[position:found.start()]))
+        code = found.group(0)
+        color = "" if code in ("\x1b[0m", "\x1b[m") else color + code
+        position = found.end()
+    cells.extend((char, color) for char in clean_text(raw[position:]))
+    return cells
+
+
+def box_render(cells):
+    out, current = [], ""
+    for char, color in cells:
+        if color != current:
+            if current:
+                out.append("\x1b[0m")
+            out.append(color)
+            current = color
+        out.append(char)
+    if current:
+        out.append("\x1b[0m")
+    return "".join(out)
+
+
+def box_wrap(cells, width):
+    # Перенос по пробелам; продолжение строки сдвигается так же, как начало, плюс два пробела.
+    if len(cells) <= width:
+        return [cells]
+    indent = 0
+    while indent < len(cells) and cells[indent][0] == " ":
+        indent += 1
+    indent = min(indent, width // 3)
+    pad = [(" ", "")] * (indent + 2)
+    lines, rest = [], cells
+    while len(rest) > width:
+        cut = -1
+        for index in range(min(width, len(rest) - 1), indent + 1, -1):
+            if rest[index][0] == " ":
+                cut = index
+                break
+        if cut <= 0:
+            cut = width
+        lines.append(rest[:cut])
+        rest = pad + [cell for cell in rest[cut:]][(1 if rest[cut][0] == " " else 0):]
+    lines.append(rest)
+    return lines
+
+
+BOX_HEADINGS = (
+    "Проверка файлов и команд",
+    "Проверка reverse proxy",
+    "Профиль сервера",
+    "Служба и таймер",
+    "Загруженные правила",
+    "Списки адресов",
+    "Как проверяется каждое новое входящее подключение",
+    "Технический вид правил",
+)
+
+
+def print_box(title, text, headings=()):
+    columns = shutil.get_terminal_size((100, 24)).columns
+    limit = max(30, columns - 4)
+    entries = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").strip("\n").split("\n"):
+        raw = raw.rstrip()
+        plain = BOX_ANSI.sub("", raw)
+        if not plain and entries and entries[-1][0] == "rule":
+            continue
+        previous = next((item for item in reversed(entries) if item[0] == "rule" or item[1]), None)
+        if (headings and plain.startswith(tuple(headings)) and len(plain) <= limit - 4
+                and not (previous and previous[0] == "rule")):
+            # Заголовок блока становится разделителем; пустая строка перед ним не нужна.
+            while entries and entries[-1][0] == "line" and not entries[-1][1]:
+                entries.pop()
+            entries.append(("rule", plain) if entries else ("line", box_cells(raw)))
+            continue
+        for part in box_wrap(box_cells(raw), limit):
+            entries.append(("line", part))
+    if entries and entries[-1][0] == "rule":
+        # Разделитель без текста под ним не нужен: оставляем строку как обычную.
+        entries[-1] = ("line", box_cells(entries[-1][1]))
+    inner = max([len(title) + 2] + [len(item) + (4 if kind == "rule" else 0) for kind, item in entries])
+    print("┌─ " + title + " " + "─" * (inner + 2 - len(title) - 3) + "┐")
+    for kind, item in entries:
+        if kind == "rule":
+            print("├─ " + item + " " + "─" * (inner + 2 - len(item) - 3) + "┤")
+        else:
+            print("│ " + box_render(item) + " " * (inner - len(item)) + " │")
+    print("└" + "─" * (inner + 2) + "┘")
+
+
+def boxed(title, function, headings=()):
+    # Выводит всё, что печатает function, в рамке. Если функция спрашивает input(),
+    # рамка закрывается до вопроса: приглашение и ответ идут уже без неё.
+    def wrapper():
+        if not (sys.stdout.isatty() and sys.stdin.isatty()):
+            return function()
+        import builtins
+        import pty
+        master, slave = pty.openpty()
+        chunks = []
+
+        def reader():
+            while True:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        sys.stdout.flush()
+        state = {"saved": os.dup(1), "done": False}
+        os.dup2(slave, 1)
+
+        def finish():
+            if state["done"]:
+                return
+            state["done"] = True
+            sys.stdout.flush()
+            os.dup2(state["saved"], 1)
+            os.close(state["saved"])
+            os.close(slave)
+            thread.join(timeout=5)
+            os.close(master)
+            print_box(title, b"".join(chunks).decode("utf-8", "replace"), headings)
+
+        real_input = builtins.input
+
+        def boxed_input(*args, **kwargs):
+            finish()
+            return real_input(*args, **kwargs)
+
+        builtins.input = boxed_input
+        try:
+            return function()
+        finally:
+            builtins.input = real_input
+            finish()
+    wrapper.__wrapped__ = function
+    return wrapper
+
+
+"""
+menu = replace_once(menu, "def show_status():\n", BOXED + "def show_status():\n", "boxed_status")
+menu = replace_once(menu, '("Статус файрвола", show_status),', '("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),', "boxed_entry")
+
+OLD_TAIL = r'''    print("\nЗагруженные правила", flush=True)
+    table = subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
+                           text=True, capture_output=True, check=False)
+    if table.returncode:
+        print(table.stderr.strip() or "Таблица inet fw пока не загружена.")
+        return
+    for item in json.loads(table.stdout)["nftables"]:
+        address_set = item.get("set")
+        if address_set and address_set["name"] in {"ru4", "ru6", "sc4", "sc6", "tr4", "tr6"}:
+            print(f"  {address_set['name']}: {len(address_set.get('elem', []))}", flush=True)
+    run("nft", "-t", "list", "chain", "inet", "fw", "input")
+'''
+NEW_TAIL = r'''    print("\nЗагруженные правила (счётчики с момента последнего применения правил)", flush=True)
+    table = subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
+                           text=True, capture_output=True, check=False)
+    if table.returncode:
+        print(table.stderr.strip() or "Таблица inet fw пока не загружена.")
+        return
+    try:
+        explain_rules(json.loads(table.stdout)["nftables"])
+    except (AttributeError, KeyError, StopIteration, TypeError, ValueError):
+        print("Не удалось разобрать правила, ниже технический вид.", flush=True)
+        run("nft", "-t", "list", "chain", "inet", "fw", "input")
+        return
+    print("\nТехнический вид правил: nft list table inet fw")
+'''
+menu = replace_once(menu, OLD_TAIL, NEW_TAIL, "хвост show_status")
+
+menu = replace_once(menu, 'def apply_rules():\n', r'''def settings_paths():
+    return [(name, DIRECTORY / name) for name in SETTING_FILES] + [("schedule.conf", SCHEDULE_FILE)]
+
+
+def save_settings(destination):
+    destination.mkdir(mode=0o700)
+    for name, path in settings_paths():
+        if path.is_file():
+            shutil.copy2(path, destination / name)
+    # Метка полной копии: без неё restore_settings ничего не удаляет.
+    (destination / ".complete").write_text("1\n")
+
+
+def restore_settings(source):
+    changed = []
+    # Копия без метки (нет каталога, оборвана запись, состояние от старой версии)
+    # не говорит, каких файлов не было: в этом случае настройки не трогаем.
+    if not (source / ".complete").is_file():
+        print(f"Копия настроек {source} неполная или отсутствует — настройки оставлены как есть.")
+        return changed
+    for name, path in settings_paths():
+        saved = source / name
+        if saved.is_file():
+            if not path.is_file() or path.read_bytes() != saved.read_bytes():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd, temp = tempfile.mkstemp(prefix=".fw-restore-", dir=path.parent)
+                os.close(fd)
+                try:
+                    shutil.copy2(saved, temp)
+                    os.replace(temp, path)
+                finally:
+                    Path(temp).unlink(missing_ok=True)
+                changed.append(str(path))
+        elif path.exists():
+            path.unlink()
+            changed.append(str(path) + " (удалён)")
+    return changed
+
+
+def save_confirmed_settings():
+    confirmed = DIRECTORY / "confirmed"
+    staged = DIRECTORY / ".confirmed-new"
+    previous = DIRECTORY / ".confirmed-old"
+    if previous.exists() and not confirmed.exists():
+        os.replace(previous, confirmed)
+    if staged.exists():
+        shutil.rmtree(staged)
+    save_settings(staged)
+    if previous.exists():
+        shutil.rmtree(previous)
+    if confirmed.exists():
+        os.replace(confirmed, previous)
+    os.replace(staged, confirmed)
+    if previous.exists():
+        shutil.rmtree(previous)
+
+
+def rollback_rules(token, locked=False):
+    state = DIRECTORY / (".rollback-" + token)
+    if not state.is_dir():
+        return
+    fd = None if locked else os.open(DIRECTORY / ".apply.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        # Меню держит lock до решения; отдельный процесс таймера ждёт здесь.
+        if fd is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        if not state.is_dir():
+            return
+        settings_source = DIRECTORY / "confirmed"
+        if not settings_source.is_dir():
+            settings_source = DIRECTORY / ".confirmed-old"
+        if not settings_source.is_dir():
+            settings_source = state / "settings"
+        old = state / "active.nft"
+        if old.exists():
+            subprocess.run(["nft", "-f", str(old)], check=True)
+        elif quiet("nft", "list", "table", "inet", "fw"):
+            subprocess.run(["nft", "delete", "table", "inet", "fw"], check=True)
+        snapshot = state / "fw.nft"
+        if snapshot.exists():
+            os.replace(snapshot, DIRECTORY / "fw.nft")
+        else:
+            (DIRECTORY / "fw.nft").unlink(missing_ok=True)
+        count_snapshot = state / "geo.count"
+        if count_snapshot.exists():
+            os.replace(count_snapshot, DIRECTORY / "geo.count")
+        else:
+            (DIRECTORY / "geo.count").unlink(missing_ok=True)
+        changed = restore_settings(settings_source)
+        (DIRECTORY / "fw.nft.pending").unlink(missing_ok=True)
+        (DIRECTORY / "geo.count.pending").unlink(missing_ok=True)
+        shutil.rmtree(state)
+        print("Правила и снимок восстановлены.")
+        if changed:
+            print("Возвращены настройки: " + ", ".join(changed))
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def confirm_timeout():
+    script = ('source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; '
+              'printf "%s" "${CONFIRM_TIMEOUT:-60}"')
+    value = probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).strip()
+    if not value.isdigit() or int(value) < 1:
+        raise ValueError("CONFIRM_TIMEOUT должен быть положительным числом секунд")
+    return int(value)
+
+
+def paint(code, text, stream=None):
+    stream = stream or sys.stdout
+    if stream.isatty() and not os.environ.get("NO_COLOR"):
+        print(f"\033[{code}m{text}\033[0m", file=stream)
+    else:
+        print(text, file=stream)
+
+
+def last_result():
+    try:
+        return (DIRECTORY / "last-result").read_text().strip()
+    except OSError:
+        return ""
+
+
+def ask_confirmation(timeout):
+    import select
+    print(f"Правила работают? Введите «да» за {timeout} с: ", end="", flush=True)
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not ready:
+        print()
+    return bool(ready and sys.stdin.readline().strip().casefold() == "да")
+
+
+def apply_rules():
+''', "откат меню")
+old_apply = '''    if (run("systemctl", "start", "fw-update.service")
+            and run("systemctl", "enable", "fw-update.service")
+            and run("systemctl", "enable", "--now", "fw-update.timer")):
+        print("Правила применены. Таймер включён.")
+        reconcile_reinstall_guard()
+    else:
+        print("Одна из команд завершилась с ошибкой. Проверь «Статус файрвола» и журнал fw-update.service.")
+'''
+new_apply = r'''    import uuid
+    lock_fd = os.open(DIRECTORY / ".apply.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        print("Применение уже идёт в другом окне.")
+        return
+    timeout = confirm_timeout()
+    token = uuid.uuid4().hex
+    state = DIRECTORY / (".rollback-" + token)
+    state.mkdir(mode=0o700)
+    unit = "fw-rollback-" + token
+    confirm_unit = unit + "-confirm"
+    try:
+        save_settings(state / "settings")
+        if quiet("nft", "list", "table", "inet", "fw"):
+            old = command_output("nft", "-s", "list", "table", "inet", "fw")
+            (state / "active.nft").write_text("add table inet fw\ndelete table inet fw\n" + old,
+                                              encoding="utf-8")
+        snapshot = DIRECTORY / "fw.nft"
+        if snapshot.exists():
+            shutil.copy2(snapshot, state / "fw.nft")
+        count_snapshot = DIRECTORY / "geo.count"
+        if count_snapshot.exists():
+            shutil.copy2(count_snapshot, state / "geo.count")
+        subprocess.run(["systemd-run", "--quiet", "--collect", "--unit=" + unit,
+                        "--on-active=15min", str(MENU_FILE), "--rollback", token],
+                       check=True)
+        env = {**os.environ, "FW_PENDING": "1"}
+        if subprocess.run([str(DIRECTORY / "update-fw.sh")], env=env, check=False).returncode:
+            raise RuntimeError("обновление завершилось с ошибкой")
+        subprocess.run(["systemd-run", "--quiet", "--collect", "--unit=" + confirm_unit,
+                        "--on-active=" + str(timeout) + "s", str(MENU_FILE), "--rollback", token],
+                       check=True)
+        run("systemctl", "stop", unit + ".timer")
+        if not ask_confirmation(timeout):
+            print("Подтверждение не получено. Восстанавливаю прежние правила.")
+            rollback_rules(token, locked=True)
+            run("systemctl", "stop", confirm_unit + ".timer")
+            paint(33, "ИТОГ: ОТМЕНЕНО — подтверждение не получено, возвращены прежние правила")
+            return
+        confirmed = state.is_dir()
+        if confirmed:
+            os.replace(DIRECTORY / "fw.nft.pending", DIRECTORY / "fw.nft")
+            os.replace(DIRECTORY / "geo.count.pending", DIRECTORY / "geo.count")
+            if not NFT_DROPIN.exists():
+                NFT_DROPIN.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                subprocess.run(["install", "-m", "0644", str(DIRECTORY / "nftables-restore.conf"), str(NFT_DROPIN)], check=True)
+                subprocess.run(["systemctl", "daemon-reload"], check=True)
+            save_confirmed_settings()
+            shutil.rmtree(state)
+        run("systemctl", "stop", confirm_unit + ".timer")
+        if not confirmed:
+            paint(33, "ИТОГ: ОТМЕНЕНО — время подтверждения истекло, прежние правила уже восстановлены")
+            return
+        if run("systemctl", "enable", "fw-update.service") and run("systemctl", "enable", "--now", "fw-update.timer"):
+            print("Правила подтверждены. Таймер включён.")
+            result = last_result()
+            if result == "ok":
+                paint(32, "ИТОГ: ВСЁ В ПОРЯДКЕ — правила применены и подтверждены, таймер включён")
+            elif result == "warn":
+                paint(33, "ИТОГ: ЕСТЬ ЗАМЕЧАНИЯ — правила применены и подтверждены, таймер включён; причины выше и в «Журнале ошибок»")
+            else:
+                paint(33, "ИТОГ: правила применены и подтверждены, таймер включён; итог проверки источников не определён")
+            reconcile_reinstall_guard()
+        else:
+            paint(31, "ИТОГ: ОШИБКА — правила подтверждены, но включить таймер не удалось")
+    except (OSError, RuntimeError, subprocess.CalledProcessError, KeyboardInterrupt) as error:
+        print(f"Ошибка применения: {error}. Восстанавливаю прежние правила.")
+        rollback_rules(token, locked=True)
+        run("systemctl", "stop", unit + ".timer")
+        run("systemctl", "stop", confirm_unit + ".timer")
+        paint(31, "ИТОГ: ОШИБКА — применение не удалось, возвращены прежние правила")
+    finally:
+        os.close(lock_fd)
+'''
+menu = replace_once(menu, old_apply, new_apply, "подтверждение применения")
+menu = replace_once(menu, 'def remove_rules():\n', '''def remove_rules():
+    lock_fd = os.open(DIRECTORY / ".apply.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        print("Применение уже идёт в другом окне.")
+        return
+    try:
+        _remove_rules_locked()
+    finally:
+        os.close(lock_fd)
+
+
+def _remove_rules_locked():
+''', "lock удаления")
+menu = replace_once(menu, '    directory_fd = os.open(DIRECTORY, os.O_RDONLY | os.O_DIRECTORY)\n    try:\n        fcntl.flock(directory_fd, fcntl.LOCK_EX)\n        result = subprocess.run(["nft", "-j", "list", "tables"],',
+    '    (DIRECTORY / "fw.nft").unlink(missing_ok=True)\n'
+    '    (DIRECTORY / "fw.nft.pending").unlink(missing_ok=True)\n'
+    '    (DIRECTORY / "geo.count.pending").unlink(missing_ok=True)\n'
+    '    NFT_DROPIN.unlink(missing_ok=True)\n'
+    '    run("systemctl", "daemon-reload")\n'
+    '    directory_fd = os.open(DIRECTORY, os.O_RDONLY | os.O_DIRECTORY)\n    try:\n        fcntl.flock(directory_fd, fcntl.LOCK_EX)\n        result = subprocess.run(["nft", "-j", "list", "tables"],', "удаление снимка")
+menu = replace_once(menu, '    if sys.argv[1:] == ["--check-proxy"]:\n',
+    '    if len(sys.argv) == 3 and sys.argv[1] == "--rollback" and re.fullmatch(r"[0-9a-f]{32}", sys.argv[2]):\n'
+    '        rollback_rules(sys.argv[2])\n        return\n'
+    '    if sys.argv[1:] == ["--check-proxy"]:\n', "команда отката")
+menu = replace_once(menu, '    warn_reverse_proxy()\n    show_profile()\n',
+    '''    warn_reverse_proxy()
+    show_profile()
+    script = ('source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; '
+              'printf "%s\\n%s\\n%s\\n%s\\n%s\\n" "${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 fc00::/7 fe80::/10}" "${CONFIRM_TIMEOUT:-60}" "${MAX_GROWTH:-3}" "${MIN_KEEP:-0.2}" "${MAX_CACHE_DAYS:-14}"')
+    values = probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).splitlines()
+    if len(values) == 5:
+        print("Настройки: LAN_ALLOW=" + (values[0] or "выключено") +
+              f", CONFIRM_TIMEOUT={values[1]}, MAX_GROWTH={values[2]}, MIN_KEEP={values[3]}, MAX_CACHE_DAYS={values[4]}")
+''', "показ настроек")
+menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 fc00::/7 fe80::/10}',
+                    '${LAN_ALLOW-}', "показ LAN")
+
+# ---------------------------------------------------------------- версии, обновление и откат скрипта
+VERSION = "1.6.0"
+VERSIONS_CODE = r'''import hashlib
+
+FW_VERSION = "@@VERSION@@"
+FW_REPO = "J0ll1er/Nftables-Script"
+HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
+BACKUP_ROOT = Path("/root/fw-rollbacks")
+VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
+
+
+def version_key(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def fetch_text(url, limit=3_000_000):
+    # file:// нужен только тестам и включается переменной окружения.
+    if url.startswith("file://") and os.environ.get("FW_ALLOW_FILE") == "1":
+        return Path(url[7:]).read_text(encoding="utf-8")
+    result = subprocess.run(
+        ["curl", "-fsSL", "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "5",
+         "--max-time", "30", "--max-filesize", str(limit), url], capture_output=True, check=False)
+    if result.returncode:
+        raise OSError(f"не скачалось: {url}")
+    return result.stdout.decode("utf-8-sig")
+
+
+def fetch_ref(ref, path):
+    base = os.environ.get("FW_TEST_BASE") if os.environ.get("FW_ALLOW_FILE") == "1" else None
+    urls = ([f"{base}/{ref}/{path}"] if base else
+            [f"https://raw.githubusercontent.com/{FW_REPO}/{ref}/{path}",
+             f"https://cdn.jsdelivr.net/gh/{FW_REPO}@{ref}/{path}",
+             f"https://fastly.jsdelivr.net/gh/{FW_REPO}@{ref}/{path}"])
+    last_error = None
+    for url in urls:
+        try:
+            return fetch_text(url)
+        except OSError as error:
+            last_error = error
+    raise OSError(str(last_error))
+
+
+def published_hash(version):
+    """(хеш установщика, причина). Хеш берётся из описания релиза на api.github.com: это другой хост,
+    чем у самого скрипта (raw.githubusercontent.com, jsDelivr), поэтому сбой или подмена кэша CDN
+    не подделывают оба сразу. Нет хеша — (None, причина)."""
+    base = os.environ.get("FW_TEST_BASE") if os.environ.get("FW_ALLOW_FILE") == "1" else None
+    url = (f"{base}/releases/v{version}.json" if base
+           else f"https://api.github.com/repos/{FW_REPO}/releases/tags/v{version}")
+    try:
+        body = json.loads(fetch_text(url, 300_000)).get("body") or ""
+    except (OSError, ValueError, AttributeError):
+        return None, "описание релиза на api.github.com не получено"
+    found = {value.lower() for value in HASH_LINE.findall(str(body))}
+    if len(found) > 1:
+        return "conflict", "противоречивые хеши в описании релиза"
+    if not found:
+        return None, "в описании релиза хеш не опубликован"
+    return found.pop(), ""
+
+
+def parse_changelog(text):
+    releases, current = [], None
+    for line in text.splitlines():
+        match = re.fullmatch(r"##\s+(" + VERSION_RE.pattern + r")(?:\s.*)?", line.strip())
+        if match:
+            current = {"version": match.group(1), "items": []}
+            releases.append(current)
+        elif current is not None and line.startswith("- "):
+            current["items"].append(line[2:].strip())
+    return sorted(releases, key=lambda release: version_key(release["version"]), reverse=True)
+
+
+def load_releases():
+    try:
+        releases = parse_changelog(fetch_ref("main", "CHANGELOG.md"))
+    except OSError:
+        paint(31, "ОШИБКА — не удалось получить список версий: GitHub недоступен. Проверь сеть и повтори.")
+        return None
+    if not releases:
+        paint(31, "ОШИБКА — список версий на GitHub пуст или в неожиданном формате.")
+        return None
+    return releases
+
+
+def print_release(release):
+    print(f"\n{release['version']}")
+    for item in release["items"]:
+        print(textwrap.fill(item, width=92, initial_indent="  • ", subsequent_indent="    "))
+
+
+def show_versions():
+    print(f"Установлена версия: {FW_VERSION}")
+    releases = load_releases()
+    if releases is None:
+        return
+    newer = [release for release in releases if version_key(release["version"]) > version_key(FW_VERSION)]
+    if not newer:
+        paint(32, "У вас последняя версия.")
+        print("Доступные версии: " + ", ".join(release["version"] for release in releases))
+        return
+    paint(33, f"Доступна новая версия: {newer[0]['version']} (новее установленной: {len(newer)})")
+    for release in newer:
+        print_release(release)
+    print("\nОбновить скрипт: пункт 5 → 2. Правила при обновлении не меняются.")
+
+
+def install_version(version):
+    try:
+        installer = fetch_ref("v" + version, "fw-install.sh")
+    except OSError:
+        paint(31, f"ОШИБКА — версия {version} не найдена на GitHub (тег v{version}). Ничего не изменено.")
+        return False
+    if not installer.startswith("bash <<'INSTALL_FW'\n") or f"FW_VERSION='{version}'" not in installer:
+        paint(31, f"ОШИБКА — скачанный файл не похож на установщик версии {version}. Ничего не изменено.")
+        return False
+    expected, reason = published_hash(version)
+    actual = hashlib.sha256(installer.encode("utf-8")).hexdigest()
+    if expected == "conflict":
+        paint(31, f"ОШИБКА — {reason}: проверить скрипт нельзя, возможна подмена. Ничего не изменено.")
+        return False
+    if expected is None:
+        paint(33, f"Контрольная сумма версии {version} не опубликована ({reason}).")
+        print(f"Скачанный файл: sha256 {actual}")
+        print("Установка без проверки доверяет только GitHub. Сверь хеш вручную на странице релиза "
+              f"https://github.com/{FW_REPO}/releases/tag/v{version}")
+        if input("Установить без проверки? Введи «без проверки»: ").strip().casefold() != "без проверки":
+            print("Отменено. Ничего не изменено.")
+            return False
+    elif actual != expected:
+        paint(31, f"ОШИБКА — контрольная сумма не совпала: скачано {actual[:16]}…, в релизе {expected[:16]}…. "
+                  "Скрипт могли подменить или он повреждён. Ничего не изменено.")
+        return False
+    else:
+        paint(32, f"Контрольная сумма совпала (sha256 {actual[:16]}…).")
+    directory = Path(tempfile.mkdtemp(prefix=".fw-update.", dir="/root"))
+    try:
+        path = directory / "fw-install.sh"
+        path.write_text(installer, encoding="utf-8")
+        path.chmod(0o700)
+        if subprocess.run(["bash", "-n", str(path)], check=False).returncode:
+            paint(31, "ОШИБКА — в скачанном установщике синтаксическая ошибка. Ничего не изменено.")
+            return False
+        result = subprocess.run(["bash", str(path)], stdin=subprocess.DEVNULL, check=False)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    if result.returncode:
+        paint(31, "ОШИБКА — установщик завершился с ошибкой, причина выше. Вернуть прежнюю версию: пункт 5 → 3.")
+        return False
+    paint(32, f"ИТОГ: ВСЁ В ПОРЯДКЕ — скрипт {version} установлен, действующие правила не менялись. "
+              "Запусти fw-menu заново.")
+    return True
+
+
+def update_script():
+    releases = load_releases()
+    if releases is None:
+        return
+    newer = [release for release in releases if version_key(release["version"]) > version_key(FW_VERSION)]
+    if not newer:
+        paint(32, f"У вас уже последняя версия ({FW_VERSION}).")
+        return
+    for release in newer:
+        print_release(release)
+    latest = newer[0]["version"]
+    answer = input(f"\nОбновить скрипт {FW_VERSION} → {latest}? Правила не изменятся. Введи «да»: ")
+    if answer.strip().casefold() != "да":
+        return
+    if install_version(latest):
+        raise SystemExit(0)
+
+
+def choose_number(count):
+    answer = input("Номер (Enter — отмена): ").strip()
+    if not answer:
+        return None
+    if not answer.isdigit() or not 1 <= int(answer) <= count:
+        print("Нет такого номера.")
+        return None
+    return int(answer) - 1
+
+
+def rollback_remote():
+    releases = load_releases()
+    if releases is None:
+        return
+    choices = [release for release in releases if release["version"] != FW_VERSION]
+    if not choices:
+        print("Других версий на GitHub нет.")
+        return
+    print(f"Установлена версия: {FW_VERSION}")
+    for number, release in enumerate(choices, start=1):
+        first = release["items"][0] if release["items"] else ""
+        print(f"{number}. {release['version']}  {first[:70]}")
+    index = choose_number(len(choices))
+    if index is None:
+        return
+    version = choices[index]["version"]
+    if version_key(version) < version_key(FW_VERSION):
+        print("Старая версия может не знать новых настроек (например LAN_ALLOW, CONFIRM_TIMEOUT): "
+              "они останутся в настройках, но защиты не дадут.")
+    answer = input(f"Установить версию {version}? Правила не изменятся. Введи «да»: ")
+    if answer.strip().casefold() == "да" and install_version(version):
+        raise SystemExit(0)
+
+
+def backup_version(directory):
+    try:
+        match = re.search(r'^FW_VERSION = "(' + VERSION_RE.pattern + r')"', (directory / "fw-menu").read_text(encoding="utf-8"), re.M)
+    except OSError:
+        return "неизвестно"
+    return match.group(1) if match else "до введения версий"
+
+
+def local_backups():
+    if not BACKUP_ROOT.is_dir():
+        return []
+    found = [path for path in BACKUP_ROOT.glob("upgrade.*")
+             if (path / "update-fw.sh").is_file() and (path / "fw-menu").is_file()]
+    return sorted(found, key=lambda path: path.stat().st_mtime, reverse=True)[:10]
+
+
+def restore_file(source, target, mode):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".fw-rollback-", dir=target.parent)
+    os.close(fd)
+    try:
+        shutil.copy2(source, temp)
+        os.chmod(temp, mode)
+        os.replace(temp, target)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+
+
+def rollback_local():
+    backups = local_backups()
+    if not backups:
+        print("Локальных копий в /root/fw-rollbacks нет. Выбери версию с GitHub (пункт 5 → 3 → 2).")
+        return
+    print(f"Установлена версия: {FW_VERSION}")
+    for number, backup in enumerate(backups, start=1):
+        stamp = datetime.datetime.fromtimestamp(backup.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
+        print(f"{number}. {stamp}  версия {backup_version(backup)}")
+    index = choose_number(len(backups))
+    if index is None:
+        return
+    backup = backups[index]
+    answer = input("Вернуть скрипты из этой копии? Правила и настройки не изменятся. Введи «да»: ")
+    if answer.strip().casefold() != "да":
+        return
+    restore_file(backup / "update-fw.sh", UPDATER, 0o755)
+    restore_file(backup / "fw-menu", MENU_FILE, 0o755)
+    for name, target in (("fw-update.service", SERVICE_FILE), ("fw-update.timer", TIMER_FILE)):
+        if (backup / name).is_file():
+            restore_file(backup / name, target, 0o644)
+    if (backup / NFT_DROPIN.name).is_file():
+        restore_file(backup / NFT_DROPIN.name, NFT_DROPIN, 0o644)
+    else:
+        NFT_DROPIN.unlink(missing_ok=True)
+    run("systemctl", "daemon-reload")
+    paint(32, f"ИТОГ: ВСЁ В ПОРЯДКЕ — скрипты возвращены к версии {backup_version(backup)}, "
+              "действующие правила не менялись. Запусти fw-menu заново.")
+    raise SystemExit(0)
+
+
+def rollback_script():
+    show_menu("Откатить скрипт", (
+        ("Из локальной копии на этом сервере", rollback_local),
+        ("Установить версию с GitHub", rollback_remote),
+    ))
+
+
+'''
+menu = replace_once(menu, 'def show_menu(title, entries, exit_label="Назад"):\n',
+                    VERSIONS_CODE.replace("@@VERSION@@", VERSION) + 'def show_menu(title, entries, exit_label="Назад"):\n', "версии и откат скрипта")
+menu = replace_once(menu, "import fcntl\n", "import datetime\nimport fcntl\n", "import datetime")
+
+WIDE_MENU_CODE = r'''WIDE_PENDING = DIRECTORY / "wide-pending.txt"
+WIDE_OK = DIRECTORY / "wide-ok.txt"
+
+
+def read_wide_networks(path, with_source=False):
+    result = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return result
+    for line in lines:
+        source, tab, value = line.partition("\t")
+        if not tab:
+            source, value = "", line
+        value = value.partition("#")[0].strip()
+        try:
+            network = ipaddress.ip_network(value)
+        except ValueError:
+            continue
+        result.append((source, network) if with_source else network)
+    return result
+
+
+def ask_wide_networks():
+    """Сети, которые шире порога, скрипт пропускает. Здесь их можно подтвердить. True — список изменился."""
+    approved = set(read_wide_networks(WIDE_OK))
+    items = sorted({(source, network) for source, network in read_wide_networks(WIDE_PENDING, True)
+                    if network not in approved}, key=lambda item: (item[0], str(item[1])))
+    if not items:
+        return False
+    print()
+    paint(33, f"Найдены слишком широкие сети: {len(items)}. Сейчас они пропускаются и не блокируются.")
+    print("Если это ошибка источника, оставь как есть. Если сеть нужна — подтверди.")
+    for source, network in items[:30]:
+        total = f"{network.num_addresses:,}".replace(",", " ")
+        print(f"  {network_text(network)} — {total} адресов — источник {source or 'не указан'}")
+    if len(items) > 30:
+        print(f"  … и ещё {len(items) - 30}")
+    answer = input("Блокировать эти сети? Введи «да», Enter — не блокировать: ").strip().casefold()
+    if answer != "да":
+        print("Сети остаются неблокируемыми. Спросим снова при следующей проверке.")
+        return False
+    append_entries(WIDE_OK, [f"{network_text(network)}  # подтверждено {datetime.date.today()}, источник {source or '?'}"
+                             for source, network in items])
+    print("Сохранено в wide-ok.txt. Эти сети теперь блокируются при каждом обновлении.")
+    return True
+
+
+def dry_run():
+    ok = run(UPDATER, "--dry")
+    if ask_wide_networks():
+        print("Повторяю проверку с учётом подтверждённых сетей.")
+        ok = run(UPDATER, "--dry")
+    return ok
+
+
+'''
+menu = replace_once(menu, 'def apply_rules():\n', WIDE_MENU_CODE + 'def apply_rules():\n', "подтверждение широких сетей")
+menu = replace_once(menu, '("Проверить обновление без применения (--dry)", lambda: run(UPDATER, "--dry")),',
+                    '("Проверить обновление без применения (--dry)", dry_run),', "пункт --dry")
+menu = replace_once(menu, '    if input("Применить правила и включить ежедневное обновление? Введи «да»: ")',
+                    '    ask_wide_networks()\n    if input("Применить правила и включить ежедневное обновление? Введи «да»: ")', "вопрос перед применением")
+menu = replace_once(menu, '"asn.txt", "sources.txt", "presets.conf")', '"asn.txt", "sources.txt", "presets.conf", "wide-ok.txt")', "wide-ok в настройках")
+
+OVERVIEW_CODE = r'''def read_lines(path):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def certbot_renewals():
+    """Сертификаты certbot: имя и параметры продления из renewal/*.conf (только чтение)."""
+    result = []
+    for conf in sorted(Path("/etc/letsencrypt/renewal").glob("*.conf")):
+        values = {}
+        for line in read_lines(conf):
+            key, separator, value = line.partition("=")
+            if separator and key.strip() in ("authenticator", "pre_hook", "post_hook", "renew_hook", "deploy_hook"):
+                values[key.strip()] = value.strip()
+        result.append((conf.stem, values))
+    return result
+
+
+def acme_sh_present():
+    return Path("/root/.acme.sh").is_dir()
+
+
+def acme_sh_modes():
+    """Как acme.sh проверяет домены: [(домен, режим)] по Le_Webroot в его настройках. Режим: dns, standalone, webroot или None."""
+    result = []
+    for conf in sorted(Path("/root/.acme.sh").glob("*/*.conf")):
+        if conf.parent.name != conf.stem and conf.parent.name != conf.stem + "_ecc":
+            continue
+        for line in read_lines(conf):
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "Le_Webroot":
+                value = value.strip().strip("'\"")
+                mode = "dns" if value.startswith("dns") else "standalone" if value == "no" else "webroot" if value.startswith("/") else None
+                result.append((conf.stem, mode))
+    return result
+
+
+def renewal_hook_files():
+    base = Path("/etc/letsencrypt/renewal-hooks")
+    found = {}
+    for kind in ("pre", "post", "deploy"):
+        folder = base / kind
+        if folder.is_dir():
+            files = [item.name for item in sorted(folder.iterdir()) if item.is_file() and os.access(item, os.X_OK)]
+            if files:
+                found[kind] = files
+    return found
+
+
+def renewal_cron_lines():
+    """Задания cron, связанные с продлением сертификатов: [(где, строка)]."""
+    sources = [("/etc/crontab", read_lines(Path("/etc/crontab")))]
+    for path in sorted(Path("/etc/cron.d").glob("*")):
+        if path.is_file():
+            sources.append((str(path), read_lines(path)))
+    sources.append(("crontab root", probe_output("crontab", "-l").splitlines()))
+    found = []
+    for place, lines in sources:
+        for line in lines:
+            text = line.strip()
+            if text and not text.startswith("#") and re.search(r"certbot|acme\.sh|letsencrypt", text):
+                found.append((place, text))
+    return found
+
+
+def port80_report(policy, listeners):
+    """Строки о порте 80 и о том, чем он открывается на время продления. Не гадает: если не уверен, так и пишет."""
+    lines = []
+    listening = any(proto == "tcp" and port == 80 and not loopback for proto, port, _, loopback in listeners)
+    exposed, _ = exposure(policy, "tcp", 80)
+    if not listening:
+        lines.append("Порт 80: никто не слушает")
+    elif exposed == "closed":
+        lines.append("Порт 80: слушает, снаружи закрыт ufw")
+    elif exposed == "limited":
+        lines.append("Порт 80: слушает, ufw пускает только часть адресов")
+    else:
+        lines.append("Порт 80: открыт" + ("" if policy is not None else " (ufw не активен)"))
+    certificates = certbot_renewals()
+    hooks = renewal_hook_files()
+    cron = renewal_cron_lines()
+    acme_sh = acme_sh_present()
+    if not certificates and not cron and not acme_sh:
+        lines.append("Продление сертификатов: certbot и acme.sh не найдены. Так бывает, если сертификаты самоподписанные, "
+                     "выданы Cloudflare Origin или получены другим способом: им порт 80 для продления не нужен")
+        return lines
+    need_http = False
+    for name, values in certificates:
+        authenticator = values.get("authenticator", "не указан")
+        if "dns" in authenticator:
+            lines.append(f"Сертификат {name}: проверка через DNS ({authenticator}), порт 80 для продления не нужен")
+        else:
+            need_http = need_http or authenticator in ("nginx", "webroot", "standalone", "apache", "не указан")
+            lines.append(f"Сертификат {name}: проверка через {authenticator}, нужен порт 80")
+    if acme_sh:
+        modes = acme_sh_modes()
+        for name, mode in modes:
+            if mode == "dns":
+                lines.append(f"acme.sh {name}: проверка через DNS, порт 80 для продления не нужен")
+            elif mode in ("standalone", "webroot"):
+                need_http = True
+                lines.append(f"acme.sh {name}: проверка через {mode}, нужен порт 80")
+        if not modes or any(mode is None for _, mode in modes):
+            lines.append("Найден acme.sh (/root/.acme.sh): как он проверяет часть доменов, не определяется")
+    handled = False
+    for kind, files in hooks.items():
+        lines.append(f"Хуки certbot ({kind}): {', '.join(files)}")
+        handled = handled or kind in ("pre", "post")
+    for name, values in certificates:
+        for key in ("pre_hook", "post_hook"):
+            if values.get(key):
+                lines.append(f"Хук в настройках {name}: {key} = {values[key]}")
+                handled = True
+    for place, text in cron:
+        if re.search(r"ufw|iptables|nft|:80|\b80\b", text):
+            lines.append(f"Задание cron ({place}) трогает файрвол или порт 80: {text[:140]}")
+            handled = True
+    if need_http and listening and exposed == "closed" and not handled:
+        lines.append("ВНИМАНИЕ: порт закрыт, а способа открыть его на время продления не найдено — продление может не сработать")
+    elif need_http and listening and exposed == "open" and handled:
+        lines.append("Порт 80 открыт постоянно, хотя есть хук или задание, которые его открывают: проверь, что после продления он закрывается")
+    elif need_http and listening and exposed == "open" and not handled:
+        lines.append("Порт 80 открыт постоянно, поэтому открывать его на время продления не нужно. "
+                     "Хотите закрывать его между продлениями: настройте хуки certbot pre и post (открыть и закрыть порт в ufw)")
+    elif need_http and not handled:
+        lines.append("Открытие и закрытие порта 80 вокруг продления не найдено — если оно настроено иначе (скриптом, контейнером), здесь этого не видно")
+    return lines
+
+
+def ssh_ports():
+    ports = sorted({int(value) for line in probe_output("sshd", "-T").splitlines()
+                    for key, _, value in [line.partition(" ")] if key == "port" and value.isdigit()})
+    if ports:
+        return ports
+    for line in read_lines(Path("/etc/ssh/sshd_config")):
+        match = re.match(r"\s*Port\s+(\d+)", line)
+        if match:
+            return [int(match[1])]
+    return [22]
+
+
+NFT_TABLE_NOTES = {
+    "inet fw": "наша",
+    "ip remnanode": "плагины ноды Remnawave (Torrent Blocker и др.)",
+    "ip6 remnanode6": "плагины ноды Remnawave (Torrent Blocker и др.)",
+    "inet geoblock": "старый геофильтр, его заменяет inet fw",
+    "ip filter": "чужая, ведётся iptables-nft (обычно ufw или Docker), мы её не трогаем",
+    "ip6 filter": "чужая, ведётся iptables-nft (обычно ufw или Docker), мы её не трогаем",
+    "ip nat": "чужая, ведётся iptables-nft (обычно Docker), мы её не трогаем",
+    "ip6 nat": "чужая, ведётся iptables-nft (обычно Docker), мы её не трогаем",
+    "inet vps_warp": "чужая, Cloudflare WARP (подрезка MSS и метки пакетов), мы её не трогаем",
+}
+
+
+def show_server_overview():
+    print("\nЧто ещё есть на сервере (только чтение, ничего не меняется)")
+    tables = [line.strip()[len("table "):] for line in probe_output("nft", "list", "tables").splitlines()
+              if line.strip().startswith("table ")]
+    print("Таблицы nftables:" if tables else "Таблицы nftables: не найдены")
+    for table in tables:
+        note = NFT_TABLE_NOTES.get(table)
+        print(f"  {table}" + (f" — {note}" if note else " — чужая (Docker, ufw и т. д.), мы её не трогаем"))
+    ufw_text = ""
+    try:
+        ufw_text = subprocess.run(["ufw", "status", "verbose"], text=True, capture_output=True, timeout=8,
+                                  check=False, env={**os.environ, "LC_ALL": "C"}).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    policy = ufw_policy(ufw_text)
+    if policy is None:
+        prepared = [line.strip() for line in probe_output("ufw", "show", "added").splitlines()
+                    if line.strip().startswith("ufw ")]
+        print("ufw: не активен или не установлен" + (f"; заготовлены правила (не действуют): "
+              f"{'; '.join(item[4:] for item in prepared)}" if prepared else ""))
+    else:
+        print("ufw: активен, входящие " + ("разрешены" if policy["allow"] else "закрыты кроме правил"))
+    listeners = parse_listeners(probe_output("ss", "-H", "-lntup"))
+    outside = sorted((port, proto, name) for proto, port, name, loopback in listeners if not loopback)
+    print("Слушают не только локально:" if outside else "Снаружи ничего не слушает")
+    names_by_port = {}
+    for port, proto, name in outside:
+        names_by_port.setdefault((port, proto), []).append(name)
+    merged = []
+    for (port, proto), names in sorted(names_by_port.items()):
+        real = [name for name in names if name and name != "systemd"]
+        if real and "systemd" in names:
+            # Один и тот же порт слушают служба и сокет-активация systemd: показываем одной строкой.
+            merged.append((port, proto, ", ".join(dict.fromkeys(real)) + " (через сокет systemd)"))
+        else:
+            merged.extend((port, proto, name) for name in dict.fromkeys(names))
+    for port, proto, name in merged:
+        state, sources = exposure(policy, proto, port)
+        label = {"open": "открыт", "closed": "закрыт ufw", "limited": "ufw пускает только " + ", ".join(sources)}[state]
+        print(f"  {proto.upper()} {port} — {name or 'процесс не определён'}, {label}")
+    for port in ssh_ports():
+        state, _ = exposure(policy, "tcp", port)
+        suffix = {"open": "открыт", "closed": "в ufw закрыт — при включённом ufw доступ по SSH пропадёт",
+                  "limited": "ограничен адресами"}[state]
+        print(f"SSH: порт {port} — {suffix}")
+    width = max(60, min(shutil.get_terminal_size((100, 24)).columns - 2, 110))
+    for line in port80_report(policy, listeners):
+        print(textwrap.fill(line, width=width, subsequent_indent="  ", break_long_words=False, break_on_hyphens=False))
+
+
+'''
+menu = replace_once(menu, 'def apply_rules():\n', OVERVIEW_CODE + 'def apply_rules():\n', "что ещё есть на сервере")
+menu = replace_once(menu, '        ("Журнал ошибок", show_error_log),\n',
+    '        ("Журнал ошибок", show_error_log),\n'
+    '        ("Версии и обновление скрипта", (\n'
+    '            ("Версии и что исправлено", show_versions),\n'
+    '            ("Обновить скрипт до последней версии", update_script),\n'
+    '            ("Откатить скрипт к другой версии", rollback_script),\n'
+    '        )),\n', "пункт 7")
+menu = replace_once(menu, '            ("Откатить скрипт к другой версии", rollback_script),\n        )),\n',
+                    '            ("Откатить скрипт к другой версии", rollback_script),\n        )),\n'
+                    '        ("Что ещё есть на сервере", show_server_overview),\n', "пункт 8")
+
+OLD_SHOW_TRUSTED = r'''def show_trusted():
+    for path in (TRUSTED, DIRECTORY / "trusted.local.txt"):
+        if path.exists():
+            print(f"{path}:")
+            print("\n".join(entries(path)) or "(пусто)")
+'''
+NEW_TRUSTED = r'''TRUSTED_OLD_DAYS = 14
+
+
+def trusted_records():
+    # Записи обоих файлов доверенных: файл, адрес, комментарий, признак «добавлен установщиком» и дата.
+    records = []
+    for path in (TRUSTED, DIRECTORY / "trusted.local.txt"):
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            body, _, comment = line.partition("#")
+            value = "".join(body.split())
+            if not value:
+                continue
+            comment = comment.strip()
+            found = re.search(r"\d{4}-\d{2}-\d{2}", comment)
+            added = None
+            if found:
+                try:
+                    added = datetime.date.fromisoformat(found[0])
+                except ValueError:
+                    added = None
+            records.append({"path": path, "value": value, "auto": comment.startswith("авто"), "added": added})
+    return records
+
+
+def trusted_age(record):
+    return (datetime.date.today() - record["added"]).days if record["added"] else None
+
+
+def trusted_note(record):
+    age = trusted_age(record)
+    if record["auto"]:
+        return f"  — добавлен установщиком {record['added']}, {age} дн. назад" if record["added"] else "  — добавлен установщиком"
+    if record["added"]:
+        return f"  — добавлен {record['added']}"
+    return ""
+
+
+def warn_old_trusted():
+    for record in trusted_records():
+        age = trusted_age(record)
+        if record["auto"] and age is not None and age > TRUSTED_OLD_DAYS:
+            paint(33, f"  Внимание: адрес {record['value']} добавлен установщиком {age} дн. назад. "
+                      "Если он больше не нужен, удали его: «Настроить доступ» → «Удалить доверенные адреса».")
+
+
+def show_trusted():
+    records = trusted_records()
+    for path in (TRUSTED, DIRECTORY / "trusted.local.txt"):
+        if path.exists():
+            print(f"{path}:")
+            items = [record for record in records if record["path"] == path]
+            if not items:
+                print("(пусто)")
+            for record in items:
+                print(f"  {record['value']}{trusted_note(record)}")
+
+
+def remove_trusted():
+    records = trusted_records()
+    if not records:
+        print("Доверенных адресов нет.")
+        return
+    client = ssh_client()
+    for number, record in enumerate(records, 1):
+        mark = "  ← адрес этого подключения" if client and record["value"] == client else ""
+        print(f"  {number}. {record['value']}{trusted_note(record)}{mark}")
+    answer = input("Номера или адреса через пробел для удаления (Enter — отмена): ").strip()
+    if not answer:
+        return
+    chosen = set()
+    for token in answer.replace(",", " ").split():
+        if token.isdigit() and 1 <= int(token) <= len(records):
+            chosen.add(records[int(token) - 1]["value"])
+        elif any(record["value"] == token for record in records):
+            chosen.add(token)
+        else:
+            print(f"«{token}» в списке нет. Ничего не удалено.")
+            return
+    if input(f"Удалить из доверенных: {', '.join(sorted(chosen))}? Введи «да»: ").strip().casefold() != "да":
+        print("Отменено.")
+        return
+    removed = []
+    with (DIRECTORY / ".trusted.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Файлы перечитываются под блокировкой: удаляются строки с выбранными адресами, остальное не меняется.
+        for path in (TRUSTED, DIRECTORY / "trusted.local.txt"):
+            if not path.exists():
+                continue
+            kept = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                value = "".join(line.partition("#")[0].split())
+                if value in chosen:
+                    removed.append(value)
+                else:
+                    kept.append(line)
+            write_text_atomic(path, "".join(item + "\n" for item in kept))
+    print(f"Удалено: {', '.join(dict.fromkeys(removed))}.")
+    if client and client in chosen:
+        print("Это адрес вашего текущего подключения: если он не российский, после применения правил 443 для него закроется. SSH это не затрагивает.")
+    print("Чтобы правила обновились, открой «Проверить и применить правила» → «Применить правила и включить таймер».")
+'''
+menu = replace_once(menu, OLD_SHOW_TRUSTED, NEW_TRUSTED, "доверенные адреса")
+
+# DDNS-имена в доверенных и расписание «каждые N часов».
+OLD_ADD_TRUSTED = r"""def add_trusted():
+    value = input("IPv4, IPv6 или CIDR через пробел (или ssh для текущего подключения): ").strip()
+    if not value:
+        return
+    if value.lower() == "ssh":
+        value = ssh_client()
+        if not value:
+            print("Адрес SSH-подключения недоступен. Введи его вручную.")
+            return
+    networks = dict.fromkeys(parse_network(item) for item in value.split())
+
+    with (DIRECTORY / ".trusted.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        existing = set(trusted_networks())
+        addresses = [network_text(network) for network in networks if network not in existing]
+        if not addresses:
+            print("Все указанные записи уже есть.")
+            return
+        append_entries(TRUSTED, addresses)
+    print(f"Добавлено: {', '.join(addresses)}. Чтобы обновить правила, открой «Проверить и применить правила».")
+"""
+NEW_ADD_TRUSTED = r"""HOSTNAME_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+
+def parse_trusted(value):
+    # Адрес или подсеть возвращаются как сеть, иначе допускается только имя хоста (DDNS), например home.example.com.
+    try:
+        ipaddress.ip_network(value)
+    except ValueError:
+        name = value.lower()
+        if HOSTNAME_RE.match(name):
+            return name
+        raise ValueError(f"«{value}» — не IP-адрес, не подсеть и не DDNS-адрес вида home.example.com")
+    return parse_network(value)
+
+
+def trusted_names():
+    names = []
+    for path in (TRUSTED, DIRECTORY / "trusted.local.txt"):
+        for value in entries(path):
+            name = value.lower()
+            try:
+                ipaddress.ip_network(value)
+            except ValueError:
+                if HOSTNAME_RE.match(name) and name not in names:
+                    names.append(name)
+    return names
+
+
+def add_trusted():
+    value = input("IPv4, IPv6, CIDR или DDNS-адрес через пробел (или ssh для текущего подключения): ").strip()
+    if not value:
+        return
+    if value.lower() == "ssh":
+        value = ssh_client()
+        if not value:
+            print("Адрес SSH-подключения недоступен. Введи его вручную.")
+            return
+    items = dict.fromkeys(parse_trusted(item) for item in value.split())
+
+    with (DIRECTORY / ".trusted.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        existing = set(trusted_networks()) | set(trusted_names())
+        addresses = [item if isinstance(item, str) else network_text(item) for item in items if item not in existing]
+        if not addresses:
+            print("Все указанные записи уже есть.")
+            return
+        append_entries(TRUSTED, addresses)
+    print(f"Добавлено: {', '.join(addresses)}. Чтобы обновить правила, открой «Проверить и применить правила».")
+    if any(isinstance(item, str) for item in items):
+        print("DDNS-адрес превращается в IP при каждом плановом обновлении. Чтобы смену IP подхватывало быстрее,")
+        print("задай частоту: «Проверить и применить правила» → «Настроить расписание обновления» → 3 (раз в 3 часа).")
+"""
+menu = replace_once(menu, OLD_ADD_TRUSTED, NEW_ADD_TRUSTED, "добавление доверенных и DDNS-имён")
+
+HOURS_CHOICES = "2, 3, 4, 6, 8 или 12"
+menu = replace_once(menu,
+    '    value = input("Введи время ЧЧ:ММ по часам VPS, «сброс» для штатного графика или Enter для отмены: ").strip().casefold()\n'
+    '    if not value:\n        return\n'
+    '    if value != "сброс" and not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):\n'
+    '        raise ValueError("введи время в формате ЧЧ:ММ от 00:00 до 23:59")\n',
+    '    print("Раз в сутки: время ЧЧ:ММ по часам VPS. Чаще: число часов — 2, 3, 4, 6, 8 или 12 (каждые N часов).")\n'
+    '    value = input("Введи время, число часов, «сброс» для штатного графика или Enter для отмены: ").strip().casefold()\n'
+    '    if not value:\n        return\n'
+    '    hours = re.fullmatch(r"(?:каждые\\s+)?(\\d{1,2})(?:\\s*(?:ч|час|часа|часов))?", value)\n'
+    '    if hours and not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):\n'
+    '        if int(hours[1]) not in (2, 3, 4, 6, 8, 12):\n'
+    '            raise ValueError("частота: 2, 3, 4, 6, 8 или 12 часов (меньше нельзя: каждое обновление скачивает списки)")\n'
+    '        value = f"every:{int(hours[1])}"\n'
+    '    elif value != "сброс" and not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):\n'
+    '        raise ValueError("введи время ЧЧ:ММ от 00:00 до 23:59 или число часов: 2, 3, 4, 6, 8, 12")\n',
+    "ввод расписания")
+menu = replace_once(menu,
+    '            write_text_atomic(SCHEDULE_FILE, f"[Timer]\\nOnCalendar=\\nOnCalendar=*-*-* {value}:00\\n"\n',
+    '            calendar = f"0/{value[6:]}:00:00" if value.startswith("every:") else f"{value}:00"\n'
+    '            write_text_atomic(SCHEDULE_FILE, f"[Timer]\\nOnCalendar=\\nOnCalendar=*-*-* {calendar}\\n"\n',
+    "запись расписания")
+menu = replace_once(menu, '    print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")\n',
+    '    print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")\n'
+    '    if trusted_names():\n        print(f"  Доверенных DDNS-адресов — {len(trusted_names())} (IP подставляется при каждом обновлении)")\n'
+    '    warn_old_trusted()\n', "предупреждение о старых")
+menu = replace_once(menu, '("Показать доверенные адреса", show_trusted),',
+    '("Показать доверенные адреса", show_trusted),\n            ("Удалить доверенные адреса", remove_trusted),', "пункт удаления")
+
+# Рамка вокруг пунктов, которые только выводят информацию (с вопросом input() рамка закрывается до вопроса).
+for old, title in (
+    ('("Показать доверенные адреса", show_trusted),', "Доверенные адреса"),
+    ('("Показать пути к файлам на VPS", show_file_paths),', "Пути к файлам"),
+    ('("Журнал ошибок", show_error_log),', "Журнал ошибок"),
+    ('("Версии и что исправлено", show_versions),', "Версии"),
+    ('("Что ещё есть на сервере", show_server_overview),', "Что ещё есть на сервере"),
+):
+    name = old.split(", ")[-1].rstrip("),")
+    new = old.replace(name + "),", f'boxed("{title}", {name})),')
+    menu = replace_once(menu, old, new, "рамка " + title)
+HEALTH_CHECK = r'''def health_check():
+    """Одна строка «ok|warn|error: причина» и код выхода 0/1/2 — для мониторинга."""
+    if not quiet("nft", "-t", "list", "table", "inet", "fw"):
+        print("error: таблица inet fw не загружена, фаервол не работает")
+        return 2
+    result = last_result()
+    if result == "error":
+        print("error: последнее обновление списков закончилось ошибкой, см. журнал ошибок")
+        return 2
+    if result == "warn":
+        print("warn: последнее обновление списков прошло с предупреждениями")
+        return 1
+    if not quiet("systemctl", "is-active", "--quiet", "fw-update.timer"):
+        print("warn: таймер обновления fw-update.timer не запущен")
+        return 1
+    if result != "ok":
+        print("warn: результат последнего обновления неизвестен")
+        return 1
+    print("ok: правила загружены, последнее обновление без ошибок")
+    return 0
+
+
+'''
+menu = replace_once(menu, "def ask_confirmation(timeout):", HEALTH_CHECK + "def ask_confirmation(timeout):", "health_check")
+menu = replace_once(menu, '    if os.geteuid() != 0:\n        raise SystemExit("Запусти fw-menu от root.")\n',
+    '    if sys.argv[1:] == ["--check"]:\n        if os.geteuid() != 0:\n            print("error: для --check нужен root")\n            raise SystemExit(2)\n        raise SystemExit(health_check())\n'
+    '    if os.geteuid() != 0:\n        raise SystemExit("Запусти fw-menu от root.")\n', "--check")
+menu = replace_once(menu, '    if os.geteuid() != 0:\n        raise SystemExit("Запусти fw-menu от root.")\n',
+    '    if sys.argv[1:] == ["--version"]:\n        print(FW_VERSION)\n        return\n'
+    '    if os.geteuid() != 0:\n        raise SystemExit("Запусти fw-menu от root.")\n', "--version")
+
+# Меню 1.6.0: шесть пунктов, подменю «Статус и наблюдение», шапка с состоянием.
+OLD_SHOW_MENU = """def show_menu(title, entries, exit_label="Назад"):
+    choices = {str(number): entry for number, entry in enumerate(entries, start=1)}
+    while True:
+        print(f"\\n{title}")
+        for number, (label, _) in choices.items():
+            print(f"{number}. {label}")
+        print(f"0. {exit_label}")
+        try:
+            choice = input("Выбор: ").strip()
+"""
+NEW_SHOW_MENU = r"""MAIN_MENU_TITLE = "Файрвол IPv4 / IPv6"
+
+
+def stdout_is_tty():
+    return sys.stdout.isatty()
+
+
+def menu_color():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def tint(code, text, color):
+    return f"\033[{code}m{text}\033[0m" if color else text
+
+
+def menu_header_text(color=None):
+    # Короткое состояние файрвола для шапки меню. Любой сбой не должен ломать меню.
+    color = menu_color() if color is None else color
+    codes = {"ok": "32", "warn": "33", "bad": "31", "off": "90"}
+    try:
+        try:
+            loaded = quiet("nft", "-t", "list", "table", "inet", "fw")
+        except (OSError, subprocess.SubprocessError):
+            loaded = False
+        rules = ("ok", "Правила работают") if loaded else ("bad", "Правила не загружены")
+        result = last_result()
+        last = {"ok": ("ok", "Последнее обновление: успешно"), "warn": ("warn", "Последнее обновление: есть замечания"),
+                "error": ("bad", "Последнее обновление: ошибка")}.get(result, ("off", "Последнее обновление: ещё не было"))
+        count = len(set(trusted_networks())) + len(trusted_names())
+        trusted = ("off", f"Доверенных: {count}")
+        try:
+            properties = systemd_properties("fw-update.timer", "ActiveState", "NextElapseUSecRealtime")
+        except (OSError, subprocess.SubprocessError):
+            properties = {}
+        match = re.search(r"[0-9]{4}-([0-9]{2})-([0-9]{2}) ([0-9]{2}:[0-9]{2}):[0-9]{2}", properties.get("NextElapseUSecRealtime", ""))
+        if properties.get("ActiveState") == "active" and match:
+            timer = ("ok", f"Следующее обновление: {match[2]}.{match[1]} в {match[3]}")
+        elif properties.get("ActiveState") == "active":
+            timer = ("warn", "Следующее обновление: не запланировано")
+        else:
+            timer = ("warn", "Таймер выключен")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+
+    def cell(item):
+        return f"{tint(codes[item[0]], '●', color)} {item[1]}"
+    columns = shutil.get_terminal_size((100, 24)).columns
+    pairs = ((rules, last), (trusted, timer))
+    if columns < 72:
+        return "\n".join(cell(item) for pair in pairs for item in pair)
+    width = max(2 + len(left[1]) for left, _ in pairs) + 3
+    return "\n".join(cell(left) + " " * (width - 2 - len(left[1])) + cell(right) for left, right in pairs)
+
+
+def show_menu(title, entries, exit_label="Назад"):
+    choices = {str(number): entry for number, entry in enumerate(entries, start=1)}
+    while True:
+        if stdout_is_tty():
+            color = menu_color()
+            print()
+            header = menu_header_text(color) if title == MAIN_MENU_TITLE else ""
+            if header:
+                print_box(f"{title} · v{FW_VERSION}", header)
+            else:
+                print(tint("90", f"── {title} " + "─" * max(4, 54 - len(title)), color))
+            print()
+            for number, (label, _) in choices.items():
+                print(f"  {tint('1;36', number, color)}  {label}")
+            print(f"  {tint('90', '0', color)}  {tint('90', exit_label, color)}\n")
+            prompt = "Выбор › "
+        else:
+            print(f"\n{title}")
+            for number, (label, _) in choices.items():
+                print(f"{number}. {label}")
+            print(f"0. {exit_label}")
+            prompt = "Выбор: "
+        try:
+            choice = input(prompt).strip()
+"""
+menu = replace_once(menu, OLD_SHOW_MENU, NEW_SHOW_MENU, "новый вид меню")
+
+OLD_ENTRIES_HEAD = '    entries = (\n        ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),\n'
+NEW_ENTRIES_HEAD = (
+    '    entries = (\n        ("Статус и наблюдение", (\n'
+    '            ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),\n'
+    '            ("Кто стучится", boxed("Кто стучится", show_hits, HITS_HEADINGS)),\n'
+    '            ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),\n'
+    '            ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),\n'
+    '        )),\n')
+menu = replace_once(menu, OLD_ENTRIES_HEAD, NEW_ENTRIES_HEAD, "подменю наблюдения")
+OLD_TAIL = """        ("Отключить или удалить", (
+            ("Удалить правила и автообновление", remove_rules),
+            ("Удалить скрипт и настройки", uninstall),
+        )),
+        ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),
+        ("Версии и обновление скрипта", (
+            ("Версии и что исправлено", boxed("Версии", show_versions)),
+            ("Обновить скрипт до последней версии", update_script),
+            ("Откатить скрипт к другой версии", rollback_script),
+        )),
+        ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),
+    )
+    try:
+        try:
+            _, _, sizes = file_inventory()
+            total = sum(size for size in sizes.values() if size is not None)
+            print(f"Размер файлов файрвола — {format_size(total)}")
+        except OSError:
+            print("Размер файлов файрвола — не удалось определить")
+        show_menu("""
+NEW_TAIL = """        ("Версии и обновление скрипта", (
+            ("Версии и что исправлено", boxed("Версии", show_versions)),
+            ("Обновить скрипт до последней версии", update_script),
+            ("Откатить скрипт к другой версии", rollback_script),
+        )),
+        ("Отключить или удалить", (
+            ("Удалить правила и автообновление", remove_rules),
+            ("Удалить скрипт и настройки", uninstall),
+        )),
+    )
+    try:
+        show_menu("""
+menu = replace_once(menu, OLD_TAIL, NEW_TAIL, "порядок пунктов и заголовок")
+
+# ------------------------------------------------------ «Кто стучится» (1.6.0)
+# Статистика: динамические наборы nft ss4/ss6 (сканеры) и sn4/sn6 (не из России
+# на защищённых портах) считают пакеты по паре «адрес + порт». Правила drop не
+# меняются: перед ними добавлена отдельная строка без вердикта. Накопленное
+# переносится в новую таблицу при каждом обновлении; если nft или ядро не умеют
+# такие наборы, правила собираются как раньше, без статистики.
+upd = replace_once(upd, '''P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
+{
+  echo "add table inet fw"
+''', r'''P="{ $(echo $GEO_PORTS | tr ' ' ',') }"
+# Статистика «Кто стучится»: наборы со счётчиками по паре «адрес + порт».
+# stat_elements: из вывода `nft list set` берёт записи для переноса. У разных версий nft между
+# счётчиком и сроком может стоять «timeout 7d»; в перенос оно не нужно (срок задаёт сам набор).
+stat_elements() {
+  grep -oE '[0-9a-fA-F:.]+ \. [0-9]+ counter packets [0-9]+ bytes [0-9]+( timeout [0-9a-z]+)? expires [0-9a-z]+' \
+    | sed -E 's/ timeout [0-9a-z]+//' | head -n 65536
+}
+stat_set() {
+  echo "  set $1 { type $2 . inet_service; size 65536; flags dynamic,timeout; timeout 7d; counter;"
+  [ -s "$TMP/stats.$1" ] && echo "    elements = { $(paste -sd, "$TMP/stats.$1") }"
+  echo "  }"
+}
+emit_rules() {
+  echo "add table inet fw"
+''', "статистика: начало сборки")
+upd = replace_once(upd, '''  set_def ap4 ipv4_addr "$TMP/ap4"; set_def ap6 ipv6_addr "$TMP/ap6"
+''', r'''  set_def ap4 ipv4_addr "$TMP/ap4"; set_def ap6 ipv6_addr "$TMP/ap6"
+  if [ "$STATS" = 1 ]; then
+    stat_set ss4 ipv4_addr; stat_set ss6 ipv6_addr; stat_set sn4 ipv4_addr; stat_set sn6 ipv6_addr
+  fi
+''', "статистика: наборы")
+upd = replace_once(upd, r'''  echo "    ip saddr @sc4 counter drop comment \"scanners\""
+  echo "    ip6 saddr @sc6 counter drop comment \"scanners\""
+  echo "    meta l4proto { tcp, udp } th dport $P ip saddr != @ru4 counter drop comment \"non-RU\""
+''', r'''  if [ "$STATS" = 1 ]; then
+    echo "    meta l4proto { tcp, udp } ip saddr @sc4 add @ss4 { ip saddr . th dport }"
+    echo "    meta l4proto { tcp, udp } ip6 saddr @sc6 add @ss6 { ip6 saddr . th dport }"
+  fi
+  echo "    ip saddr @sc4 counter drop comment \"scanners\""
+  echo "    ip6 saddr @sc6 counter drop comment \"scanners\""
+  if [ "$STATS" = 1 ]; then
+    echo "    meta l4proto { tcp, udp } th dport $P ip saddr != @ru4 add @sn4 { ip saddr . th dport }"
+    echo "    meta l4proto { tcp, udp } th dport $P ip6 saddr != @ru6 add @sn6 { ip6 saddr . th dport }"
+  fi
+  echo "    meta l4proto { tcp, udp } th dport $P ip saddr != @ru4 counter drop comment \"non-RU\""
+''', "статистика: правила")
+upd = replace_once(upd, '''} > "$TMP/new.nft"
+''', r'''}
+# Накопленную статистику переносим из действующей таблицы. Если что-то не
+# принялось, сначала собираем без перенесённых записей, затем без статистики:
+# правила важнее неё и всегда применяются.
+STATS=1
+for stat in ss4 ss6 sn4 sn6; do
+  : > "$TMP/stats.$stat"
+  nft -n list set inet fw "$stat" 2>/dev/null | stat_elements > "$TMP/stats.$stat" || true
+done
+emit_rules > "$TMP/new.nft"
+if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
+  for stat in ss4 ss6 sn4 sn6; do : > "$TMP/stats.$stat"; done
+  emit_rules > "$TMP/new.nft"
+  if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
+    STATS=0
+    emit_rules > "$TMP/new.nft"
+  fi
+fi
+''', "статистика: сборка и откат")
+
+menu = replace_once(menu, "import datetime\nimport fcntl\n", "import concurrent.futures\nimport datetime\nimport fcntl\n", "импорт потоков")
+menu = replace_once(menu, "import tempfile\nimport textwrap\n", "import tempfile\nimport textwrap\nimport threading\n", "импорт блокировки")
+menu = replace_once(menu, "def show_status():\n", r'''HIT_SETS = (("scanners", "ss4"), ("scanners", "ss6"), ("non_ru", "sn4"), ("non_ru", "sn6"))
+HIT_RE = re.compile(r"([0-9a-fA-F:.]+) \. (\d+) counter packets (\d+) bytes (\d+)")
+PORT_NAMES = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "почта (SMTP)", 53: "DNS", 80: "HTTP", 110: "почта (POP3)",
+    143: "почта (IMAP)", 443: "HTTPS", 445: "SMB, общие папки Windows", 587: "почта (SMTP)",
+    993: "почта (IMAPS)", 1433: "MS SQL", 1521: "Oracle", 1723: "PPTP VPN", 2375: "Docker без защиты",
+    3306: "MySQL", 3389: "RDP, удалённый рабочий стол", 5060: "SIP, телефония", 5432: "PostgreSQL",
+    5900: "VNC, удалённый экран", 6379: "Redis", 8080: "HTTP (запасной)", 8443: "HTTPS (запасной)",
+    9200: "Elasticsearch", 11211: "Memcached", 27017: "MongoDB",
+}
+
+
+def parse_hits(text):
+    """Строки «адрес . порт counter packets N bytes M» из вывода `nft list set`."""
+    return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
+
+
+HITS_READ_TIMEOUT = 30  # полный набор (65536 записей) на слабом сервере читается дольше обычных 4 секунд
+
+
+def set_is_full(text):
+    """Набор статистики заполнен: ядро не добавляет новые записи, пока старые не истекут."""
+    match = re.search(r"^\s*size (\d+)\s*$", text, re.M)
+    return bool(match) and int(match.group(1)) > 0 and len(HIT_RE.findall(text)) >= int(match.group(1))
+
+
+def summarize_hits(rows, top=5):
+    by_port, by_source, ports_of = {}, {}, {}
+    for address, port, packets, _size in rows:
+        by_port[port] = by_port.get(port, 0) + packets
+        by_source[address] = by_source.get(address, 0) + packets
+        ports_of.setdefault(address, set()).add(port)
+    ports = sorted(by_port.items(), key=lambda item: (-item[1], item[0]))[:top]
+    sources = sorted(by_source.items(), key=lambda item: (-item[1], item[0]))[:top]
+    shown_packets = sum(packets for _port, packets in ports)
+    return {"packets": sum(by_port.values()), "sources": len(by_source), "ports": ports,
+            "other_ports": len(by_port) - len(ports), "other_packets": sum(by_port.values()) - shown_packets,
+            "top_sources": [(address, packets, len(ports_of[address])) for address, packets in sources]}
+
+
+def port_label(port):
+    return PORT_NAMES.get(port, "")
+
+
+def share(part, total):
+    """Доля в целых процентах; настоящая, но малая — «<1%», чтобы строка не казалась пустой."""
+    if total <= 0:
+        return ""
+    percent = round(100 * part / total)
+    return "<1%" if part > 0 and percent == 0 else f"{percent}%"
+
+
+def ports_word(count):
+    if count % 100 in range(11, 15):
+        return "портов"
+    return {1: "порт", 2: "порта", 3: "порта", 4: "порта"}.get(count % 10, "портов")
+
+
+OWNER_LOOKUPS = 15  # владельца узнаём у стольких самых активных адресов; остальные идут одной строкой
+OWNER_WORKERS = 6
+OTHER_ADDRESSES = "другие адреса"
+
+
+def group_by_owner(rows, owner_for):
+    """Строки счётчиков -> группы по владельцу: адреса, попытки, три главных порта. Самые активные первыми."""
+    groups = {}
+    for address, port, packets, _size in rows:
+        group = groups.setdefault(owner_for(address), {"addresses": set(), "packets": 0, "by_port": {}})
+        group["addresses"].add(address)
+        group["packets"] += packets
+        group["by_port"][port] = group["by_port"].get(port, 0) + packets
+    result = []
+    for owner, group in groups.items():
+        ports = sorted(group["by_port"].items(), key=lambda item: (-item[1], item[0]))[:3]
+        result.append({"owner": owner, "addresses": len(group["addresses"]), "packets": group["packets"],
+                       "ports": [port for port, _count in ports]})
+    result.sort(key=lambda group: (-group["packets"], group["owner"]))
+    return result
+
+
+def fit_ports(prefix, count, ports, room):
+    """«N адр.  порты: 443, 8443» целиком, а если не влезает в room, то с меньшим числом портов."""
+    head = f"  {count} адр."
+    shown = list(ports)
+    while shown:
+        text = f"{head}  порты: {', '.join(str(port) for port in shown)}"
+        if len(prefix) + len(text) <= room:
+            return text
+        shown.pop()
+    return head
+
+
+def hits_bar(value, maximum, width=10):
+    # Полоска из отдельных палочек (как у индикаторов доступности): width штук через пробел.
+    if maximum <= 0 or value <= 0:
+        filled = 0
+    else:
+        filled = max(1, round(width * value / maximum))
+    return " ".join(["▮"] * filled + ["▯"] * (width - filled))
+
+
+def hits_bar_view(value, maximum, width, color):
+    bar = hits_bar(value, maximum, width)
+    if not color:
+        return bar
+    filled = bar.count("▮")
+    head = " ".join(["▮"] * filled)
+    tail = bar[len(head):]
+    return tint("32", head, True) + tint("90", tail, True)
+
+
+SOURCE_LABELS = {
+    "skipa_cidr.txt": "СКИПА", "skipa.list": "СКИПА", "antiscanner.list": "антисканер",
+    "censys_v4.txt": "Censys", "shodan_v4.txt": "Shodan", "paloaltonetworks_v4.txt": "Palo Alto Networks",
+    "shadowserver_v4.txt": "Shadowserver", "driftnet_v4.txt": "Driftnet", "onyphe_v4.txt": "ONYPHE",
+    "zoomeye_v4.txt": "ZoomEye", "leakix_v4.txt": "LeakIX", "rapid7_v4.txt": "Rapid7",
+    "fofa_v4.txt": "FOFA", "quake_v4.txt": "Quake", "extra.txt": "ваш список",
+}
+
+
+def source_label(name):
+    if name in SOURCE_LABELS:
+        return SOURCE_LABELS[name]
+    if name.startswith("custom_"):
+        return "свой список"
+    match = re.fullmatch(r"asn_(AS\d+)\.cache", name)
+    return match.group(1) if match else name
+
+
+def load_scanner_sources():
+    """Копии списков сканеров, сохранённые скриптом: [(подпись, [сети])]. Ошибки чтения пропускаются."""
+    files = []
+    try:
+        files += sorted((DIRECTORY / "scanner-cache").iterdir())
+        files += sorted(DIRECTORY.glob("asn_AS*.cache"))
+        files.append(DIRECTORY / "extra.txt")
+    except OSError:
+        pass
+    sources = []
+    for path in files:
+        networks = []
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                value = line.partition("#")[0].strip()
+                if not value:
+                    continue
+                try:
+                    networks.append(ipaddress.ip_network(value, strict=False))
+                except ValueError:
+                    continue
+        except OSError:
+            continue
+        if networks:
+            sources.append((source_label(path.name), networks))
+    return sources
+
+
+def owner_of(address, sources):
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return ""
+    found = []
+    for label, networks in sources:
+        if label not in found and any(network.version == ip.version and ip in network for network in networks):
+            found.append(label)
+    return ", ".join(found[:2])
+
+
+def short_host(name):
+    labels = [part for part in name.strip(".").split(".") if part]
+    if len(labels) <= 2:
+        return ".".join(labels)
+    keep = 3 if len(labels[-1]) == 2 and labels[-2] in {"co", "com", "net", "org", "ac", "gov"} else 2
+    return ".".join(labels[-keep:])
+
+
+def reverse_name(address):
+    """Имя из обратной DNS-записи (домен провайдера), если ответ пришёл быстро."""
+    try:
+        result = subprocess.run(["getent", "hosts", address], text=True, capture_output=True, timeout=2, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    fields = result.stdout.split()
+    return short_host(clean_text(fields[1])) if result.returncode == 0 and len(fields) > 1 else ""
+
+
+OWNER_CACHE_FILE = "owner-cache.json"
+OWNER_CACHE_DAYS = 30
+OWNER_CACHE_LIMIT = 500
+OWNER_CACHE_LOCK = threading.Lock()
+OWNER_TEXT_WIDTH = 40
+
+
+def fetch_ripe(address):
+    """Ответ RIPEstat про адрес (номер AS и владелец); пусто, если сеть не ответила."""
+    url = f"https://stat.ripe.net/data/prefix-overview/data.json?resource={address}"
+    try:
+        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4", url],
+                                text=True, capture_output=True, timeout=6, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def parse_ripe_owner(text):
+    try:
+        asns = json.loads(text)["data"]["asns"]
+        first = asns[0]
+        holder = clean_text(first["holder"] or "").strip()  # у части AS владелец не указан (null)
+        # «ИМЯ-AS-BLOCK - Читаемое название»: показываем читаемую часть
+        holder = holder.split(" - ", 1)[1].strip() if " - " in holder and holder.split(" - ", 1)[1].strip() else holder
+        return f"{holder} AS{int(first['asn'])}" if holder else f"AS{int(first['asn'])}"
+    except (ValueError, KeyError, IndexError, TypeError):
+        return ""
+
+
+def fetch_whois(address):
+    """Запись о блоке адресов у регистратора через RIPEstat; пусто, если сеть не ответила."""
+    url = f"https://stat.ripe.net/data/whois/data.json?resource={address}"
+    try:
+        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4", url],
+                                text=True, capture_output=True, timeout=6, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def parse_whois_owner(text):
+    """(название, страна) из первой записи; у регистраторов поля называются по-разному."""
+    try:
+        fields = {}
+        for item in json.loads(text)["data"]["records"][0]:
+            fields.setdefault(clean_text(item["key"]).lower(), clean_text(item["value"]).strip())
+    except (ValueError, KeyError, IndexError, TypeError):
+        return "", ""
+    # В descr у RIPE часто стоит адрес улицы («11 Hanbury St»): такое не берём, остаётся netname.
+    if fields.get("descr", " ")[:1].isdigit():
+        fields.pop("descr")
+    name = next((fields[key] for key in ("descr", "orgname", "owner", "netname") if fields.get(key)), "")
+    return name, fields.get("country", "")
+
+
+def lookup_owner(address):
+    """Владелец адреса по RIPEstat; ответ запоминается на 30 дней. Любой сбой даёт пустую строку."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return ""
+    if not ip.is_global:
+        return ""
+    path = DIRECTORY / OWNER_CACHE_FILE
+    cache = {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            cache = loaded
+    except (OSError, ValueError):
+        pass
+    now = int(datetime.datetime.now().timestamp())
+    entry = cache.get(address)
+    if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], int) \
+            and now - entry[1] < OWNER_CACHE_DAYS * 86400 and isinstance(entry[0], str):
+        return clean_text(entry[0])
+    answer = fetch_ripe(address)
+    owner = parse_ripe_owner(answer)
+    if owner:
+        # название из записи блока (регистратор) точнее владельца AS: берём его, если оно есть
+        name, country = parse_whois_owner(fetch_whois(address))
+        holder, _, asn = owner.rpartition(" ")
+        if not name and len(owner) > OWNER_TEXT_WIDTH:
+            owner = holder[:max(8, OWNER_TEXT_WIDTH - len(asn) - 2)].rstrip(" ,-") + "… " + asn
+        if name and name.isupper() and holder:
+            name = holder  # «MSFT», «NET-V4-…»: технический код сети, понятнее название владельца AS
+        if name:
+            tail = ", ".join(part for part in (country, asn) if part)
+            room = OWNER_TEXT_WIDTH - len(tail) - 2
+            if len(name) > room:
+                name = name[:max(8, room - 1)].rstrip(" ,-") + "…"
+            owner = f"{name}, {tail}"
+    if owner:
+        with OWNER_CACHE_LOCK:
+            try:  # запросы идут параллельно: перед записью перечитываем файл, чтобы не потерять чужие записи
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                cache = loaded if isinstance(loaded, dict) else cache
+            except (OSError, ValueError):
+                pass
+            cache[address] = [owner, now]
+            fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list)
+                           and len(item[1]) == 2 and isinstance(item[1][1], int) else 0)[:OWNER_CACHE_LIMIT]
+            try:
+                write_text_atomic(path, json.dumps(dict(fresh), ensure_ascii=False))
+            except OSError:
+                pass
+    return owner
+
+
+def screen_columns():
+    """Ширина настоящего терминала (вывод внутри рамки идёт через pty, поэтому берём stderr или stdin)."""
+    for fd in (2, 0, 1):
+        try:
+            columns = os.get_terminal_size(fd).columns
+        except OSError:
+            continue
+        if columns > 0:
+            return columns
+    try:
+        return max(20, int(os.environ.get("COLUMNS", "")))
+    except ValueError:
+        return 100
+
+
+COMPACT_BELOW = 100
+
+
+HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Чего здесь нет")
+
+
+def resolve_owners(addresses, kind, sources):
+    """{адрес: владелец}: списки сканеров, затем RIPEstat (с кэшем), затем DNS. Запросы идут параллельно,
+    любой сбой даёт «неизвестно»."""
+    def one(address):
+        try:
+            owner = owner_of(address, sources) if kind == "scanners" else ""
+            return owner or lookup_owner(address) or reverse_name(address) or "неизвестно"
+        except Exception:
+            return "неизвестно"
+    if not addresses:
+        return {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=OWNER_WORKERS) as pool:
+        return dict(zip(addresses, pool.map(one, addresses)))
+
+
+def show_hits():
+    color = menu_color()
+    columns = screen_columns()
+    compact = columns < COMPACT_BELOW
+
+    def say(text):  # длинные пояснения переносятся по ширине экрана (рамка оставляет columns - 4)
+        print(textwrap.fill(text, width=max(30, columns - 4)))
+
+    print()
+    say("Кто стучится: попытки подключения, которые файрвол отклонил. "
+        "Счёт идёт с включения статистики, данные хранятся до 7 дней.")
+    groups = (("scanners", "Сканеры и сети ведомств (любые порты)"),
+              ("non_ru", "Из других стран (на защищённых портах)"))
+    collected = {"scanners": [], "non_ru": []}
+    full = set()
+    sources = load_scanner_sources()
+    seen = False
+    slow = []
+
+    def read_set(item):
+        return probe_output("nft", "-n", "list", "set", "inet", "fw", item[1],
+                            timeout=HITS_READ_TIMEOUT, on_timeout=None)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(HIT_SETS)) as pool:
+        answers = list(pool.map(read_set, HIT_SETS))  # параллельно: самый долгий ответ, а не сумма
+    for (kind, name), text in zip(HIT_SETS, answers):
+        if text is None:
+            slow.append(name)
+        elif text:
+            seen = True
+            collected[kind].extend(parse_hits(text))
+            if set_is_full(text):
+                full.add(kind)
+    if slow:
+        print()
+        say(f"Часть статистики не прочитана ({', '.join(slow)}): nft не ответил за {HITS_READ_TIMEOUT} с. "
+            "Блокировка от этого не зависит, откройте экран позже.")
+    if not seen and slow:
+        return
+    if not seen:
+        print()
+        say("Статистика не ведётся: правила загружены без неё (старая версия nft или ядра) или ещё не обновлены.")
+        say("Примените правила заново: «Проверить и применить правила» → «Применить правила и включить таймер».")
+        return
+    if not any(collected.values()) and not slow:
+        print()
+        say("Пока никого: статистика включена, но отклонённых попыток ещё нет. Загляните позже.")
+    for kind, title in groups:
+        rows = collected[kind]
+        if not rows:
+            continue
+        summary = summarize_hits(rows)
+        print(f"\n{title}")
+        print(f"Попыток: {summary['packets']}, с разных адресов: {summary['sources']}")
+        if kind in full:
+            say("Внимание: место для статистики закончилось. Новые адреса и порты не записываются, "
+                "пока старые записи не устареют (до 7 дней). Блокировка при этом работает как обычно.")
+        say("Куда стучатся (число — сколько раз отклонена попытка на этот порт, % — доля от всех попыток):")
+        biggest = summary["ports"][0][1]
+        for port, packets in summary["ports"]:
+            label = port_label(port)
+            if compact:
+                room = columns - 4 - 32 - 2
+                label = label if len(label) <= room else label[:max(0, room - 1)].rstrip(" ,") + "…" if room > 1 else ""
+                print(f"  {port:>5}  {hits_bar_view(packets, biggest, 6, color)}  {packets:>5} "
+                      f"{share(packets, summary['packets']):>4}" + (f"  {label}" if label else ""))
+            else:
+                print(f"  {port:>5}  {hits_bar_view(packets, biggest, 10, color)}  {packets:>6} "
+                      f"{share(packets, summary['packets']):>4}" + (f"  {label}" if label else ""))
+        if summary["other_ports"]:
+            # Остальное одной строкой без полоски: так сумма строк равна «Попыток» и видно, куда ушла масса
+            name = f"ещё {summary['other_ports']} {ports_word(summary['other_ports'])}"
+            gap = 5 + 2 + len(hits_bar(0, 1, 6 if compact else 10))
+            print(f"  {name:<{gap}}  {summary['other_packets']:>{5 if compact else 6}} "
+                  f"{share(summary['other_packets'], summary['packets']):>4}")
+        by_address = {}
+        for address, _port, packets, _size in rows:
+            by_address[address] = by_address.get(address, 0) + packets
+        busiest = [address for address, _packets in sorted(by_address.items(), key=lambda item: (-item[1], item[0]))]
+        owner_of_address = resolve_owners(busiest[:OWNER_LOOKUPS], kind, sources)
+        owner_groups = group_by_owner(rows, lambda address: owner_of_address.get(address, OTHER_ADDRESSES))
+        named = [group for group in owner_groups if group["owner"] != OTHER_ADDRESSES]
+        rest = [group for group in owner_groups if group["owner"] == OTHER_ADDRESSES]
+        shown = named[:5] + rest
+        say("По владельцам (попыток, адресов, чаще всего порты):")
+        biggest = max(group["packets"] for group in (named[:5] or shown))  # «другие адреса» масштаб не задают
+        owner_width = min(40, max(len(group["owner"]) for group in shown))
+        for group in shown:
+            owner = group["owner"] if len(group["owner"]) <= owner_width else group["owner"][:owner_width - 1].rstrip() + "…"
+            leftover = group["owner"] == OTHER_ADDRESSES  # без полоски: сумма остатка не сравнима с владельцами
+            if compact:
+                room = columns - 4
+                print("  " + (owner if len(owner) <= room - 2 else owner[:room - 3].rstrip() + "…"))
+                prefix = f"    {hits_bar(group['packets'], biggest, 6)} {group['packets']:>5}"
+                tail = fit_ports(prefix, group["addresses"], group["ports"], room)
+                bar = " " * len(hits_bar(0, 1, 6)) if leftover else hits_bar_view(group["packets"], biggest, 6, color)
+                print(f"    {bar} {group['packets']:>5}{tail}")
+            else:
+                prefix = f"  {owner:<{owner_width}}  {hits_bar(group['packets'], biggest, 8)} {group['packets']:>6}"
+                tail = fit_ports(prefix, group["addresses"], group["ports"], 10 ** 6)
+                bar = " " * len(hits_bar(0, 1, 8)) if leftover else hits_bar_view(group["packets"], biggest, 8, color)
+                print(f"  {owner:<{owner_width}}  {bar} {group['packets']:>6}{tail}")
+        say("Самые активные адреса (попыток, на сколько портов стучался):")
+        biggest = summary["top_sources"][0][1]
+        owners = [owner_of_address.get(address, "неизвестно") for address, _p, _c in summary["top_sources"]]
+        width = min(39, max(len(address) for address, _p, _c in summary["top_sources"]))
+        owner_width = min(40, max(len(owner) for owner in owners))
+        owners = [owner if len(owner) <= owner_width else owner[:owner_width - 1].rstrip() + "…" for owner in owners]
+        for (address, packets, count), owner in zip(summary["top_sources"], owners):
+            if compact:
+                # узкий экран: адрес, полоска и число в первой строке, владелец под ними
+                extra = f"  портов: {count}" if count > 1 else ""
+                print(f"  {address:<{width}}  {hits_bar_view(packets, biggest, 6, color)} {packets:>5}{extra}")
+                room = columns - 4 - 4
+                print("    " + (owner if len(owner) <= room else owner[:room - 1].rstrip() + "…"))
+            else:
+                print(f"  {address:<{width}}  {owner[:owner_width]:<{owner_width}}  "
+                      f"{hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")
+    print("\nЧего здесь нет")
+    say("Попытки входа по SSH сюда не попадают: порт SSH файрвол не фильтрует (смотрите журнал sshd).")
+    say("Считаются отдельные пакеты, а не подключения: один сканер может прислать несколько пакетов на один порт.")
+
+
+''' + "def show_status():\n", "функции «Кто стучится»")
+menu = replace_once(menu, """        rule = item.get("rule")
+        if not rule or rule.get("chain") != "input":
+            continue
+""", """        rule = item.get("rule")
+        if not rule or rule.get("chain") != "input":
+            continue
+        if any("set" in expression for expression in rule.get("expr", [])):
+            continue  # служебная строка статистики «Кто стучится», не правило отбора
+""", "статус: скрыть строки статистики")
+
+# ---------------------------------------------------------------- сборка
+new_text = text
+for key, replacement in (("menu", menu), ("update", upd)):
+    a, b, _ = parts[key]
+    # заменяем с конца, чтобы смещения не сбивались: menu идёт после update
+    new_text = new_text[:a] + replacement + new_text[b:]
+    # пересчитать смещения оставшихся частей после правки
+    a2, b2 = heredoc(new_text, {"menu": "FW_MENU_FILE", "update": "FW_UPDATER_FILE"}[key])
+    parts[key] = (a2, b2, new_text[a2:b2])
+
+# Установщик вне heredoc также патчится при сборке.
+new_text = replace_once(new_text, 'TIMER=/etc/systemd/system/fw-update.timer\n',
+    'TIMER=/etc/systemd/system/fw-update.timer\n'
+    'NFT_DROPIN=/etc/systemd/system/nftables.service.d/10-fw-restore.conf\n', "путь drop-in")
+new_text = replace_once(new_text, "cat > \"$stage/fw-update.timer\" <<'FW_TIMER_FILE'\n",
+    "cat > \"$stage/nftables-restore.conf\" <<'FW_NFT_RESTORE_FILE'\n"
+    "[Service]\n"
+    "ExecStartPost=-/bin/sh -c 'for state in /opt/fw/.rollback-*; do [ -d \"$$state\" ] || continue; echo \"WARN: найдено неподтверждённое применение, откатываю\" >&2; /usr/local/sbin/fw-menu --rollback \"$${state##*/.rollback-}\" || exit 1; done; [ ! -s /opt/fw/fw.nft ] || { /usr/sbin/nft -c -f /opt/fw/fw.nft && /usr/sbin/nft -f /opt/fw/fw.nft; }'\n"
+    "ExecReload=-/bin/sh -c '[ ! -s /opt/fw/fw.nft ] || { /usr/sbin/nft -c -f /opt/fw/fw.nft && /usr/sbin/nft -f /opt/fw/fw.nft; }'\n"
+    "FW_NFT_RESTORE_FILE\n"
+    "systemd_version=$(systemctl --version | awk 'NR == 1 { print $2 }')\n"
+    "if [[ $systemd_version =~ ^[0-9]+$ ]] && [ \"$systemd_version\" -ge 259 ]; then\n"
+    "  sed -i 's/^ExecReload=/ExecReloadPost=/' \"$stage/nftables-restore.conf\"\n"
+    "fi\n\n"
+    "cat > \"$stage/fw-update.timer\" <<'FW_TIMER_FILE'\n", "содержимое drop-in")
+new_text = replace_once(new_text, '  for path in "$MENU" "$SERVICE" "$TIMER"; do\n',
+    '  for path in "$MENU" "$SERVICE" "$TIMER" "$NFT_DROPIN"; do\n', "копия drop-in")
+new_text = replace_once(new_text, '  install -m 0644 "$stage/fw-update.service" "$SERVICE"\n',
+    '  install -m 0644 "$stage/fw-update.service" "$SERVICE"\n'
+    '  install -m 0644 "$stage/nftables-restore.conf" "$FW/nftables-restore.conf"\n'
+    '  if [ -e "$NFT_DROPIN" ] || [ -s "$FW/fw.nft" ]; then\n'
+    '    install -d -m 0755 "${NFT_DROPIN%/*}"\n'
+    '    install -m 0644 "$stage/nftables-restore.conf" "$NFT_DROPIN"\n'
+    '  fi\n', "drop-in при обновлении")
+new_text = replace_once(new_text, 'install -m 0644 "$stage/fw-update.timer" "$TIMER"\n',
+    'install -m 0644 "$stage/fw-update.timer" "$TIMER"\n'
+    'install -m 0644 "$stage/nftables-restore.conf" "$FW/nftables-restore.conf"\n'
+    'install -d -m 0755 "${NFT_DROPIN%/*}"\n'
+    'install -m 0644 "$stage/nftables-restore.conf" "$NFT_DROPIN"\n', "drop-in при установке")
+start = '  if ! grep -qE \'^[[:space:]]*[^#[:space:]]\' "$FW/asn.txt"; then\n'
+a = new_text.index(start)
+b = new_text.index('\n  "$MENU" --profile', a)
+new_text = new_text[:a] + new_text[b:]
+new_text = replace_once(new_text, '  install_seed\n\n\n  "$MENU" --profile',
+    '  install_seed\n'
+    '  if ! grep -q "^[[:space:]]*LAN_ALLOW=" "$FW/fw.conf" && ! grep -q "^[[:space:]]*LAN_ALLOW=" "$FW/local.conf" 2>/dev/null; then\n'
+    '    echo \'LAN_ALLOW выключен. Для включения добавь LAN_ALLOW="нужная_подсеть" в /opt/fw/local.conf.\'\n'
+    '  fi\n'
+    '  ssh_client=$(detect_admin)\n'
+    '  if [ -n "$ssh_client" ] && ! sed "s/#.*//; s/[[:space:]]//g" "$FW/trusted.txt" | grep -Fxq "$ssh_client"; then\n'
+    '    printf "%s  # авто, добавлен %s\\n" "$ssh_client" "$(date +%F)" >> "$FW/trusted.txt"\n'
+    '    echo "Адрес администратора ($ssh_client) добавлен в trusted.txt."\n'
+    '  fi\n\n  "$MENU" --profile', "LAN при обновлении")
+new_text = replace_once(new_text, "  echo 'API_ALLOW=\"\"'\n",
+    "  echo 'API_ALLOW=\"\"'\n" + '  printf \'LAN_ALLOW="%s"\\n\' "$lan_default"\n', "LAN в новом конфиге")
+old_ssh = '''ssh_client=${SSH_CONNECTION:-}
+ssh_client=${ssh_client%% *}
+if [ -n "$ssh_client" ]; then
+  printf '%s\\n' "$ssh_client" > "$FW/trusted.txt"
+  echo "Адрес этого SSH-подключения ($ssh_client) добавлен в доверенные."
+fi
+'''
+new_ssh = '''ssh_client=$(python3 - <<'PY'
+import ipaddress
+import os
+import re
+import subprocess
+
+def valid(value):
+    try:
+        return str(ipaddress.ip_address(value.strip("[]")))
+    except ValueError:
+        return ""
+
+connection = os.environ.get("SSH_CONNECTION", "").split()
+client = valid(connection[0]) if connection else ""
+if not client:
+    for command in (("who", "-m", "--ips"), ("who", "am", "i")):
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        match = re.search(r"\\(([^()]*)\\)\\s*$", result.stdout.strip())
+        client = valid(match.group(1)) if match else ""
+        if client:
+            break
+if not client:
+    pids = set()
+    pid = os.getppid()
+    for _ in range(32):
+        if pid <= 1 or pid in pids:
+            break
+        pids.add(pid)
+        try:
+            pid = int(open(f"/proc/{pid}/stat").read().split(") ", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    session = os.environ.get("XDG_SESSION_ID", "")
+    if session:
+        result = subprocess.run(("loginctl", "show-session", session, "-p", "Leader", "--value"),
+                                text=True, capture_output=True, check=False)
+        if result.stdout.strip().isdigit():
+            pids.add(int(result.stdout.strip()))
+    result = subprocess.run(("ss", "-Htnp", "state", "established"), text=True,
+                            capture_output=True, check=False)
+    for line in result.stdout.splitlines():
+        if not any(f"pid={pid}," in line for pid in pids) or "sshd" not in line:
+            continue
+        fields = line.split()
+        if len(fields) > 4:
+            client = valid(fields[-2].rsplit(":", 1)[0])
+            if client:
+                break
+print(client)
+PY
+)
+if [ -n "$ssh_client" ]; then
+  printf '%s\\n' "$ssh_client" > "$FW/trusted.txt"
+  echo "Адрес этого SSH-подключения ($ssh_client) добавлен в доверенные."
+else
+  echo 'WARN: адрес администратора не определён. Добавь свой IPv4/IPv6 в /opt/fw/trusted.txt до применения правил.' >&2
+fi
+'''
+detect_body = new_ssh.split('if [ -n "$ssh_client" ]; then', 1)[0]
+detect_body = detect_body.replace('ssh_client=$(python3', 'detect_admin() {\npython3', 1)
+detect_body = detect_body.replace('PY\n)\n', 'PY\n}\n', 1)
+new_text = replace_once(new_text, '# ---------------------------------------------------------------- обновление\n',
+                            detect_body + '\n# ---------------------------------------------------------------- обновление\n', "общий поиск администратора")
+new_text = replace_once(new_text, old_ssh,
+    'ssh_client=$(detect_admin)\n'
+    'if [ -n "$ssh_client" ]; then\n'
+    '  printf "%s  # авто, добавлен %s\\n" "$ssh_client" "$(date +%F)" > "$FW/trusted.txt"\n'
+    '  echo "Адрес этого SSH-подключения ($ssh_client) добавлен в доверенные."\n'
+    'else\n'
+    "  echo 'WARN: адрес администратора не определён. Добавь свой IPv4/IPv6 в /opt/fw/trusted.txt до применения правил.' >&2\n"
+    'fi\n', "адрес администратора")
+new_text = replace_once(new_text, 'install -d -m 0755 /opt\n',
+    '''lan_default=""
+server_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' || true)
+lan_candidate=$(python3 - "$server_ip" <<'PY'
+import ipaddress, sys
+try:
+    address = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    address = None
+for subnet in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"):
+    if address is not None and address in ipaddress.ip_network(subnet):
+        print(subnet)
+        break
+PY
+)
+if [ -n "$lan_candidate" ]; then
+  ask enable_lan "Адрес сервера $server_ip находится в $lan_candidate. Разрешить эту подсеть через LAN_ALLOW? да/нет" да
+  if [ "$enable_lan" = да ]; then lan_default=$lan_candidate; fi
+fi
+
+install -d -m 0755 /opt
+''', "предложение LAN")
+
+new_text = replace_once(new_text, "      echo 'Применить новые: systemctl start fw-update.service'\n",
+    "      echo 'Применить новые правила с подтверждением и автооткатом: fw-menu → 4 → 2'\n"
+    "      echo 'Команда systemctl start fw-update.service применяет сразу, без подтверждения и отката.'\n", "подсказка применения")
+new_text = replace_once(new_text,
+    "      echo 'Применить и включить автозапуск: systemctl enable fw-update.service && systemctl enable --now fw-update.timer && systemctl start fw-update.service'\n",
+    "      echo 'Применить и включить автозапуск с подтверждением и автооткатом: fw-menu → 4 → 2'\n", "подсказка автозапуска")
+
+new_text = replace_once(new_text, "umask 022\n\nif [ \"$(id -u)\" -ne 0 ]; then\n",
+    "umask 022\nFW_VERSION='" + VERSION + "'\n\nif [ \"$(id -u)\" -ne 0 ]; then\n", "версия установщика")
+new_text = replace_once(new_text, "FW=/opt/fw\nMENU=/usr/local/sbin/fw-menu\n",
+    "echo \"Nftables-Script, версия $FW_VERSION\"\nFW=/opt/fw\nMENU=/usr/local/sbin/fw-menu\n", "печать версии")
+
+new_hashes = {}
+for key, marker in (("update", "FW_UPDATER_FILE"), ("menu", "FW_MENU_FILE"), ("seed", "FW_SEED_FILE")):
+    a, b = heredoc(new_text, marker)
+    new_hashes[key] = sha(new_text[a:b])
+    if key != "seed":
+        parts[key] = (a, b, new_text[a:b])
+
+for key in ("update", "menu", "seed"):
+    new_text = replace_once(new_text, old_hashes[key], new_hashes[key], f"хеш {key}") if old_hashes[key] != new_hashes[key] else new_text
+
+OUT.write_bytes(new_text.encode("utf-8"))
+BUILD.mkdir(exist_ok=True)
+a, b = heredoc(new_text, "FW_UPDATER_FILE")
+(BUILD / "update-fw.sh").write_text(new_text[a:b], encoding="utf-8")
+a, b = heredoc(new_text, "FW_MENU_FILE")
+(BUILD / "fw-menu").write_text(new_text[a:b], encoding="utf-8")
+a, b = heredoc(new_text, "FW_SEED_FILE")
+(BUILD / "seed.txt").write_text(new_text[a:b], encoding="utf-8")
+
+# Регрессионные проверки добавляются генератором: исходным патчем остаётся build.py.
+tests_file = ROOT / "tests/test_updater_limits.py"
+tests_text = tests_file.read_text(encoding="utf-8")
+test_marker = "    def test_restart_rolls_back_before_normal_update(self):\n"
+if test_marker not in tests_text:
+    new_tests = '''    def test_restart_rolls_back_before_normal_update(self):
+        _, snapshot = self.run_case("restart_rollback")
+        fw = snapshot.parent / "fw"
+        token = "a" * 32
+        (fw / (".rollback-" + token)).mkdir()
+        (fw / "fw.nft.pending").write_text("pending rules\\n")
+        stub = snapshot.parent / "fw-menu-stub"
+        stub.write_text("#!/bin/sh\\nprintf '%s\\n' \\"$*\\" >> \\"$STUB_DIR/menu_calls\\"\\n"
+                        "rm -rf \\"$STUB_DIR/fw/.rollback-$2\\"\\n"
+                        "rm -f \\"$STUB_DIR/fw/fw.nft.pending\\"\\n")
+        stub.chmod(0o755)
+        script = fw / "update-fw.sh"
+        script.write_text(script.read_text().replace("/usr/local/sbin/fw-menu", str(stub)))
+        env = {**os.environ, "STUB_DIR": str(snapshot.parent),
+               "GEO_DAT": str(snapshot.parent / "geo.dat"),
+               "PATH": str(snapshot.parent / "stubs") + os.pathsep + os.environ["PATH"]}
+        result = subprocess.run([str(script)], env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WARN: найдено неподтверждённое применение, откатываю", result.stderr)
+        self.assertEqual((snapshot.parent / "menu_calls").read_text().strip(), "--rollback " + token)
+        self.assertFalse((fw / "fw.nft.pending").exists())
+        self.assertFalse((fw / (".rollback-" + token)).exists())
+        self.assertTrue((fw / "fw.nft").is_file())
+
+    def test_pending_update_does_not_start_recovery(self):
+        _, snapshot = self.run_case("pending_recovery")
+        fw = snapshot.parent / "fw"
+        token = "b" * 32
+        (fw / (".rollback-" + token)).mkdir()
+        env = {**os.environ, "FW_PENDING": "1", "STUB_DIR": str(snapshot.parent),
+               "GEO_DAT": str(snapshot.parent / "geo.dat"),
+               "PATH": str(snapshot.parent / "stubs") + os.pathsep + os.environ["PATH"]}
+        result = subprocess.run([str(fw / "update-fw.sh")], env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((fw / (".rollback-" + token)).is_dir())
+        self.assertTrue((fw / "fw.nft.pending").is_file())
+
+    def test_nftables_dropin_rolls_back_before_loading_rules(self):
+        script = (ROOT / "fw-install.sh").read_text()
+        line = next(line for line in script.splitlines() if line.startswith("ExecStartPost="))
+        self.assertLess(line.index("fw-menu --rollback"), line.index("/usr/sbin/nft -f"))
+        self.assertNotIn("fw.nft.pending", line)
+
+'''
+    tests_file.write_text(tests_text.replace("class InstallerAsn(unittest.TestCase):\n",
+                                            new_tests + "class InstallerAsn(unittest.TestCase):\n"),
+                          encoding="utf-8")
+print("готово:", OUT)
+for key in ("update", "menu", "seed"):
+    print(key, old_hashes[key][:12], "->", new_hashes[key][:12])

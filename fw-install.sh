@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.6.1'
+FW_VERSION='1.7.0'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -150,6 +150,7 @@ source "$DIR/fw.conf"
 [ -f "$DIR/local.conf" ] && source "$DIR/local.conf"
 API_PORTS="${API_PORTS:-}"; API_ALLOW="${API_ALLOW:-}"
 LAN_ALLOW="${LAN_ALLOW-}"
+SSH_RATE_LIMIT="${SSH_RATE_LIMIT:-0}"; SSH_PORTS="${SSH_PORTS-}"
 MAX_GROWTH="${MAX_GROWTH:-3}"; MIN_KEEP="${MIN_KEEP:-0.2}"; MAX_CACHE_DAYS="${MAX_CACHE_DAYS:-14}"
 # Самая широкая сеть, которую можно принять из чужого списка или анонса ASN.
 # Записи из extra.txt этим порогом не ограничены: их вносит администратор.
@@ -157,6 +158,11 @@ MIN_PREFIX4="${MIN_PREFIX4:-8}"; MIN_PREFIX6="${MIN_PREFIX6:-16}"
 HOOK="${HOOK:-input}"
 ZKEEN_MIRRORS="${ZKEEN_MIRRORS-https://raw.githubusercontent.com/jameszeroX/zkeen-ip/master/release/zkeenip.dat https://cdn.jsdelivr.net/gh/jameszeroX/zkeen-ip@master/release/zkeenip.dat https://fastly.jsdelivr.net/gh/jameszeroX/zkeen-ip@master/release/zkeenip.dat}"
 [ "$HOOK" = input ] || [ "$HOOK" = prerouting ] || fail_keep "HOOK должен быть input или prerouting"
+[[ "$SSH_RATE_LIMIT" =~ ^[0-9]{1,4}$ ]] || fail_keep "SSH_RATE_LIMIT: число новых подключений в минуту (0 — выключено)"
+for ssh_port in $SSH_PORTS; do
+  [[ "$ssh_port" =~ ^[0-9]{1,5}$ ]] && [ "$ssh_port" -ge 1 ] && [ "$ssh_port" -le 65535 ] \
+    || fail_keep "SSH_PORTS: порты от 1 до 65535"
+done
 [[ "$MIN_PREFIX4" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || fail_keep "MIN_PREFIX4 должен быть от 1 до 32"
 [[ "$MIN_PREFIX6" =~ ^([1-9][0-9]?|1[01][0-9]|12[0-8])$ ]] || fail_keep "MIN_PREFIX6 должен быть от 1 до 128"
 python3 - "$MAX_GROWTH" "$MIN_KEEP" "$MAX_CACHE_DAYS" <<'PY' || fail_keep "неверные лимиты списков"
@@ -850,6 +856,25 @@ stat_set() {
   [ -s "$TMP/stats.$1" ] && echo "    elements = { $(paste -sd, "$TMP/stats.$1") }"
   echo "  }"
 }
+# Порты SSH: из sshd -T (действующая настройка), иначе из sshd_config, иначе 22.
+ssh_ports_detect() {
+  local found
+  found=$(sshd -T 2>/dev/null | awk '$1 == "port" && $2 ~ /^[0-9]+$/ { print $2 }' | sort -un | tr '\n' ' ')
+  [ -n "$found" ] || found=$(awk 'tolower($1) == "port" && $2 ~ /^[0-9]+$/ { print $2 }' /etc/ssh/sshd_config 2>/dev/null | sort -un | tr '\n' ' ')
+  echo "${found:-22}"
+}
+SSH_RULES=0
+if [ "$SSH_RATE_LIMIT" -gt 0 ]; then
+  SSH_LIST=$(echo ${SSH_PORTS:-$(ssh_ports_detect)})
+  SSH_BURST=$(( SSH_RATE_LIMIT / 2 )); [ "$SSH_BURST" -ge 5 ] || SSH_BURST=5
+  SP="{ $(echo $SSH_LIST | tr ' ' ',') }"
+  SSH_RULES=1
+  # Проверка на старом nft: если синтаксис meter не принят, правило не добавляется, остальное работает.
+  if ! printf 'add table inet fw_probe\nadd chain inet fw_probe c { type filter hook input priority 0; }\nadd rule inet fw_probe c tcp dport %s ct state new meter p { ip saddr timeout 5m limit rate over 20/minute burst 5 packets } drop\nadd rule inet fw_probe c tcp dport %s ct state new meter q { ip6 saddr & ffff:ffff:ffff:ffff:: timeout 5m limit rate over 20/minute burst 5 packets } drop\n' "$SP" "$SP" | nft -c -f - >/dev/null 2>&1; then
+    SSH_RULES=0
+    note "WARN: ограничение частоты SSH не применено: эта версия nft не принимает такое правило"
+  fi
+fi
 emit_rules() {
   echo "add table inet fw"
   echo "delete table inet fw"
@@ -862,6 +887,8 @@ emit_rules() {
   set_def ap4 ipv4_addr "$TMP/ap4"; set_def ap6 ipv6_addr "$TMP/ap6"
   if [ "$STATS" = 1 ]; then
     stat_set ss4 ipv4_addr; stat_set ss6 ipv6_addr; stat_set sn4 ipv4_addr; stat_set sn6 ipv6_addr
+    # Адреса, превысившие лимит SSH: счёт по паре «адрес + порт», как у сканеров (экран «Кто стучится»).
+    if [ "$SSH_RULES" = 1 ]; then stat_set sr4 ipv4_addr; stat_set sr6 ipv6_addr; fi
   fi
   echo "  chain input {"
   if [ "$HOOK" = prerouting ]; then
@@ -896,6 +923,17 @@ emit_rules() {
   fi
   echo "    ip saddr @sc4 counter drop comment \"scanners\""
   echo "    ip6 saddr @sc6 counter drop comment \"scanners\""
+  if [ "$SSH_RULES" = 1 ]; then
+    # Отбрасывается только избыток: больше SSH_RATE_LIMIT новых подключений в минуту с одного адреса
+    # (для IPv6 считается вся сеть /64). Через минуту доступ возвращается сам.
+    # Запись в набор статистики стоит после meter, поэтому выполняется только для превысивших лимит.
+    SSH_ADD4=""; SSH_ADD6=""
+    if [ "$STATS" = 1 ]; then
+      SSH_ADD4=" add @sr4 { ip saddr . tcp dport }"; SSH_ADD6=" add @sr6 { ip6 saddr . tcp dport }"
+    fi
+    echo "    tcp dport $SP ct state new meter ssh4 { ip saddr timeout 5m limit rate over $SSH_RATE_LIMIT/minute burst $SSH_BURST packets }$SSH_ADD4 counter drop comment \"ssh-rate\""
+    echo "    tcp dport $SP ct state new meter ssh6 { ip6 saddr & ffff:ffff:ffff:ffff:: timeout 5m limit rate over $SSH_RATE_LIMIT/minute burst $SSH_BURST packets }$SSH_ADD6 counter drop comment \"ssh-rate\""
+  fi
   if [ "$STATS" = 1 ]; then
     echo "    meta l4proto { tcp, udp } th dport $P ip saddr != @ru4 add @sn4 { ip saddr . th dport }"
     echo "    meta l4proto { tcp, udp } th dport $P ip6 saddr != @ru6 add @sn6 { ip6 saddr . th dport }"
@@ -909,13 +947,13 @@ emit_rules() {
 # принялось, сначала собираем без перенесённых записей, затем без статистики:
 # правила важнее неё и всегда применяются.
 STATS=1
-for stat in ss4 ss6 sn4 sn6; do
+for stat in ss4 ss6 sn4 sn6 sr4 sr6; do
   : > "$TMP/stats.$stat"
   nft -n list set inet fw "$stat" 2>/dev/null | stat_elements > "$TMP/stats.$stat" || true
 done
 emit_rules > "$TMP/new.nft"
 if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
-  for stat in ss4 ss6 sn4 sn6; do : > "$TMP/stats.$stat"; done
+  for stat in ss4 ss6 sn4 sn6 sr4 sr6; do : > "$TMP/stats.$stat"; done
   emit_rules > "$TMP/new.nft"
   if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
     STATS=0
@@ -925,6 +963,7 @@ fi
 
 nft -c -f "$TMP/new.nft" || fail_keep "nft -c не прошёл"
 echo "RU v4/v6: $(wc -l < "$TMP/ru4")/$(wc -l < "$TMP/ru6") | сканеры v4/v6: $(wc -l < "$TMP/sc4")/$(wc -l < "$TMP/sc6") | trusted: $(cat "$TMP/tr4" "$TMP/tr6" | wc -l) | API: ${API_PORTS:-off} <- $(cat "$TMP/ap4" "$TMP/ap6" | wc -l) адр. | списков $ok/${#SCAN_FILES[@]} (своих $custom_total) | из кэша $cached | ASN $asn_total, из кэша $asn_cached | без данных $missing"
+[ "$SSH_RULES" = 0 ] || echo "SSH: не больше $SSH_RATE_LIMIT новых подключений в минуту с одного адреса (порты: $SSH_LIST)"
 wide_finish
 if [ "$DRY" = 1 ]; then echo "DRY: синтаксис ок, ничего не применено"; verdict "проверка прошла, правила не менялись"; exit 0; fi
 nft -f "$TMP/new.nft" || fail_keep "nft не применил новые правила"
@@ -974,6 +1013,8 @@ FW_UPDATER_FILE
 cat > "$stage/fw-menu" <<'FW_MENU_FILE'
 #!/usr/bin/python3
 import concurrent.futures
+import contextlib
+import io
 import datetime
 import fcntl
 import ipaddress
@@ -1855,6 +1896,7 @@ def show_profile():
     print("Расхождения с настройками:" if findings else "Расхождений с настройками нет.")
     for finding in findings:
         print(f"  ! {finding}")
+    return findings
 
 
 def show_suggestion():
@@ -1902,7 +1944,8 @@ def rule_protocols(expressions):
 
 
 def rule_kind(rule):
-    comments = {"api-lock": "api_lock", "api-allow": "api_allow", "LAN_ALLOW": "lan", "scanners": "scanners", "non-RU": "non_ru"}
+    comments = {"api-lock": "api_lock", "api-allow": "api_allow", "LAN_ALLOW": "lan", "scanners": "scanners",
+                "non-RU": "non_ru", "ssh-rate": "ssh_rate"}
     if rule.get("comment") in comments:
         return comments[rule["comment"]]
     expressions = rule.get("expr", [])
@@ -1918,11 +1961,33 @@ def rule_kind(rule):
     return "other"
 
 
+def rule_rate(expressions):
+    """Допустимое число новых подключений в минуту из правила с meter (None, если правило другое)."""
+    for expression in expressions:
+        limit = ((expression.get("meter") or {}).get("stmt") or {}).get("limit")
+        if limit:
+            return limit.get("rate")
+    return None
+
+
 def rule_counter(rule):
     for expression in rule.get("expr", []):
         if "counter" in expression:
             return expression["counter"]["packets"], expression["counter"]["bytes"]
     return 0, 0
+
+
+class CountedStep(str):
+    # Пункт проверки со счётчиком: текст и группа правил, для которой под пунктом печатается строка «Отброшено …».
+    def __new__(cls, text, group):
+        item = super().__new__(cls, text)
+        item.group = group
+        return item
+
+
+def dropped_line(group):
+    text = dropped_text(group)
+    return "     " + text[0].upper() + text[1:]
 
 
 def dropped_text(group):
@@ -1947,18 +2012,19 @@ def explain_rules(items):
         rule = item.get("rule")
         if not rule or rule.get("chain") != "input":
             continue
-        if any("set" in expression for expression in rule.get("expr", [])):
-            continue  # служебная строка статистики «Кто стучится», не правило отбора
+        if any("set" in expression for expression in rule.get("expr", [])) and rule.get("comment") != "ssh-rate":
+            continue  # служебная строка статистики «Кто стучится», не правило отбора (правило SSH-лимита тоже пишет в набор)
         kind = rule_kind(rule)
         packets, size = rule_counter(rule)
-        if groups and groups[-1]["kind"] == kind and kind in {"api_lock", "api_allow", "trusted", "lan", "scanners", "non_ru", "other"}:
+        if groups and groups[-1]["kind"] == kind and kind in {"api_lock", "api_allow", "trusted", "lan", "scanners", "non_ru", "ssh_rate", "other"}:
             groups[-1]["packets"] += packets
             groups[-1]["size"] += size
             groups[-1]["count"] += 1
             continue
         groups.append({"kind": kind, "packets": packets, "size": size, "count": 1,
                        "ports": rule_ports(rule.get("expr", [])),
-                       "protocols": rule_protocols(rule.get("expr", []))})
+                       "protocols": rule_protocols(rule.get("expr", [])),
+                       "rate": rule_rate(rule.get("expr", []))})
     kinds = [group["kind"] for group in groups]
 
     print("\nСписки адресов (записей после объединения подсетей):")
@@ -1985,9 +2051,9 @@ def explain_rules(items):
         elif kind == "transit":
             steps.append("Трафик, адресованный не этому серверу (транзит), — не проверяется, пропускается.")
         elif kind == "api_lock":
-            steps.append(f"{ports_phrase(group['ports'], 'Порт управления', 'Порты управления')} "
-                         f"({protocols_phrase(group['protocols']) or 'TCP'}): адреса не из списка допущенных "
-                         f"отбрасываются ({dropped_text(group)}), допущенные — пропускаются.")
+            steps.append(CountedStep(f"{ports_phrase(group['ports'], 'Порт управления', 'Порты управления')} "
+                                     f"({protocols_phrase(group['protocols']) or 'TCP'}): адреса не из списка допущенных "
+                                     "отбрасываются, допущенные — пропускаются.", group))
         elif kind == "api_allow":
             if api_lock is None:
                 steps.append(f"{ports_phrase(group['ports'], 'Порт управления', 'Порты управления')} — пропускается.")
@@ -1996,10 +2062,14 @@ def explain_rules(items):
         elif kind == "lan":
             steps.append("Адреса LAN_ALLOW — пропускаются до списков сканеров и геофильтра.")
         elif kind == "scanners":
-            steps.append(f"Сканеры и сети ведомств — отбрасываются на всех портах ({dropped_text(group)}).")
+            steps.append(CountedStep("Сканеры и сети ведомств — отбрасываются на всех портах.", group))
+        elif kind == "ssh_rate":
+            steps.append(CountedStep(f"{ports_phrase(group['ports'], 'SSH, порт', 'SSH, порты')}: с одного адреса не больше "
+                                     f"{group['rate']} новых подключений в минуту, лишние отбрасываются. "
+                                     "Открытые сессии это не затрагивает.", group))
         elif kind == "non_ru":
-            steps.append(f"{ports_phrase(group['ports'], 'Порт', 'Порты')} ({protocols_phrase(group['protocols'])}): "
-                         f"адреса не из России — отбрасываются ({dropped_text(group)}).")
+            steps.append(CountedStep(f"{ports_phrase(group['ports'], 'Порт', 'Порты')} ({protocols_phrase(group['protocols'])}): "
+                                     "адреса не из России — отбрасываются.", group))
         else:
             steps.append(f"Прочие правила: {group['count']} шт. Их смысл смотри в техническом виде.")
     steps.append("Всё остальное — пропускается." if chain.get("policy") == "accept"
@@ -2011,6 +2081,12 @@ def explain_rules(items):
         print("  Фильтр стоит до маршрутизации (prerouting), поэтому действует и на порты Docker-контейнеров.")
     for number, text in enumerate(steps, 1):
         print(textwrap.fill(f"{number}. {text}", width=92, initial_indent="  ", subsequent_indent="     "))
+        if isinstance(text, CountedStep):
+            # Счётчик отдельной строкой под пунктом: ненулевой выделен, чтобы было видно, где что-то отбрасывается.
+            if text.group["packets"]:
+                paint(33, dropped_line(text.group))
+            else:
+                print(dropped_line(text.group))
 
 
 import threading
@@ -2084,6 +2160,7 @@ BOX_HEADINGS = (
     "Проверка файлов и команд",
     "Проверка reverse proxy",
     "Профиль сервера",
+    "Настройки",
     "Служба и таймер",
     "Загруженные правила",
     "Списки адресов",
@@ -2179,7 +2256,8 @@ def boxed(title, function, headings=()):
     return wrapper
 
 
-HIT_SETS = (("scanners", "ss4"), ("scanners", "ss6"), ("non_ru", "sn4"), ("non_ru", "sn6"))
+HIT_SETS = (("scanners", "ss4"), ("scanners", "ss6"), ("non_ru", "sn4"), ("non_ru", "sn6"),
+            ("ssh_rate", "sr4"), ("ssh_rate", "sr6"))
 HIT_RE = re.compile(r"([0-9a-fA-F:.]+) \. (\d+) counter packets (\d+) bytes (\d+)")
 PORT_NAMES = {
     21: "FTP", 22: "SSH", 23: "Telnet", 25: "почта (SMTP)", 53: "DNS", 80: "HTTP", 110: "почта (POP3)",
@@ -2518,7 +2596,7 @@ def screen_columns():
 COMPACT_BELOW = 100
 
 
-HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Чего здесь нет")
+HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Превысили лимит SSH", "Чего здесь нет")
 
 
 def resolve_owners(addresses, kind, sources):
@@ -2548,9 +2626,11 @@ def show_hits():
     say("Кто стучится: попытки подключения, которые файрвол отклонил. "
         "Счёт идёт с включения статистики, данные хранятся до 7 дней.")
     groups = (("scanners", "Сканеры и сети ведомств (любые порты)"),
-              ("non_ru", "Из других стран (на защищённых портах)"))
-    collected = {"scanners": [], "non_ru": []}
-    ages = {"scanners": {}, "non_ru": {}}
+              ("non_ru", "Из других стран (на защищённых портах)"),
+              ("ssh_rate", "Превысили лимит SSH (слишком частые новые подключения)"))
+    collected = {"scanners": [], "non_ru": [], "ssh_rate": []}
+    ages = {"scanners": {}, "non_ru": {}, "ssh_rate": {}}
+    ssh_stats = False
     full = set()
     sources = load_scanner_sources()
     seen = False
@@ -2567,6 +2647,7 @@ def show_hits():
             slow.append(name)
         elif text:
             seen = True
+            ssh_stats = ssh_stats or kind == "ssh_rate"
             collected[kind].extend(parse_hits(text))
             for address, age in parse_hit_ages(text).items():
                 ages[kind][address] = max(ages[kind].get(address, 0), age)
@@ -2589,6 +2670,9 @@ def show_hits():
     for kind, title in groups:
         rows = collected[kind]
         if not rows:
+            if kind == "ssh_rate" and ssh_stats:
+                print(f"\n{title.split(' (')[0]}")
+                say("Пока никто не превысил порог новых подключений.")
             continue
         summary = summarize_hits(rows)
         print(f"\n{title}")
@@ -2661,11 +2745,43 @@ def show_hits():
                 print(f"  {address:<{width}}  {owner[:owner_width]:<{owner_width}}  "
                       f"{hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")
     print("\nЧего здесь нет")
-    say("Попытки входа по SSH сюда не попадают: порт SSH файрвол не фильтрует (смотрите журнал sshd).")
+    if ssh_stats:
+        say("В блоке «Превысили лимит SSH» только адреса, которые превысили порог новых подключений. "
+            "Медленный подбор паролей ниже порога сюда не попадает: смотрите журнал sshd.")
+    else:
+        say("Попытки входа по SSH сюда не попадают: порт SSH файрвол не фильтрует (смотрите журнал sshd). "
+            "Если включить ограничение частоты SSH, адреса, превысившие порог, появятся здесь.")
     say("Считаются отдельные пакеты, а не подключения: один сканер может прислать несколько пакетов на один порт.")
 
 
 def show_status():
+    # Сначала собирается весь экран, потом сверху печатается итог: одна строка, по которой видно, всё ли в порядке.
+    problems = []
+    real_tty = sys.stdout.isatty()
+
+    class Buffer(io.StringIO):
+        def isatty(self):
+            return real_tty
+
+    buffer = Buffer()
+    completed = False
+    try:
+        with contextlib.redirect_stdout(buffer):
+            status_body(problems)
+        completed = True
+    finally:
+        if completed:
+            if problems:
+                paint(min(code for code, _ in problems), f"ИТОГ: ЕСТЬ ЗАМЕЧАНИЯ ({len(problems)})")
+                for code, message in problems:
+                    paint(code, f"  ! {message}")
+            else:
+                paint(32, "ИТОГ: ВСЁ В ПОРЯДКЕ — файлы на месте, правила загружены, таймер активен, расхождений нет")
+            print()
+        sys.stdout.write(buffer.getvalue())
+
+
+def status_body(problems):
     print("Проверка файлов и команд")
     for name in ("fw.conf", "asn.txt", "extra.txt", "trusted.txt", "update-fw.sh"):
         path = DIRECTORY / name
@@ -2673,20 +2789,47 @@ def show_status():
         if name == "update-fw.sh":
             present = present and os.access(path, os.X_OK)
         print(f"  {'OK' if present else 'ПРОВЕРЬ'} {path}")
+        if not present:
+            problems.append((31, f"нет файла {path}"))
     for name in ("nft", "curl", "systemctl"):
         print(f"  {'OK' if shutil.which(name) else 'ПРОВЕРЬ'} {name}")
+        if not shutil.which(name):
+            problems.append((31, f"нет команды {name}"))
     print(f"  Доверенных адресов и подсетей — {len(set(trusted_networks()))}")
     if trusted_names():
         print(f"  Доверенных DDNS-адресов — {len(trusted_names())} (IP подставляется при каждом обновлении)")
     warn_old_trusted()
     warn_reverse_proxy()
-    show_profile()
+    findings = show_profile() or []
+    if findings:
+        problems.append((33, f"расхождения с настройками: {len(findings)} (подробности в блоке «Профиль сервера»)"))
     script = ('source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; '
-              'printf "%s\n%s\n%s\n%s\n%s\n" "${LAN_ALLOW-}" "${CONFIRM_TIMEOUT:-60}" "${MAX_GROWTH:-3}" "${MIN_KEEP:-0.2}" "${MAX_CACHE_DAYS:-14}"')
+              'printf "%s\n%s\n%s\n%s\n%s\n%s\n" "${LAN_ALLOW-}" "${CONFIRM_TIMEOUT:-60}" "${MAX_GROWTH:-3}" "${MIN_KEEP:-0.2}" "${MAX_CACHE_DAYS:-14}" "${SSH_RATE_LIMIT:-0}"')
     values = probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).splitlines()
-    if len(values) == 5:
-        print("Настройки: LAN_ALLOW=" + (values[0] or "выключено") +
-              f", CONFIRM_TIMEOUT={values[1]}, MAX_GROWTH={values[2]}, MIN_KEEP={values[3]}, MAX_CACHE_DAYS={values[4]}")
+    if len(values) == 6:
+        ssh_rate = int(values[5]) if values[5].isdigit() else 0
+        print("\nНастройки")
+        not_default = "не по умолчанию"
+        for name, shown, note in (
+                ("LAN_ALLOW", values[0] or "выключено", ""),
+                ("SSH_RATE_LIMIT", f"{ssh_rate} в минуту" if ssh_rate else "выключено", "включено" if ssh_rate else ""),
+                ("CONFIRM_TIMEOUT", f"{values[1]} с", not_default if values[1] != "60" else ""),
+                ("MAX_GROWTH", values[2], not_default if values[2] != "3" else ""),
+                ("MIN_KEEP", values[3], not_default if values[3] != "0.2" else ""),
+                ("MAX_CACHE_DAYS", values[4], not_default if values[4] != "14" else "")):
+            line = f"  {name} ".ljust(24, ".") + f" {shown}" + (f"   ← {note}" if note else "")
+            if note == not_default:
+                paint(33, line)
+            else:
+                print(line)
+        if ssh_rate and "ssh-rate" not in probe_output("nft", "list", "chain", "inet", "fw", "input"):
+            print(textwrap.fill("Ограничение частоты SSH настроено, но правило ещё не загружено. "
+                                "Примени правила: «Проверить и применить правила».", width=92))
+            problems.append((33, "лимит SSH настроен, но правило ещё не загружено: примени правила"))
+        admin_warning = ssh_admin_warning(ssh_rate) if ssh_rate else ""
+        if admin_warning:
+            paint(31, admin_warning)
+            problems.append((31, "адрес твоего подключения не в доверенных: лимит SSH может заблокировать тебя"))
 
     print("\nСлужба и таймер", flush=True)
     service = systemd_properties("fw-update.service", "LoadState", "UnitFileState", "Result")
@@ -2696,19 +2839,25 @@ def show_status():
     last_update = "успешно" if result == "success" else "завершилось с ошибкой" if result else "нет данных"
     print(f"Служба обновления — {loaded}")
     print(f"Последнее обновление — {last_update}")
+    if result and result != "success":
+        problems.append((31, "последнее обновление завершилось с ошибкой: смотри «Журнал ошибок»"))
     print(f"Запуск службы при загрузке сервера — {unit_startup_status(service.get('UnitFileState'))}")
-    show_schedule_status()
+    timer = show_schedule_status()
+    if timer.get("ActiveState") in ("inactive", "failed", "deactivating"):
+        problems.append((33, "таймер обновления не активен: списки не обновляются"))
     print("\nЗагруженные правила (счётчики с момента последнего применения правил)", flush=True)
     table = subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
                            text=True, capture_output=True, check=False)
     if table.returncode:
         print(table.stderr.strip() or "Таблица inet fw пока не загружена.")
+        problems.append((33, "правила ещё не загружены: «Проверить и применить правила»"))
         return
     try:
         explain_rules(json.loads(table.stdout)["nftables"])
     except (AttributeError, KeyError, StopIteration, TypeError, ValueError):
         print("Не удалось разобрать правила, ниже технический вид.", flush=True)
-        run("nft", "-t", "list", "chain", "inet", "fw", "input")
+        print(probe_output("nft", "-t", "list", "chain", "inet", "fw", "input"))
+        problems.append((33, "правила не удалось разобрать: смотри технический вид ниже"))
         return
     print("\nТехнический вид правил: nft list table inet fw")
 
@@ -3307,6 +3456,193 @@ def configure_api():
     print("Настройки порта управления сохранены. Дальше открой «Проверить и применить правила».")
 
 
+SSH_BEGIN, SSH_END = "# BEGIN FW-MENU SSH", "# END FW-MENU SSH"
+
+
+def admin_address():
+    # Адрес, с которого ты сейчас подключён по SSH ("" — определить не удалось: консоль хостера и т. п.).
+    def valid(value):
+        try:
+            return str(ipaddress.ip_address(value.strip("[]")))
+        except ValueError:
+            return ""
+    client = valid(ssh_client())
+    if client:
+        return client
+    for command in (("who", "-m", "--ips"), ("who", "am", "i")):
+        match = re.search(r"\(([^()]*)\)\s*$", probe_output(*command).strip())
+        client = valid(match.group(1)) if match else ""
+        if client:
+            return client
+    # sudo сбрасывает SSH_CONNECTION: ищем сокет sshd по цепочке родительских процессов.
+    pids, pid = set(), os.getppid()
+    for _ in range(32):
+        if pid <= 1 or pid in pids:
+            break
+        pids.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    for line in probe_output("ss", "-Htnp", "state", "established").splitlines():
+        fields = line.split()
+        if len(fields) > 4 and "sshd" in line and any(f"pid={item}," in line for item in pids):
+            client = valid(fields[-2].rsplit(":", 1)[0])
+            if client:
+                return client
+    return ""
+
+
+def lan_allow_networks():
+    script = ('source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; '
+              'printf "%s" "${LAN_ALLOW-}"')
+    result = []
+    for item in probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).replace(",", " ").split():
+        try:
+            result.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            continue
+    return result
+
+
+def admin_protection(address):
+    # Где адрес уже пропускается раньше SSH-правила: "в доверенных", "в LAN_ALLOW" или "" (лимит его заденет).
+    ip = ipaddress.ip_address(address)
+    if any(ip in network for network in trusted_networks() if network.version == ip.version):
+        return "в доверенных"
+    if any(ip in network for network in lan_allow_networks() if network.version == ip.version):
+        return "в LAN_ALLOW"
+    return ""
+
+
+LAYOUT_FIX = str.maketrans("qwertyuiop[]asdfghjkl;'zxcvbnm,.", "йцукенгшщзхъфывапролджэячсмитьбю")
+
+
+def explain_unclear_answer(raw, options):
+    # Почему вопрос задан ещё раз. Ответ, набранный в английской раскладке («lf» вместо «да»), узнаём и говорим об этом прямо.
+    if not raw:
+        return textwrap.fill(f"Ответ пустой, поэтому вопрос задан ещё раз. Нужно: {options}.", width=92)
+    text = f"Ответ «{raw}» не понят, поэтому вопрос задан ещё раз. Нужно: {options}."
+    fixed = raw.casefold().translate(LAYOUT_FIX)
+    if fixed != raw.casefold() and fixed in ("да", "нет", "отмена"):
+        text += (f" Похоже, включена английская раскладка: «{raw}» в ней то же, что «{fixed}». "
+                 "Переключи раскладку и введи слово заново.")
+    return textwrap.fill(text, width=92)
+
+
+def confirm_yes(prompt):
+    # «да» — продолжить; «нет» или Enter — отмена; всё остальное не угадываем, а спрашиваем снова и объясняем почему.
+    while True:
+        raw = input(prompt).strip()
+        answer = raw.casefold()
+        if answer == "да":
+            return True
+        if answer in ("", "нет", "отмена"):
+            return False
+        print(explain_unclear_answer(raw, "«да» (сохранить) или «нет» / Enter (отмена)"))
+
+
+def ask_admin_for_ssh_limit(rate):
+    # Возвращает ("ok" | "exposed" | "unknown" | "cancel", адрес). Ответ «да» или «нет» обязателен: Enter ничего не решает.
+    address = admin_address()
+    if not address:
+        paint(33, "Внимание: адрес, с которого ты подключён, определить не удалось (консоль хостера или нестандартный вход).")
+        print(textwrap.fill("Убедись, что твой адрес есть в доверенных (пункт «Показать доверенные адреса»): иначе при быстрых "
+                            "подключениях можно заблокировать самого себя на 5 минут.", width=92))
+        return "unknown", ""
+    where = admin_protection(address)
+    if where:
+        print(f"Ты подключён с {address}: он {where}, лимит тебе не помешает.")
+        return "ok", address
+    paint(33, f"Внимание: ты сейчас подключён с адреса {address}, его нет в списке доверенных.")
+    print(textwrap.fill(f"Если ты сам сделаешь больше {rate} новых подключений за минуту (scp, rsync, несколько окон), "
+                        "этот адрес будет заблокирован на 5 минут. Доверенные адреса лимитом не затрагиваются.", width=92))
+    if ":" in address:
+        print(textwrap.fill("IPv6: лимит считается по всей подсети /64, а в доверенные попадёт только этот адрес. "
+                            "Если провайдер часто меняет адрес, добавь подсеть вручную.", width=92))
+    while True:
+        raw = input(f"Добавить {address} в доверенные? Введи «да», «нет» или «отмена»: ").strip()
+        answer = raw.casefold()
+        if answer == "да":
+            with (DIRECTORY / ".trusted.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                network = parse_network(address)
+                if network not in set(trusted_networks()):
+                    append_entries(TRUSTED, [network_text(network)])
+            print(f"Адрес {address} добавлен в trusted.txt. Он начнёт действовать при применении правил.")
+            return "ok", address
+        if answer == "нет":
+            return "exposed", address
+        if answer == "отмена":
+            return "cancel", address
+        print(explain_unclear_answer(raw, "«да», «нет» или «отмена»; Enter здесь ничего не решает"))
+
+
+def ssh_admin_warning(rate):
+    # Строка для «Статуса файрвола»: лимит включён, а адрес этого подключения не в доверенных.
+    address = admin_address()
+    if not address or admin_protection(address):
+        return ""
+    return textwrap.fill(f"Внимание: ты подключён с {address}, его нет в доверенных: лимит SSH ({rate} в минуту) может "
+                         "заблокировать тебя при быстрых подключениях. Добавь адрес: «Настроить доступ» → "
+                         "«Добавить доверенные IP или подсети» → ssh.", width=92)
+
+
+
+
+def ssh_rate_setting():
+    """Действующее значение SSH_RATE_LIMIT и SSH_PORTS из fw.conf и local.conf."""
+    script = ('source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; '
+              'printf "%s\\n%s\\n" "${SSH_RATE_LIMIT:-0}" "${SSH_PORTS-}"')
+    values = (probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).splitlines() + ["0", ""])[:2]
+    return (int(values[0]) if values[0].isdigit() else 0), values[1].split()
+
+
+def configure_ssh_limit():
+    rate, ports = ssh_rate_setting()
+    shown = ports or ssh_ports()
+    print(textwrap.fill("Ограничение частоты новых подключений к SSH: с одного адреса пропускается не больше "
+                        "заданного числа новых подключений в минуту, лишние отбрасываются. Уже открытые сессии, "
+                        "доверенные адреса и LAN_ALLOW не затрагиваются; через минуту доступ возвращается сам.", width=92))
+    print(f"Порты SSH: {', '.join(str(port) for port in shown)}" + (" (заданы в SSH_PORTS)" if ports else " (определены автоматически)"))
+    print(f"Сейчас: {'выключено' if not rate else f'не больше {rate} новых подключений в минуту'}")
+    print(textwrap.fill("Осторожно: при плохой связи один вход может отправить несколько пакетов подряд, "
+                        "поэтому порог должен быть щедрым. Рекомендуется 20. Если вы часто открываете много сессий "
+                        "сразу (rsync, ansible, autossh), поставьте больше.", width=92))
+    answer = input("Новых подключений в минуту (число от 5, 0 — выключить, Enter — отмена): ").strip()
+    if not answer:
+        return
+    if not re.fullmatch(r"[0-9]{1,4}", answer) or (0 < int(answer) < 5):
+        raise ValueError("укажи число от 5 до 9999 или 0, чтобы выключить")
+    value = int(answer)
+    if value == rate:
+        print("Это уже действующее значение, ничего не меняю.")
+        return
+    exposure, admin = ask_admin_for_ssh_limit(value) if value else ("ok", "")
+    if exposure == "cancel":
+        print("Отменено, настройка не изменена.")
+        return
+    print("Будет сохранено: " + ("ограничение выключено." if not value else f"не больше {value} новых подключений в минуту."))
+    if not confirm_yes("Сохранить настройку на этой ноде? Введи «да» или «нет»: "):
+        print("Отменено, настройка не изменена.")
+        return
+    managed_block = re.compile(r"(?ms)^" + re.escape(SSH_BEGIN) + r"\n.*?^" + re.escape(SSH_END) + r"(?:\n|$)")
+    with (DIRECTORY / ".api.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = LOCAL_CONFIG.read_text(encoding="utf-8") if LOCAL_CONFIG.exists() else ""
+        current, count = managed_block.subn("", current)
+        if count > 1 or SSH_BEGIN in current or SSH_END in current:
+            raise ValueError("проверь границы блока FW-MENU SSH в local.conf")
+        prefix = current.rstrip("\n") + "\n\n" if current.rstrip("\n") else ""
+        write_text_atomic(LOCAL_CONFIG, f"{prefix}{SSH_BEGIN}\nSSH_RATE_LIMIT={value}\n{SSH_END}\n")
+    print("Настройка сохранена. Дальше открой «Проверить и применить правила»: проверка без применения, "
+          "затем применение с подтверждением и автооткатом.")
+    if exposure == "exposed":
+        paint(33, f"Внимание: адрес {admin}, с которого ты работаешь, не в доверенных: лимит может заблокировать тебя на 5 минут.")
+    elif exposure == "unknown":
+        paint(33, "Внимание: адрес этого подключения не определён: проверь, что он есть в доверенных.")
+
+
 def command_output(*command):
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, check=True).stdout
 
@@ -3517,6 +3853,7 @@ def show_schedule_status():
         if zone:
             next_run += f" ({'МСК' if zone == 'MSK' else zone})"
     print(f"Следующее обновление — {next_run}")
+    return properties
 
 
 def configure_schedule():
@@ -3711,7 +4048,7 @@ def show_error_log():
 
 import hashlib
 
-FW_VERSION = "1.6.1"
+FW_VERSION = "1.7.0"
 FW_REPO = "J0ll1er/Nftables-Script"
 HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -4108,6 +4445,7 @@ def main():
             ("Показать доверенные адреса", boxed("Доверенные адреса", show_trusted)),
             ("Удалить доверенные адреса", remove_trusted),
             ("Настроить порт управления и разрешённые IP", configure_api),
+            ("Ограничить частоту новых SSH-подключений", configure_ssh_limit),
         )),
         ("Настроить блокировки", (
             ("Посмотреть подсети ASN и добавить ASN в блокировку", lookup_asn),
@@ -5869,8 +6207,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    '32ccf6e6826f7c888c21d796466e3007968b2efbcca33d85ab2bb8f26d9472ac' "$stage/update-fw.sh" \
-    '4d5d2a6f8588ff93ca8472d75db0895531fb1a48e2f37a07d31bc5ec59b29ef5' "$stage/fw-menu" \
+    '2f6c52d53b5cd26d1a492147cebcea86867b123bee8242a121b6496d6fe367cd' "$stage/update-fw.sh" \
+    '6f0b2dc8f7886f7c65125ef52415d195088233e487caa799ffe95fc5804a93d3' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

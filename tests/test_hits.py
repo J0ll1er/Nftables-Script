@@ -108,6 +108,40 @@ class Hits(unittest.TestCase):
             self.menu.show_hits()
         return out.getvalue()
 
+    def test_ssh_group_has_its_own_title_owner_and_honest_note(self):
+        self.fake_nft({"sr4": SET_TEXT.replace("ss4", "sr4").replace("198.51.100.7", "192.0.2.77")})
+        self.menu.lookup_owner = lambda address: "Тестовый хостинг, DE, AS64500"
+        text = self.show()
+        self.assertIn("Превысили лимит SSH (слишком частые новые подключения)", text)
+        self.assertIn("Тестовый хостинг", text)
+        self.assertIn("192.0.2.77", text)
+        flat = " ".join(text.split())  # пояснения переносятся по ширине экрана
+        self.assertIn("Медленный подбор паролей ниже порога сюда не попадает", flat)
+        self.assertNotIn("Попытки входа по SSH сюда не попадают", flat)
+
+    def test_without_ssh_sets_the_old_note_and_a_hint_stay(self):
+        self.fake_nft({"ss4": SET_TEXT})
+        text = self.show()
+        flat = " ".join(text.split())
+        self.assertIn("Попытки входа по SSH сюда не попадают", flat)
+        self.assertIn("Если включить ограничение частоты SSH", flat)
+        self.assertNotIn("Превысили лимит SSH", text)
+
+    def test_empty_ssh_set_says_nobody_exceeded(self):
+        empty = "table inet fw {\n\tset sr4 {\n\t\ttype ipv4_addr . inet_service\n\t}\n}\n"
+        self.fake_nft({"sr4": empty, "ss4": SET_TEXT})
+        text = self.show()
+        self.assertIn("Превысили лимит SSH", text)
+        flat = " ".join(text.split())
+        self.assertIn("Пока никто не превысил порог новых подключений.", flat)
+        self.assertIn("Медленный подбор паролей", flat)
+
+    def test_ssh_group_counts_ipv6_rows_too(self):
+        self.fake_nft({"sr6": SET_TEXT_V6.replace("ss6", "sr6")})
+        text = self.show()
+        self.assertIn("2001:db8::1", text)
+        self.assertIn("Превысили лимит SSH", text)
+
     def test_screen_shows_both_groups_with_ports_and_sources(self):
         self.fake_nft({"ss4": SET_TEXT, "ss6": SET_TEXT_V6,
                        "sn4": SET_TEXT.replace("198.51.100.7", "192.0.2.50"), "sn6": ""})
@@ -208,7 +242,7 @@ class Hits(unittest.TestCase):
         # полный набор на 65536 записей на слабом сервере читается дольше обычных 4 секунд
         self.slow_nft(set(), {"ss4": SET_TEXT})
         self.show()
-        self.assertEqual(len(self.asked), 4)
+        self.assertEqual(len(self.asked), len(self.menu.HIT_SETS))
         self.assertTrue(all(timeout >= 30 for timeout in self.asked), self.asked)
 
     def test_probe_output_timeout_is_optional(self):

@@ -1295,7 +1295,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 VERSIONS_CODE = r'''import hashlib
 
 FW_VERSION = "@@VERSION@@"
@@ -2333,6 +2333,30 @@ def parse_hits(text):
     return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
 
 
+HIT_AGE_RE = re.compile(r"([0-9a-fA-F:.]+) \. \d+ counter packets \d+ bytes \d+(?: timeout \S+)? expires ([0-9dhms]+)")
+HIT_TTL = 7 * 24 * 3600  # срок записи в наборах статистики: с него отсчитывается «возраст» записи
+DAY = 24 * 3600
+
+
+def parse_duration(text):
+    """«6d23h59m1s», «259197s» или «1d» в секунды; непонятное значение даёт None."""
+    parts = re.findall(r"(\d+)([dhms])", text)
+    if not parts or "".join(number + unit for number, unit in parts) != text:
+        return None
+    return sum(int(number) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit] for number, unit in parts)
+
+
+def parse_hit_ages(text):
+    """{адрес: возраст самой старой записи в секундах}. Запись не продлевается (правило `add`, а не `update`),
+    поэтому возраст = срок набора минус остаток срока: сколько прошло с первого отклонённого пакета."""
+    ages = {}
+    for address, expires in HIT_AGE_RE.findall(text):
+        left = parse_duration(expires)
+        if left is not None:
+            ages[address] = max(ages.get(address, 0), max(0, HIT_TTL - left))
+    return ages
+
+
 HITS_READ_TIMEOUT = 30  # полный набор (65536 записей) на слабом сервере читается дольше обычных 4 секунд
 
 
@@ -2663,6 +2687,7 @@ def show_hits():
     groups = (("scanners", "Сканеры и сети ведомств (любые порты)"),
               ("non_ru", "Из других стран (на защищённых портах)"))
     collected = {"scanners": [], "non_ru": []}
+    ages = {"scanners": {}, "non_ru": {}}
     full = set()
     sources = load_scanner_sources()
     seen = False
@@ -2680,6 +2705,8 @@ def show_hits():
         elif text:
             seen = True
             collected[kind].extend(parse_hits(text))
+            for address, age in parse_hit_ages(text).items():
+                ages[kind][address] = max(ages[kind].get(address, 0), age)
             if set_is_full(text):
                 full.add(kind)
     if slow:
@@ -2702,7 +2729,10 @@ def show_hits():
             continue
         summary = summarize_hits(rows)
         print(f"\n{title}")
-        print(f"Попыток: {summary['packets']}, с разных адресов: {summary['sources']}")
+        print(f"Отклонено пакетов: {summary['packets']}, с разных адресов: {summary['sources']}")
+        if ages[kind]:
+            fresh = sum(1 for age in ages[kind].values() if age < DAY)
+            say(f"Из них впервые замечены за последние сутки: {fresh} адр. (остальные стучатся дольше: это постоянный фон).")
         if kind in full:
             say("Внимание: место для статистики закончилось. Новые адреса и порты не записываются, "
                 "пока старые записи не устареют (до 7 дней). Блокировка при этом работает как обычно.")
@@ -2719,7 +2749,7 @@ def show_hits():
                 print(f"  {port:>5}  {hits_bar_view(packets, biggest, 10, color)}  {packets:>6} "
                       f"{share(packets, summary['packets']):>4}" + (f"  {label}" if label else ""))
         if summary["other_ports"]:
-            # Остальное одной строкой без полоски: так сумма строк равна «Попыток» и видно, куда ушла масса
+            # Остальное одной строкой без полоски: так сумма строк равна числу пакетов и видно, куда ушла масса
             name = f"ещё {summary['other_ports']} {ports_word(summary['other_ports'])}"
             gap = 5 + 2 + len(hits_bar(0, 1, 6 if compact else 10))
             print(f"  {name:<{gap}}  {summary['other_packets']:>{5 if compact else 6}} "

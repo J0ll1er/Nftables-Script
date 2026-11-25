@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.6.0'
+FW_VERSION='1.6.1'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -2196,6 +2196,30 @@ def parse_hits(text):
     return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
 
 
+HIT_AGE_RE = re.compile(r"([0-9a-fA-F:.]+) \. \d+ counter packets \d+ bytes \d+(?: timeout \S+)? expires ([0-9dhms]+)")
+HIT_TTL = 7 * 24 * 3600  # срок записи в наборах статистики: с него отсчитывается «возраст» записи
+DAY = 24 * 3600
+
+
+def parse_duration(text):
+    """«6d23h59m1s», «259197s» или «1d» в секунды; непонятное значение даёт None."""
+    parts = re.findall(r"(\d+)([dhms])", text)
+    if not parts or "".join(number + unit for number, unit in parts) != text:
+        return None
+    return sum(int(number) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit] for number, unit in parts)
+
+
+def parse_hit_ages(text):
+    """{адрес: возраст самой старой записи в секундах}. Запись не продлевается (правило `add`, а не `update`),
+    поэтому возраст = срок набора минус остаток срока: сколько прошло с первого отклонённого пакета."""
+    ages = {}
+    for address, expires in HIT_AGE_RE.findall(text):
+        left = parse_duration(expires)
+        if left is not None:
+            ages[address] = max(ages.get(address, 0), max(0, HIT_TTL - left))
+    return ages
+
+
 HITS_READ_TIMEOUT = 30  # полный набор (65536 записей) на слабом сервере читается дольше обычных 4 секунд
 
 
@@ -2526,6 +2550,7 @@ def show_hits():
     groups = (("scanners", "Сканеры и сети ведомств (любые порты)"),
               ("non_ru", "Из других стран (на защищённых портах)"))
     collected = {"scanners": [], "non_ru": []}
+    ages = {"scanners": {}, "non_ru": {}}
     full = set()
     sources = load_scanner_sources()
     seen = False
@@ -2543,6 +2568,8 @@ def show_hits():
         elif text:
             seen = True
             collected[kind].extend(parse_hits(text))
+            for address, age in parse_hit_ages(text).items():
+                ages[kind][address] = max(ages[kind].get(address, 0), age)
             if set_is_full(text):
                 full.add(kind)
     if slow:
@@ -2565,7 +2592,10 @@ def show_hits():
             continue
         summary = summarize_hits(rows)
         print(f"\n{title}")
-        print(f"Попыток: {summary['packets']}, с разных адресов: {summary['sources']}")
+        print(f"Отклонено пакетов: {summary['packets']}, с разных адресов: {summary['sources']}")
+        if ages[kind]:
+            fresh = sum(1 for age in ages[kind].values() if age < DAY)
+            say(f"Из них впервые замечены за последние сутки: {fresh} адр. (остальные стучатся дольше: это постоянный фон).")
         if kind in full:
             say("Внимание: место для статистики закончилось. Новые адреса и порты не записываются, "
                 "пока старые записи не устареют (до 7 дней). Блокировка при этом работает как обычно.")
@@ -2582,7 +2612,7 @@ def show_hits():
                 print(f"  {port:>5}  {hits_bar_view(packets, biggest, 10, color)}  {packets:>6} "
                       f"{share(packets, summary['packets']):>4}" + (f"  {label}" if label else ""))
         if summary["other_ports"]:
-            # Остальное одной строкой без полоски: так сумма строк равна «Попыток» и видно, куда ушла масса
+            # Остальное одной строкой без полоски: так сумма строк равна числу пакетов и видно, куда ушла масса
             name = f"ещё {summary['other_ports']} {ports_word(summary['other_ports'])}"
             gap = 5 + 2 + len(hits_bar(0, 1, 6 if compact else 10))
             print(f"  {name:<{gap}}  {summary['other_packets']:>{5 if compact else 6}} "
@@ -3681,7 +3711,7 @@ def show_error_log():
 
 import hashlib
 
-FW_VERSION = "1.6.0"
+FW_VERSION = "1.6.1"
 FW_REPO = "J0ll1er/Nftables-Script"
 HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -5840,7 +5870,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '32ccf6e6826f7c888c21d796466e3007968b2efbcca33d85ab2bb8f26d9472ac' "$stage/update-fw.sh" \
-    'd6a35483ee31bca6bb030959897fa20f50362b5372bc61da25e81b8864456289' "$stage/fw-menu" \
+    '4d5d2a6f8588ff93ca8472d75db0895531fb1a48e2f37a07d31bc5ec59b29ef5' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

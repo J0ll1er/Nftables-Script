@@ -120,6 +120,25 @@ class Hits(unittest.TestCase):
         self.assertIn("192.0.2.50", text)
         self.assertIn("SSH", text)  # заметка: порт управления не виден
 
+    def test_screen_counts_addresses_first_seen_in_the_last_day(self):
+        self.fake_nft({"ss4": SET_TEXT, "ss6": SET_TEXT_V6, "sn4": "", "sn6": ""})
+        text = self.show()
+        self.assertIn("Из них впервые замечены за последние сутки: 2 адр.", text)
+
+    def test_age_parsing_handles_all_nft_duration_forms(self):
+        self.assertEqual(self.menu.parse_duration("6d23h59m1s"), 604741)
+        self.assertEqual(self.menu.parse_duration("259197s"), 259197)
+        self.assertEqual(self.menu.parse_duration("1d"), 86400)
+        self.assertIsNone(self.menu.parse_duration("скоро"))
+        ages = self.menu.parse_hit_ages(SET_TEXT)
+        self.assertEqual(ages["198.51.100.7"], 59)
+        self.assertEqual(ages["203.0.113.9"], 604800 - (6 * 86400 + 3600))
+
+    def test_no_age_line_when_expiry_is_unknown(self):
+        plain = SET_TEXT.replace(" expires 6d23h59m1s", "").replace(" expires 6d1h", "")
+        self.fake_nft({"ss4": plain, "ss6": "", "sn4": "", "sn6": ""})
+        self.assertNotIn("впервые замечены", self.show())
+
     def test_screen_when_nothing_collected_yet(self):
         self.fake_nft({"ss4": "table inet fw {\n\tset ss4 {\n\t\ttype ipv4_addr . inet_service\n\t}\n}\n",
                        "ss6": "", "sn4": "", "sn6": ""})
@@ -522,7 +541,7 @@ class Grouped(unittest.TestCase):
 
     def test_plain_words_instead_of_jargon(self):
         text = self.render()
-        for word in ("Попыток:", "с разных адресов", "Из других стран", "Чего здесь нет"):
+        for word in ("Отклонено пакетов:", "с разных адресов", "Из других стран", "Чего здесь нет"):
             self.assertIn(word, text)
         for old in ("Всего пакетов", "пакеты, отброшенные", "Что здесь не видно", "чей адрес"):
             self.assertNotIn(old, text)

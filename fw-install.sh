@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.7.1'
+FW_VERSION='1.7.2'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -197,6 +197,7 @@ SCAN_FILES=(
   "$OPENFILTERS/rapid7_v4.txt"
   "$OPENFILTERS/fofa_v4.txt"
   "$OPENFILTERS/quake_v4.txt"
+  "$OPENFILTERS/strechoid_v4.txt"
 )
 ENABLED_PRESETS="skipa antiscanner classic fofa"
 if [ -f "$DIR/presets.conf" ]; then
@@ -2398,7 +2399,7 @@ SOURCE_LABELS = {
     "censys_v4.txt": "Censys", "shodan_v4.txt": "Shodan", "paloaltonetworks_v4.txt": "Palo Alto Networks",
     "shadowserver_v4.txt": "Shadowserver", "driftnet_v4.txt": "Driftnet", "onyphe_v4.txt": "ONYPHE",
     "zoomeye_v4.txt": "ZoomEye", "leakix_v4.txt": "LeakIX", "rapid7_v4.txt": "Rapid7",
-    "fofa_v4.txt": "FOFA", "quake_v4.txt": "Quake", "extra.txt": "ваш список",
+    "fofa_v4.txt": "FOFA", "quake_v4.txt": "Quake", "strechoid_v4.txt": "Stretchoid", "extra.txt": "ваш список",
 }
 
 
@@ -4049,7 +4050,7 @@ def show_error_log():
 
 import hashlib
 
-FW_VERSION = "1.7.1"
+FW_VERSION = "1.7.2"
 FW_REPO = "J0ll1er/Nftables-Script"
 HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -6208,8 +6209,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    '2f6c52d53b5cd26d1a492147cebcea86867b123bee8242a121b6496d6fe367cd' "$stage/update-fw.sh" \
-    'f5f0b29c1cd453c55cb45be2d20fe3904a8322f96826d18cbfa0c8b71dd5bf73' "$stage/fw-menu" \
+    'e8aee21243616035f71880471d6953f325fc997109e9aaf9a395bca6bf87b2f4' "$stage/update-fw.sh" \
+    'ac0661c3d43a5f3943db2cc21897a8f2db576d2fc272c67045b2007a45334afa' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

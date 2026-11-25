@@ -56,6 +56,15 @@ print("исходные суммы сходятся")
 upd = parts["update"][2]
 
 
+# 1.7.2: Stretchoid (OpenFilters/internet-scanners) входит в пресет «classic»
+upd = replace_once(
+    upd,
+    '  "$OPENFILTERS/quake_v4.txt"\n)\n',
+    '  "$OPENFILTERS/quake_v4.txt"\n  "$OPENFILTERS/strechoid_v4.txt"\n)\n',
+    "источники: Stretchoid",
+)
+
+
 upd = replace_once(
     upd,
     'fail_keep() { echo "ERR: $1 — правила не тронуты" >&2; exit 1; }\n'
@@ -1295,7 +1304,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 VERSIONS_CODE = r'''import hashlib
 
 FW_VERSION = "@@VERSION@@"
@@ -2509,7 +2518,7 @@ SOURCE_LABELS = {
     "censys_v4.txt": "Censys", "shodan_v4.txt": "Shodan", "paloaltonetworks_v4.txt": "Palo Alto Networks",
     "shadowserver_v4.txt": "Shadowserver", "driftnet_v4.txt": "Driftnet", "onyphe_v4.txt": "ONYPHE",
     "zoomeye_v4.txt": "ZoomEye", "leakix_v4.txt": "LeakIX", "rapid7_v4.txt": "Rapid7",
-    "fofa_v4.txt": "FOFA", "quake_v4.txt": "Quake", "extra.txt": "ваш список",
+    "fofa_v4.txt": "FOFA", "quake_v4.txt": "Quake", "strechoid_v4.txt": "Stretchoid", "extra.txt": "ваш список",
 }
 
 

@@ -1295,7 +1295,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 VERSIONS_CODE = r'''import hashlib
 
 FW_VERSION = "@@VERSION@@"
@@ -2967,7 +2967,7 @@ ADMIN_HELPERS = r"""def admin_address():
             return str(ipaddress.ip_address(value.strip("[]")))
         except ValueError:
             return ""
-    client = valid(ssh_client())
+    client = valid(os.environ.get("SSH_CONNECTION", "").partition(" ")[0])
     if client:
         return client
     for command in (("who", "-m", "--ips"), ("who", "am", "i")):
@@ -3092,6 +3092,9 @@ def ssh_admin_warning(rate):
 """
 menu = replace_once(menu, "SSH_BEGIN, SSH_END = \"# BEGIN FW-MENU SSH\", \"# END FW-MENU SSH\"\n",
                     "SSH_BEGIN, SSH_END = \"# BEGIN FW-MENU SSH\", \"# END FW-MENU SSH\"\n\n\n" + ADMIN_HELPERS, "SSH: адрес администратора")
+menu = replace_once(menu, 'def ssh_client():\n    return os.environ.get("SSH_CONNECTION", "").partition(" ")[0]\n',
+                    'def ssh_client():\n    # sudo сбрасывает SSH_CONNECTION, поэтому адрес ищется и другими способами.\n    return admin_address()\n',
+                    "SSH: ssh_client через admin_address")
 menu = replace_once(menu, '''              'printf "%s\\n%s\\n%s\\n%s\\n%s\\n" "${LAN_ALLOW-}" "${CONFIRM_TIMEOUT:-60}" "${MAX_GROWTH:-3}" "${MIN_KEEP:-0.2}" "${MAX_CACHE_DAYS:-14}"')
     values = probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).splitlines()
     if len(values) == 5:

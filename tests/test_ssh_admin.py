@@ -209,6 +209,26 @@ class Detection(unittest.TestCase):
     def test_garbage_in_who_is_ignored(self):
         self.assertEqual(self.run_with({}, lambda *a, **k: "user tty1 (:0)\n"), "")
 
+    def test_ssh_client_finds_address_after_sudo_dropped_the_variable(self):
+        # ssh_client() используют «ssh» в добавлении доверенных, apply_rules, удаление и --dry.
+        def probe(*command, **kwargs):
+            return "root pts/0 2026-11-25 21:00 (203.0.113.9)\n" if command[0] == "who" else ""
+        self.menu.probe_output = probe
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SSH_CONNECTION", None)
+            self.assertEqual(self.menu.ssh_client(), "203.0.113.9")
+
+    def test_ssh_client_is_empty_without_any_ssh_session(self):
+        self.menu.probe_output = lambda *a, **k: ""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SSH_CONNECTION", None)
+            self.assertEqual(self.menu.ssh_client(), "")
+
+    def test_ssh_client_keeps_using_the_variable_first(self):
+        self.menu.probe_output = lambda *a, **k: self.fail("лишний вызов")
+        with mock.patch.dict(os.environ, {"SSH_CONNECTION": "203.0.113.9 51514 10.0.0.1 22"}):
+            self.assertEqual(self.menu.ssh_client(), "203.0.113.9")
+
 
 class Protection(unittest.TestCase):
     def test_lan_allow_parsing_reads_config(self):

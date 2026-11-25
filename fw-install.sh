@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.7.0'
+FW_VERSION='1.7.1'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -1093,7 +1093,8 @@ def parse_network(value):
 
 
 def ssh_client():
-    return os.environ.get("SSH_CONNECTION", "").partition(" ")[0]
+    # sudo сбрасывает SSH_CONNECTION, поэтому адрес ищется и другими способами.
+    return admin_address()
 
 
 def entries(path):
@@ -3466,7 +3467,7 @@ def admin_address():
             return str(ipaddress.ip_address(value.strip("[]")))
         except ValueError:
             return ""
-    client = valid(ssh_client())
+    client = valid(os.environ.get("SSH_CONNECTION", "").partition(" ")[0])
     if client:
         return client
     for command in (("who", "-m", "--ips"), ("who", "am", "i")):
@@ -4048,7 +4049,7 @@ def show_error_log():
 
 import hashlib
 
-FW_VERSION = "1.7.0"
+FW_VERSION = "1.7.1"
 FW_REPO = "J0ll1er/Nftables-Script"
 HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -6208,7 +6209,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '2f6c52d53b5cd26d1a492147cebcea86867b123bee8242a121b6496d6fe367cd' "$stage/update-fw.sh" \
-    '6f0b2dc8f7886f7c65125ef52415d195088233e487caa799ffe95fc5804a93d3' "$stage/fw-menu" \
+    'f5f0b29c1cd453c55cb45be2d20fe3904a8322f96826d18cbfa0c8b71dd5bf73' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

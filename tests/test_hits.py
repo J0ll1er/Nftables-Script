@@ -246,6 +246,14 @@ class Hits(unittest.TestCase):
         self.assertEqual(len(self.asked), len(self.menu.HIT_SETS))
         self.assertTrue(all(timeout >= 30 for timeout in self.asked), self.asked)
 
+    def test_oldest_entry_expiry_is_shown(self):
+        self.fake_nft({"ss4": SET_TEXT, "ss6": "", "sn4": "", "sn6": ""})
+        self.assertIn("Самая старая сотрётся через 6 д 1 ч 0 мин", self.show().replace("\n", " "))
+
+    def test_format_left(self):
+        self.assertEqual(self.menu.format_left(2 * 86400 + 5 * 3600 + 7 * 60 + 30), "2 д 5 ч 7 мин")
+        self.assertEqual(self.menu.format_left(0), "0 д 0 ч 0 мин")
+
     def test_probe_output_timeout_is_optional(self):
         if not shutil.which("sleep"):
             self.skipTest("нет sleep")

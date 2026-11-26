@@ -2325,6 +2325,13 @@ def parse_duration(text):
     return sum(int(number) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit] for number, unit in parts)
 
 
+def format_left(seconds):
+    """Остаток времени словами: «2 д 5 ч 7 мин»."""
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    return f"{days} д {hours} ч {rest // 60} мин"
+
+
 def parse_hit_ages(text):
     """{адрес: возраст самой старой записи в секундах}. Запись не продлевается (правило `add`, а не `update`),
     поэтому возраст = срок набора минус остаток срока: сколько прошло с первого отклонённого пакета."""
@@ -2693,6 +2700,10 @@ def show_hits():
                 ages[kind][address] = max(ages[kind].get(address, 0), age)
             if set_is_full(text):
                 full.add(kind)
+    oldest = max((age for group in ages.values() for age in group.values()), default=None)
+    if oldest is not None:
+        say("Общего сброса нет: каждая запись хранится 7 дней с первого отклонённого пакета. "
+            f"Самая старая сотрётся через {format_left(max(0, HIT_TTL - oldest))}.")
     if slow:
         print()
         say(f"Часть статистики не прочитана ({', '.join(slow)}): nft не ответил за {HITS_READ_TIMEOUT} с. "
@@ -6879,7 +6890,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    '3fa9f426bae4c7bde0d7779c6eba73eab71cbe8c42c947b34911a9b8220109d5' "$stage/fw-menu" \
+    'cdf9c2d86cb6e77f578786f04f40f3243f26b5304cc7235b3be2d58af50c8ca9' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

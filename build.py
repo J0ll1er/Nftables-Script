@@ -2492,6 +2492,13 @@ def parse_duration(text):
     return sum(int(number) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit] for number, unit in parts)
 
 
+def format_left(seconds):
+    """Остаток времени словами: «2 д 5 ч 7 мин»."""
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    return f"{days} д {hours} ч {rest // 60} мин"
+
+
 def parse_hit_ages(text):
     """{адрес: возраст самой старой записи в секундах}. Запись не продлевается (правило `add`, а не `update`),
     поэтому возраст = срок набора минус остаток срока: сколько прошло с первого отклонённого пакета."""
@@ -2857,6 +2864,10 @@ def show_hits():
                 ages[kind][address] = max(ages[kind].get(address, 0), age)
             if set_is_full(text):
                 full.add(kind)
+    oldest = max((age for group in ages.values() for age in group.values()), default=None)
+    if oldest is not None:
+        say("Общего сброса нет: каждая запись хранится 7 дней с первого отклонённого пакета. "
+            f"Самая старая сотрётся через {format_left(max(0, HIT_TTL - oldest))}.")
     if slow:
         print()
         say(f"Часть статистики не прочитана ({', '.join(slow)}): nft не ответил за {HITS_READ_TIMEOUT} с. "

@@ -1,6 +1,6 @@
 name: Проверка версии и сборки
 
-# Установщик должен совпадать со сборкой, а его изменение требует новой версии.
+# Установщик должен совпадать со сборкой, а его изменение требует новой версии (правка одной сборки без изменения установщика версии не требует).
 on:
   pull_request:
   push:
@@ -29,7 +29,7 @@ jobs:
           fi
           case "$base" in ""|0000000000000000000000000000000000000000) exit 0;; esac
           git cat-file -e "$base^{commit}" 2>/dev/null || exit 0
-          if git diff --quiet "$base" HEAD -- build.py orig-fw-install.sh fw-install.sh; then
+          if git diff --quiet "$base" HEAD -- fw-install.sh; then
             exit 0
           fi
           top_version() { grep -m1 -E '^## [0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$' | sed 's/^## //; s/[[:space:]]*$//'; }

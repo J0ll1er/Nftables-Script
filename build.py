@@ -2752,13 +2752,15 @@ def fetch_rdap(address):
 
 
 def parse_rdap_owner(text):
-    """(название, страна) из ответа RDAP: имя организации из карточки, иначе название блока."""
+    """(название, страна) из ответа RDAP: имя организации-владельца (registrant), иначе название блока."""
     try:
         data = json.loads(text)
         if not isinstance(data, dict):
             return "", ""
         name = ""
         for entity in data.get("entities") or []:
+            if "registrant" not in (entity.get("roles") or []):
+                continue  # контакты («Abuse», «Technical») названием владельца не считаются
             card = entity.get("vcardArray") or []
             for field in (card[1] if len(card) > 1 else []):
                 if field and field[0] == "fn" and isinstance(field[3], str):

@@ -102,8 +102,14 @@ class Password(unittest.TestCase):
         self.menu.fetch_ripe = lambda address: ""
         self.menu.fetch_whois = lambda address: self.fail("whois не нужен")
         self.menu.fetch_rdap = lambda address: (
-            '{"name": "NET-1", "country": "US", "entities": [{"vcardArray": ["vcard", [["fn", {}, "text", "Example Hosting LLC"]]]}]}')
+            '{"name": "NET-1", "country": "US", "entities": ['
+            '{"roles": ["abuse"], "vcardArray": ["vcard", [["fn", {}, "text", "Abuse"]]]},'
+            '{"roles": ["registrant"], "vcardArray": ["vcard", [["fn", {}, "text", "Example Hosting LLC"]]]}]}')
         self.assertEqual(self.menu.lookup_owner("5f00::1"), "Example Hosting LLC, US")
+
+    def test_rdap_abuse_contact_is_not_owner(self):
+        text = '{"name": "BESTDC_LIMITED", "country": "AD", "entities": [{"roles": ["abuse"], "vcardArray": ["vcard", [["fn", {}, "text", "Abuse"]]]}]}'
+        self.assertEqual(self.menu.parse_rdap_owner(text), ("BESTDC_LIMITED", "AD"))
 
     def test_rdap_garbage_is_empty(self):
         self.assertEqual(self.menu.parse_rdap_owner("не json"), ("", ""))

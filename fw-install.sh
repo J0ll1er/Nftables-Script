@@ -2585,13 +2585,15 @@ def fetch_rdap(address):
 
 
 def parse_rdap_owner(text):
-    """(название, страна) из ответа RDAP: имя организации из карточки, иначе название блока."""
+    """(название, страна) из ответа RDAP: имя организации-владельца (registrant), иначе название блока."""
     try:
         data = json.loads(text)
         if not isinstance(data, dict):
             return "", ""
         name = ""
         for entity in data.get("entities") or []:
+            if "registrant" not in (entity.get("roles") or []):
+                continue  # контакты («Abuse», «Technical») названием владельца не считаются
             card = entity.get("vcardArray") or []
             for field in (card[1] if len(card) > 1 else []):
                 if field and field[0] == "fn" and isinstance(field[3], str):
@@ -6943,7 +6945,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    '8b02b8cea10d516f24ad2865849b091047799cabcf72f5f59f13f44f4c5fd34f' "$stage/fw-menu" \
+    '8ab90bf335f069429194ed6b99b490366ce891519c0dc990909176f11dfe1c1a' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

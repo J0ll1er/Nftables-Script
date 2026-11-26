@@ -3540,6 +3540,384 @@ menu = replace_once(menu, """def ask_confirmation(timeout):
         print("Правила работают? Введите «да»: ", end="", flush=True)
 """, "подтверждение применения: повторный вопрос")
 
+# ---------------------------------------------------------------- SSH-ключ для входа (1.9.0)
+SSH_KEY_CODE = r'''SSH_KEYS_FILE = DIRECTORY / "ssh-keys.json"
+SSH_KEY_TTL = 24 * 3600
+SSH_SWEEP_UNIT = "fw-ssh-key-sweep"
+
+
+@contextlib.contextmanager
+def ssh_keys_locked():
+    with (DIRECTORY / ".sshkey.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def load_ssh_keys():
+    try:
+        data = json.loads(SSH_KEYS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+def save_ssh_keys(items):
+    write_text_atomic(SSH_KEYS_FILE, json.dumps(items, ensure_ascii=False, indent=1) + "\n")
+
+
+def ssh_key_user():
+    # Для кого создаётся ключ: пользователь, под которым ты вошёл (при sudo — тот, кто его вызвал), иначе root.
+    import pwd
+    names = [os.environ.get("SUDO_USER", "")]
+    who = probe_output("who", "-m").split()
+    names.append(who[0] if who else "")
+    names.append(probe_output("logname").strip())
+    for name in names:
+        if name:
+            try:
+                pwd.getpwnam(name)
+            except KeyError:
+                continue
+            return name
+    return "root"
+
+
+def ssh_session_endpoint():
+    # (адрес, порт), к которым ты подключился по SSH. Адрес "" — не определён или не публичный (тогда его вводит человек).
+    def public(value):
+        try:
+            ip = ipaddress.ip_address(value.strip("[]").partition("%")[0])
+        except ValueError:
+            return ""
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+            return ""
+        return str(ip)
+
+    parts = os.environ.get("SSH_CONNECTION", "").split()
+    if len(parts) == 4:
+        return public(parts[2]), int(parts[3]) if parts[3].isdigit() else 0
+    pids, pid = set(), os.getppid()
+    for _ in range(32):
+        if pid <= 1 or pid in pids:
+            break
+        pids.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    for line in probe_output("ss", "-Htnp", "state", "established").splitlines():
+        fields = line.split()
+        if len(fields) > 4 and "sshd" in line and any(f"pid={item}," in line for item in pids):
+            local, _, port = fields[-3].rpartition(":")
+            return public(local), int(port) if port.isdigit() else 0
+    return "", 0
+
+
+def authorized_keys_path(user):
+    import pwd
+    home = pwd.getpwnam(user).pw_dir
+    spec = ".ssh/authorized_keys"
+    for line in probe_output("sshd", "-T").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "authorizedkeysfile" and value.split():
+            spec = value.split()[0]
+            break
+    path = spec.replace("%h", home).replace("%u", user).replace("%%", "%")
+    return Path(path if path.startswith("/") else os.path.join(home, path))
+
+
+def pubkey_auth_enabled():
+    for line in probe_output("sshd", "-T").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "pubkeyauthentication":
+            return value.strip().casefold() == "yes"
+    return True
+
+
+def public_key_blob(line):
+    fields = line.split()
+    for index, field in enumerate(fields[:-1]):
+        if field.startswith(("ssh-", "ecdsa-", "sk-")):
+            return fields[index + 1]
+    return ""
+
+
+def ssh_fingerprint(public_line):
+    import base64
+    import hashlib
+    try:
+        blob = base64.b64decode(public_key_blob(public_line) + "==")
+    except ValueError:
+        return ""
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def generate_ssh_key(path, comment, with_passphrase):
+    if not shutil.which("ssh-keygen"):
+        raise ValueError("не найден ssh-keygen. Установи пакет openssh-client")
+    command = ["ssh-keygen", "-q", "-t", "ed25519", "-C", comment, "-f", str(path)]
+    if not with_passphrase:
+        command += ["-N", ""]
+    if subprocess.run(command, check=False).returncode or not path.exists():
+        raise ValueError("ssh-keygen не создал ключ")
+
+
+def add_authorized_key(user, public_line):
+    import pwd
+    path = authorized_keys_path(user)
+    entry = pwd.getpwnam(user)
+    blob = public_key_blob(public_line)
+    if not path.parent.exists():
+        path.parent.mkdir(mode=0o700, parents=True)
+        os.chown(path.parent, entry.pw_uid, entry.pw_gid)
+    current = path.read_text(encoding="utf-8") if path.exists() else ""
+    if any(public_key_blob(line) == blob for line in current.splitlines()):
+        return path
+    created = not path.exists()
+    with path.open("a", encoding="utf-8") as handle:
+        if current and not current.endswith("\n"):
+            handle.write("\n")
+        handle.write(public_line.strip() + "\n")
+    if created:
+        os.chmod(path, 0o600)
+        os.chown(path, entry.pw_uid, entry.pw_gid)
+    return path
+
+
+def remove_authorized_key(user, public_line):
+    try:
+        path = authorized_keys_path(user)
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except (OSError, KeyError):
+        return
+    blob = public_key_blob(public_line)
+    kept = [line for line in lines if public_key_blob(line) != blob]
+    if len(kept) != len(lines):
+        with path.open("w", encoding="utf-8") as handle:  # на месте: владелец и права файла не меняются
+            handle.write("".join(kept))
+
+
+def wipe_ssh_private(item):
+    path = Path(item.get("file", ""))
+    if path.is_file():
+        if shutil.which("shred"):
+            subprocess.run(["shred", "-u", str(path)], check=False, capture_output=True)
+        path.unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        path.parent.rmdir()
+
+
+def ssh_login_log(since):
+    out = probe_output("journalctl", "--no-pager", "-o", "cat", "--since", f"@{int(since)}",
+                       "-t", "sshd", "-t", "sshd-session", "-t", "ssh", timeout=15)
+    if out:
+        return out
+    for name in ("/var/log/auth.log", "/var/log/secure"):
+        try:
+            return Path(name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    return ""
+
+
+def ssh_key_used(fingerprint, since):
+    return any("Accepted publickey" in line and fingerprint in line for line in ssh_login_log(since).splitlines())
+
+
+def schedule_ssh_sweep():
+    subprocess.run(["systemd-run", "--quiet", "--collect", "--unit=" + SSH_SWEEP_UNIT, "--on-active=2min",
+                    "--on-unit-active=2min", str(MENU_FILE), "--ssh-key-sweep"],
+                   check=False, capture_output=True)
+
+
+def sweep_ssh_keys():
+    # Приватная часть удаляется после первого входа этим ключом или через сутки, если вход не состоялся.
+    import time
+    if not SSH_KEYS_FILE.exists():
+        return
+    now = time.time()
+    with ssh_keys_locked():
+        items, kept, changed = load_ssh_keys(), [], False
+        for item in items:
+            if item.get("state") == "pending":
+                if ssh_key_used(item.get("fingerprint", ""), item.get("created", now)):
+                    wipe_ssh_private(item)
+                    item["state"], item["used"] = "used", now
+                    changed = True
+                elif now - item.get("created", now) > SSH_KEY_TTL:
+                    wipe_ssh_private(item)
+                    remove_authorized_key(item.get("user", "root"), item.get("pub", ""))
+                    changed = True
+                    continue
+            kept.append(item)
+        if changed:
+            save_ssh_keys(kept)
+    if not any(item.get("state") == "pending" for item in kept):
+        subprocess.run(["systemctl", "stop", SSH_SWEEP_UNIT + ".timer"], check=False, capture_output=True)
+
+
+def scp_hint(item):
+    host, port = ssh_session_endpoint()
+    if not host:
+        host = "IP_ВАШЕГО_СЕРВЕРА"
+    elif ":" in host:
+        host = f"[{host}]"
+    option = f"-P {port} " if port and port != 22 else ""
+    return f"scp {option}{item['user']}@{host}:{item['file']} ."
+
+
+def show_ssh_key(item):
+    try:
+        private = Path(item["file"]).read_text(encoding="utf-8").strip()
+    except OSError:
+        print("Приватная часть этого ключа уже удалена с сервера (вход им выполнен или прошли сутки).")
+        return
+    host, _ = ssh_session_endpoint()
+    print_box("SSH-ключ создан", "\n".join([
+        "Сохраните ключ на своём устройстве. Он нужен только вам.",
+        f"Пользователь: {item['user']}",
+        f"Отпечаток: {item['fingerprint']}",
+        f"Название: {item['comment']}"]))
+    print("\nСпособ 1 (надёжнее). Скопировать файлом")
+    print("  Выполните на своём компьютере (не на сервере):")
+    print("    " + scp_hint(item))
+    if not host:
+        print("  IP_ВАШЕГО_СЕРВЕРА замените на публичный адрес сервера (он есть в панели хостера).")
+    print(f"  В Termius: откройте хост → SFTP → папка {Path(item['file']).parent} → скачайте файл {Path(item['file']).name}.")
+    print("\nСпособ 2. Скопировать текстом")
+    print("  Копируйте всё, что между линиями, включая строки BEGIN и END:")
+    print("  " + "═" * 58)
+    print(private)
+    print("  " + "═" * 58)
+    print("  Termius: Keychain → Новый ключ → вставить → сохранить.")
+    print("  Компьютер: сохраните в файл с названием ключа (подойдёт Блокнот), на Linux и macOS выдайте права: chmod 600 файл.")
+    print("\nПроверка: подключитесь этим ключом. Как только вход пройдёт,")
+    print("скрипт сам удалит приватную часть с сервера. Если вход не состоится,")
+    print("ключ останется здесь ещё сутки, его можно показать снова.")
+    print("Вход по паролю остаётся как был: ключ добавляет ещё один способ входа.")
+
+
+def create_ssh_key():
+    import datetime as dt
+    import pwd
+    import time
+    if not pubkey_auth_enabled():
+        paint(33, "Внимание: в sshd выключен вход по ключам (PubkeyAuthentication no). Ключ создастся, но войти им не получится, пока это не изменить.")
+    default = ssh_key_user()
+    user = input(f"Для какого пользователя создать ключ? Enter — {default}: ").strip() or default
+    try:
+        entry = pwd.getpwnam(user)
+    except KeyError:
+        print(f"Пользователя «{user}» на сервере нет.")
+        return
+    print("Ключ можно защитить парольной фразой: тогда украденный файл без неё бесполезен, но фразу придётся вводить при каждом входе.")
+    with_passphrase = input("Защитить ключ парольной фразой? Введи «да» (Enter — без фразы): ").strip().casefold() == "да"
+    now = dt.datetime.now()
+    directory = Path(entry.pw_dir) / ".fw-key"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    os.chown(directory, entry.pw_uid, entry.pw_gid)
+    stamp = now.strftime("%Y%m%d-%H%M")
+    path, number = directory / f"fw-key-{stamp}.pem", 1
+    while path.exists() or Path(str(path) + ".pub").exists():
+        number += 1
+        path = directory / f"fw-key-{stamp}-{number}.pem"
+    comment = "fw-menu " + now.strftime("%Y-%m-%d")
+    generate_ssh_key(path, comment, with_passphrase)
+    public_path = Path(str(path) + ".pub")
+    public_line = public_path.read_text(encoding="utf-8").strip()
+    public_path.unlink(missing_ok=True)
+    os.chmod(path, 0o600)
+    os.chown(path, entry.pw_uid, entry.pw_gid)
+    add_authorized_key(user, public_line)
+    item = {"id": stamp if number == 1 else f"{stamp}-{number}", "user": user, "file": str(path), "pub": public_line,
+            "fingerprint": ssh_fingerprint(public_line), "comment": comment, "created": time.time(), "state": "pending"}
+    with ssh_keys_locked():
+        save_ssh_keys(load_ssh_keys() + [item])
+    schedule_ssh_sweep()
+    show_ssh_key(item)
+
+
+def pending_ssh_keys():
+    sweep_ssh_keys()
+    return [item for item in load_ssh_keys() if item.get("state") == "pending" and Path(item.get("file", "")).is_file()]
+
+
+def show_ssh_key_again():
+    items = pending_ssh_keys()
+    if not items:
+        print("Нет ключей, которые ещё ждут первого входа. Либо ключей нет, либо вход ими уже был (приватная часть удалена).")
+        return
+    item = items[0]
+    if len(items) > 1:
+        for number, entry in enumerate(items, 1):
+            print(f"  {number}. {entry['comment']}, пользователь {entry['user']}")
+        answer = input("Номер ключа (Enter — отмена): ").strip()
+        if not answer.isdigit() or not 1 <= int(answer) <= len(items):
+            return
+        item = items[int(answer) - 1]
+    show_ssh_key(item)
+
+
+def ssh_key_state_text(item):
+    import time
+    if item.get("state") == "used":
+        return "используется, вход этим ключом был"
+    left = max(0, int(item.get("created", 0) + SSH_KEY_TTL - time.time()))
+    return f"ждёт первого входа, приватная часть на сервере ещё {left // 3600} ч {left % 3600 // 60} мин"
+
+
+def show_ssh_keys():
+    sweep_ssh_keys()
+    items = load_ssh_keys()
+    if not items:
+        print("Ключей, созданных через fw-menu, нет.")
+        return
+    for number, item in enumerate(items, 1):
+        print(f"{number}. {item['comment']}, пользователь {item['user']}")
+        print(f"   {item['fingerprint']}")
+        print(f"   {ssh_key_state_text(item)}")
+
+
+def remove_ssh_key():
+    sweep_ssh_keys()
+    items = load_ssh_keys()
+    if not items:
+        print("Ключей, созданных через fw-menu, нет.")
+        return
+    for number, item in enumerate(items, 1):
+        print(f"  {number}. {item['comment']}, пользователь {item['user']}, {item['fingerprint']}")
+    answer = input("Номер ключа для удаления (Enter — отмена): ").strip()
+    if not answer.isdigit() or not 1 <= int(answer) <= len(items):
+        return
+    item = items[int(answer) - 1]
+    if not confirm_yes(f"Удалить ключ «{item['comment']}» пользователя {item['user']}? Устройство с этим ключом больше не войдёт. Введи «да»: "):
+        print("Отменено.")
+        return
+    with ssh_keys_locked():
+        current = [entry for entry in load_ssh_keys() if entry.get("fingerprint") != item["fingerprint"]]
+        remove_authorized_key(item["user"], item["pub"])
+        wipe_ssh_private(item)
+        save_ssh_keys(current)
+    print("Ключ удалён с сервера. Вход по паролю и другими ключами не затронут.")
+
+
+'''
+menu = replace_once(menu, 'def apply_rules():\n', SSH_KEY_CODE + 'def apply_rules():\n', "SSH-ключ: код")
+menu = replace_once(menu, '''            ("Ограничить частоту новых SSH-подключений", configure_ssh_limit),
+''', '''            ("Ограничить частоту новых SSH-подключений", configure_ssh_limit),
+            ("SSH-ключ для входа (создать, показать, удалить)", (
+                ("Создать SSH-ключ для входа", create_ssh_key),
+                ("Показать созданный ключ ещё раз", show_ssh_key_again),
+                ("Показать ключи, созданные через fw-menu", boxed("SSH-ключи", show_ssh_keys)),
+                ("Удалить ключ", remove_ssh_key),
+            )),
+''', "SSH-ключ: пункт меню")
+menu = replace_once(menu, '    if sys.argv[1:] == ["--check-proxy"]:\n',
+    '    if sys.argv[1:] == ["--ssh-key-sweep"]:\n        sweep_ssh_keys()\n        return\n'
+    '    if sys.argv[1:] == ["--check-proxy"]:\n', "SSH-ключ: команда проверки")
+menu = replace_once(menu, '    entries = (\n        ("Статус и наблюдение", (\n',
+    '    sweep_ssh_keys()\n    entries = (\n        ("Статус и наблюдение", (\n', "SSH-ключ: проверка при запуске меню")
+
 # ---------------------------------------------------------------- сборка
 new_text = text
 for key, replacement in (("menu", menu), ("update", upd)):

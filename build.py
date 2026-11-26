@@ -1380,7 +1380,11 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.8.1"
+# Номер версии берётся из верхнего заголовка «## X.Y.Z» в CHANGELOG.md: он записан в одном месте.
+_top_version = re.search(r"^##\s+(\d+\.\d+\.\d+)\s*$", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"), re.M)
+if not _top_version:
+    sys.exit("в CHANGELOG.md нет заголовка вида «## 1.2.3»")
+VERSION = _top_version.group(1)
 VERSIONS_CODE = r'''import hashlib
 
 FW_VERSION = "@@VERSION@@"

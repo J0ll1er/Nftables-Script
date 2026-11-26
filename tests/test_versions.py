@@ -1,4 +1,5 @@
 """Проверки пункта меню «Версии и обновление скрипта» без сети и без установки на систему."""
+import re
 import builtins
 import contextlib
 import importlib.machinery
@@ -79,6 +80,14 @@ class Versions(unittest.TestCase):
         self.assertTrue(releases)
         installer = (ROOT / "fw-install.sh").read_text(encoding="utf-8")
         self.assertIn(f"FW_VERSION='{releases[0]['version']}'", installer)
+
+    def test_build_takes_version_from_changelog(self):
+        build = (ROOT / "build.py").read_text(encoding="utf-8")
+        self.assertNotRegex(build, r'(?m)^VERSION = "')
+        top = re.search(r"(?m)^##\s+(\d+\.\d+\.\d+)\s*$", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")).group(1)
+        for name in ("fw-install.sh", "build/fw-menu"):
+            found = re.search(r"FW_VERSION[ =]+['\"](\d+\.\d+\.\d+)['\"]", (ROOT / name).read_text(encoding="utf-8"))
+            self.assertEqual(found.group(1), top, name)
 
     def test_shows_newer_versions_and_fixes(self):
         output, _ = self.call(self.menu.show_versions)

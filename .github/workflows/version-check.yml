@@ -32,13 +32,14 @@ jobs:
           if git diff --quiet "$base" HEAD -- build.py orig-fw-install.sh fw-install.sh; then
             exit 0
           fi
-          old=$(git show "$base:build.py" | sed -n 's/^VERSION = "\(.*\)"/\1/p' | head -1)
-          new=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' build.py | head -1)
-          if [ "$old" = "$new" ]; then
-            echo "::error::Установщик изменён, но VERSION в build.py остался $new. Подними версию и добавь раздел в CHANGELOG.md."
+          top_version() { grep -m1 -E '^## [0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$' | sed 's/^## //; s/[[:space:]]*$//'; }
+          old=$(git show "$base:CHANGELOG.md" | top_version)
+          new=$(top_version < CHANGELOG.md)
+          if [ -z "$new" ]; then
+            echo "::error::В CHANGELOG.md нет заголовка вида ## 1.2.3."
             exit 1
           fi
-          if ! grep -q "^## $new\$" CHANGELOG.md; then
-            echo "::error::В CHANGELOG.md нет раздела ## $new."
+          if [ "$old" = "$new" ]; then
+            echo "::error::Установщик изменён, но верхняя версия в CHANGELOG.md осталась $new. Добавьте раздел с новой версией."
             exit 1
           fi

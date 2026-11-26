@@ -75,10 +75,10 @@ class Password(unittest.TestCase):
         self.assertIn("Тест-хостинг", text)
 
     def test_short_owner_keeps_country_and_as(self):
-        text = self.menu.short_owner("DMZHOST TECHOFF SRV LIMITED LONG NAME, AD, AS47890", 40)
-        self.assertTrue(text.endswith(", AD, AS47890"))
+        text = self.menu.short_owner("EXAMPLE HOSTING SERVICES LIMITED LONG NAME, AD, AS64500", 40)
+        self.assertTrue(text.endswith(", AD, AS64500"))
         self.assertLessEqual(len(text), 40)
-        self.assertEqual(self.menu.short_owner("bshield, TR, AS154383", 40), "bshield, TR, AS154383")
+        self.assertEqual(self.menu.short_owner("examplenet, TR, AS64501", 40), "examplenet, TR, AS64501")
 
     def test_owner_falls_back_to_registry_without_asn(self):
         self.menu.DIRECTORY = Path(self.tmp.name)
@@ -149,15 +149,15 @@ class Password(unittest.TestCase):
         self.assertEqual(self.menu.ssh_established_clients(), {("100.64.0.1", "5555"), ("5f00::1", "6666")})
 
     def test_owner_name_has_no_url_decoration(self):
-        self.assertEqual(self.menu.tidy_owner("https://dmzhost.co, NL, AS47890"), "dmzhost.co, NL, AS47890")
+        self.assertEqual(self.menu.tidy_owner("https://example-host.test, NL, AS64500"), "example-host.test, NL, AS64500")
         self.assertEqual(self.menu.tidy_owner("http://www.example.com/, DE, AS1"), "example.com, DE, AS1")
-        self.assertEqual(self.menu.tidy_owner("TM ONE Cloud, MY, AS18206"), "TM ONE Cloud, MY, AS18206")
+        self.assertEqual(self.menu.tidy_owner("Example Cloud, MY, AS64502"), "Example Cloud, MY, AS64502")
 
     def test_cached_owner_is_tidied_on_read(self):
         self.menu.DIRECTORY = Path(self.tmp.name)
         (Path(self.tmp.name) / self.menu.OWNER_CACHE_FILE).write_text(
-            '{"5f00::1": ["https://dmzhost.co, NL, AS47890", %d]}' % int(time.time()))
-        self.assertEqual(self.menu.lookup_owner("5f00::1"), "dmzhost.co, NL, AS47890")
+            '{"5f00::1": ["https://example-host.test, NL, AS64500", %d]}' % int(time.time()))
+        self.assertEqual(self.menu.lookup_owner("5f00::1"), "example-host.test, NL, AS64500")
 
     def test_restore_removes_file(self):
         self.menu.SSH_NOPASS_FILE.write_text("x")

@@ -2571,6 +2571,37 @@ def parse_whois_owner(text):
     return name, fields.get("country", "")
 
 
+def fetch_rdap(address):
+    """Запись о блоке адресов через RDAP (rdap.org сам отправляет запрос нужному региональному регистратору)."""
+    url = f"https://rdap.org/ip/{address}"
+    try:
+        result = subprocess.run(["curl", "-fsS", "-L", "--max-redirs", "3", "--proto", "=https", "--proto-redir", "=https",
+                                 "--connect-timeout", "3", "--max-time", "5", "--max-filesize", str(MAX_OWNER_BYTES),
+                                 "-H", "Accept: application/rdap+json", url],
+                                text=True, capture_output=True, timeout=8, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 and len(result.stdout) <= MAX_OWNER_BYTES else ""
+
+
+def parse_rdap_owner(text):
+    """(название, страна) из ответа RDAP: имя организации из карточки, иначе название блока."""
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return "", ""
+        name = ""
+        for entity in data.get("entities") or []:
+            card = entity.get("vcardArray") or []
+            for field in (card[1] if len(card) > 1 else []):
+                if field and field[0] == "fn" and isinstance(field[3], str):
+                    name = name or clean_text(field[3]).strip()
+        name = name or clean_text(str(data.get("name") or "")).strip()
+        return name, clean_text(str(data.get("country") or "")).strip()
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return "", ""
+
+
 def lookup_owner(address):
     """Владелец адреса по RIPEstat; ответ запоминается на 30 дней. Любой сбой даёт пустую строку."""
     try:
@@ -2594,11 +2625,16 @@ def lookup_owner(address):
         return clean_text(entry[0])
     answer = fetch_ripe(address) or fetch_ripe(address)  # при сбое сети или лимите RIPEstat пробуем ещё раз
     owner = parse_ripe_owner(answer)
+    from_ripe = bool(owner)
     if not owner and answer:
         # сеть не анонсируется (нет номера AS) или RIPEstat не знает адрес: берём название блока у регистратора
         name, country = parse_whois_owner(fetch_whois(address))
         owner = ", ".join(part for part in (name[:OWNER_TEXT_WIDTH], country) if part)
-    elif owner:
+    if not owner:
+        # RIPEstat не помог (молчит или не знает адрес): RDAP — независимый источник со всех регистраторов
+        name, country = parse_rdap_owner(fetch_rdap(address))
+        owner = ", ".join(part for part in (name[:OWNER_TEXT_WIDTH], country) if part)
+    if from_ripe:
         # название из записи блока (регистратор) точнее владельца AS: берём его, если оно есть
         name, country = parse_whois_owner(fetch_whois(address))
         holder, _, asn = owner.rpartition(" ")
@@ -6907,7 +6943,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    'dc249efee80dc878ad65b2b8b9fd25d1f16263da486846eb22e36502c3350c58' "$stage/fw-menu" \
+    '8b02b8cea10d516f24ad2865849b091047799cabcf72f5f59f13f44f4c5fd34f' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

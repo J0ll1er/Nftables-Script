@@ -617,6 +617,7 @@ class Lookup(unittest.TestCase):
             return RIPE_ANSWER
         self.menu.fetch_ripe = fetch
         self.menu.fetch_whois = lambda address: ""
+        self.menu.fetch_rdap = lambda address: ""
 
     def tearDown(self):
         self.tmp.cleanup()

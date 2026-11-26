@@ -93,8 +93,21 @@ class Password(unittest.TestCase):
         calls = []
         self.menu.fetch_ripe = lambda address: calls.append(address) or ""
         self.menu.fetch_whois = lambda address: self.fail("при недоступном RIPEstat whois не нужен")
+        self.menu.fetch_rdap = lambda address: ""
         self.assertEqual(self.menu.lookup_owner("5f00::1"), "")
         self.assertEqual(len(calls), 2)
+
+    def test_rdap_is_used_when_ripestat_is_silent(self):
+        self.menu.DIRECTORY = Path(self.tmp.name)
+        self.menu.fetch_ripe = lambda address: ""
+        self.menu.fetch_whois = lambda address: self.fail("whois не нужен")
+        self.menu.fetch_rdap = lambda address: (
+            '{"name": "NET-1", "country": "US", "entities": [{"vcardArray": ["vcard", [["fn", {}, "text", "Example Hosting LLC"]]]}]}')
+        self.assertEqual(self.menu.lookup_owner("5f00::1"), "Example Hosting LLC, US")
+
+    def test_rdap_garbage_is_empty(self):
+        self.assertEqual(self.menu.parse_rdap_owner("не json"), ("", ""))
+        self.assertEqual(self.menu.parse_rdap_owner("[]"), ("", ""))
 
     def test_restore_removes_file(self):
         self.menu.SSH_NOPASS_FILE.write_text("x")

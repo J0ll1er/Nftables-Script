@@ -118,11 +118,13 @@ class MenuDownloads(unittest.TestCase):
         self.fake_run("x" * (self.menu.MAX_OWNER_BYTES + 1))
         self.assertEqual(self.menu.fetch_ripe("203.0.113.5"), "")
         self.assertEqual(self.menu.fetch_whois("203.0.113.5"), "")
+        self.assertEqual(self.menu.fetch_rdap("203.0.113.5"), "")
 
     def test_owner_request_carries_size_limit(self):
         self.fake_run("{}")
         self.menu.fetch_ripe("203.0.113.5")
         self.menu.fetch_whois("203.0.113.5")
+        self.menu.fetch_rdap("203.0.113.5")
         for command in self.calls:
             self.assertIn("--max-filesize", command)
 

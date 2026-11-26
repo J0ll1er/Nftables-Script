@@ -208,7 +208,8 @@ class Hits(unittest.TestCase):
         self.asked = []
 
         def probe(*command, timeout=4, on_timeout=""):
-            self.asked.append(timeout)
+            if command[0] == "nft":
+                self.asked.append(timeout)
             return on_timeout if command[-1] in slow else outputs.get(command[-1], "")
         self.menu.probe_output = probe
         self.menu.reverse_name = lambda address: ""

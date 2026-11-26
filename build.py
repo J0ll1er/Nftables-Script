@@ -3511,14 +3511,14 @@ menu = replace_once(menu, """def ask_confirmation(timeout):
     if not ready:
         print()
     return bool(ready and sys.stdin.readline().strip().casefold() == "да")
-""", """def ask_confirmation(timeout):
+""", """def ask_yes_within(prompt, again, timeout):
     import select
     import time
     # Читаем напрямую из дескриптора: если ввод пришёл пачкой (вставка, лишний Enter), буфер Python не прячет оставшиеся строки от select.
     fd = sys.stdin.fileno()
     pending = b""
     deadline = time.monotonic() + timeout
-    print(f"Правила работают? Введите «да» за {timeout} с: ", end="", flush=True)
+    print(prompt, end="", flush=True)
     while True:
         while b"\\n" not in pending:
             remaining = deadline - time.monotonic()
@@ -3536,8 +3536,12 @@ menu = replace_once(menu, """def ask_confirmation(timeout):
             return True
         if raw.casefold() in ("нет", "отмена"):
             return False
-        print(explain_unclear_answer(raw, "«да», пока не вышло время; «нет» вернёт прежние правила"))
-        print("Правила работают? Введите «да»: ", end="", flush=True)
+        print(explain_unclear_answer(raw, "«да», пока не вышло время; «нет» отменит"))
+        print(again, end="", flush=True)
+
+
+def ask_confirmation(timeout):
+    return ask_yes_within(f"Правила работают? Введите «да» за {timeout} с: ", "Правила работают? Введите «да»: ", timeout)
 """, "подтверждение применения: повторный вопрос")
 
 # ---------------------------------------------------------------- SSH-ключ для входа (1.9.0)
@@ -3582,20 +3586,15 @@ def ssh_key_user():
     return "root"
 
 
-def ssh_session_endpoint():
-    # (адрес, порт), к которым ты подключился по SSH. Адрес "" — не определён или не публичный (тогда его вводит человек).
-    def public(value):
-        try:
-            ip = ipaddress.ip_address(value.strip("[]").partition("%")[0])
-        except ValueError:
-            return ""
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
-            return ""
-        return str(ip)
+def ssh_session_sockets():
+    # ((адрес_сервера, порт_сервера), (адрес_клиента, порт_клиента)) текущего SSH-подключения; None — определить не удалось.
+    def split(value):
+        host, _, port = value.rpartition(":")
+        return host.strip("[]").partition("%")[0], int(port) if port.isdigit() else 0
 
     parts = os.environ.get("SSH_CONNECTION", "").split()
-    if len(parts) == 4:
-        return public(parts[2]), int(parts[3]) if parts[3].isdigit() else 0
+    if len(parts) == 4 and parts[1].isdigit() and parts[3].isdigit():
+        return (parts[2], int(parts[3])), (parts[0], int(parts[1]))
     pids, pid = set(), os.getppid()
     for _ in range(32):
         if pid <= 1 or pid in pids:
@@ -3608,9 +3607,23 @@ def ssh_session_endpoint():
     for line in probe_output("ss", "-Htnp", "state", "established").splitlines():
         fields = line.split()
         if len(fields) > 4 and "sshd" in line and any(f"pid={item}," in line for item in pids):
-            local, _, port = fields[-3].rpartition(":")
-            return public(local), int(port) if port.isdigit() else 0
-    return "", 0
+            return split(fields[-3]), split(fields[-2])
+    return None
+
+
+def ssh_session_endpoint():
+    # (адрес, порт), к которым ты подключился по SSH. Адрес "" — не определён или не публичный (тогда его вводит человек).
+    sockets = ssh_session_sockets()
+    if not sockets:
+        return "", 0
+    (host, port), _ = sockets
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return "", port
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+        return "", port
+    return str(ip), port
 
 
 def authorized_keys_path(user):
@@ -3919,6 +3932,264 @@ menu = replace_once(menu, '    if sys.argv[1:] == ["--check-proxy"]:\n',
     '    if sys.argv[1:] == ["--check-proxy"]:\n', "SSH-ключ: команда проверки")
 menu = replace_once(menu, '    entries = (\n        ("Статус и наблюдение", (\n',
     '    sweep_ssh_keys()\n    entries = (\n        ("Статус и наблюдение", (\n', "SSH-ключ: проверка при запуске меню")
+
+# ---------------------------------------------------------------- вход по паролю: выключить и вернуть, перебор на SSH (1.9.0)
+SSH_PASSWORD_CODE = r'''SSH_NOPASS_FILE = Path("/etc/ssh/sshd_config.d/10-fw-menu-keys-only.conf")
+SSH_NOPASS_UNIT = "fw-ssh-password-rollback"
+SSH_NOPASS_WINDOW = 120
+SSH_CONFIG_MAIN = Path("/etc/ssh/sshd_config")
+SSH_ATTEMPT_PATTERNS = (
+    re.compile(r"Invalid user (\S+) from (\S+) port (\d+)"),
+    re.compile(r"Failed \S+ for (?:invalid user )?(\S+) from (\S+) port (\d+)"),
+    re.compile(r"(?:Connection closed by|Connection reset by|Disconnected from) (?:invalid|authenticating) user (\S+) (\S+) port (\d+)"),
+    re.compile(r"maximum authentication attempts exceeded for (?:invalid user )?(\S+) from (\S+) port (\d+)"),
+)
+
+
+def sshd_settings():
+    result = {}
+    for line in probe_output("sshd", "-T").splitlines():
+        key, _, value = line.partition(" ")
+        result.setdefault(key.casefold(), value.strip().casefold())
+    return result
+
+
+def password_login_open():
+    # Вход по паролю возможен, если включён любой из двух способов: обычный пароль или ввод через PAM.
+    settings = sshd_settings()
+    return settings.get("passwordauthentication", "yes") != "no" or settings.get("kbdinteractiveauthentication", "yes") != "no"
+
+
+def ssh_config_files():
+    files = [SSH_CONFIG_MAIN]
+    drop_in = SSH_CONFIG_MAIN.parent / "sshd_config.d"
+    if drop_in.is_dir():
+        files += sorted(drop_in.glob("*.conf"))
+    return files
+
+
+def ssh_config_hits(pattern):
+    found = []
+    for path in ssh_config_files():
+        for line in read_lines(path):
+            text = line.strip()
+            if text and not text.startswith("#") and re.match(pattern, text, re.I):
+                found.append(f"{path}: {text}")
+    return found
+
+
+def current_session_used_key():
+    # True — это подключение прошло по ключу; False — иначе; None — подключение определить не удалось.
+    import time
+    sockets = ssh_session_sockets()
+    if not sockets:
+        return None
+    _, (address, port) = sockets
+    needle = f"from {address} port {port} "
+    log = ssh_login_log(time.time() - 30 * 24 * 3600)
+    return any("Accepted publickey" in line and needle in line for line in log.splitlines())
+
+
+def reload_sshd():
+    for unit in ("ssh", "sshd"):
+        result = subprocess.run(["systemctl", "reload", unit], check=False, capture_output=True)
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def sshd_config_valid():
+    return subprocess.run(["sshd", "-t"], check=False, capture_output=True).returncode == 0
+
+
+def write_nopass_file(keyword):
+    SSH_NOPASS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SSH_NOPASS_FILE.write_text("# Создан fw-menu: вход только по ключам. Удаляется пунктом «Вернуть вход по паролю».\n"
+                               f"PasswordAuthentication no\n{keyword} no\n", encoding="utf-8")
+    os.chmod(SSH_NOPASS_FILE, 0o644)
+
+
+def stop_nopass_timer():
+    subprocess.run(["systemctl", "stop", SSH_NOPASS_UNIT + ".timer"], check=False, capture_output=True)
+
+
+def restore_password_login(announce=True):
+    existed = SSH_NOPASS_FILE.exists()
+    SSH_NOPASS_FILE.unlink(missing_ok=True)
+    reloaded = True
+    if existed:
+        reloaded = sshd_config_valid() and reload_sshd()
+    stop_nopass_timer()
+    if announce:
+        if not existed:
+            print("Отдельной настройки fw-menu нет: вход по паролю fw-menu не менял.")
+        elif reloaded:
+            print("Вход по паролю возвращён.")
+        else:
+            print("Файл настройки удалён, но sshd перезагрузить не удалось: выполните systemctl reload ssh.")
+    return reloaded
+
+
+def disable_password_login():
+    if not password_login_open():
+        print("Вход по паролю уже выключен.")
+        return
+    used = current_session_used_key()
+    if used is None:
+        print(textwrap.fill("Не удалось определить текущее SSH-подключение (возможно, вы в консоли хостера). "
+                            "Зайдите на сервер по SSH по ключу и повторите.", width=92))
+        return
+    if not used:
+        print(textwrap.fill("Это подключение прошло не по ключу. Если отключить пароль сейчас, вход потеряется, "
+                            "если ключ не работает. Зайдите на сервер по ключу (например, с -i файл_ключа) и повторите отсюда.", width=92))
+        return
+    if not any(re.match(r"include\s+.*sshd_config\.d", line.strip(), re.I) for line in read_lines(SSH_CONFIG_MAIN)):
+        print(textwrap.fill("В /etc/ssh/sshd_config нет строки Include для sshd_config.d, поэтому отдельный файл настройки не подхватится. "
+                            "Отключите вход по паролю вручную (PasswordAuthentication no в sshd_config).", width=92))
+        return
+    matches = ssh_config_hits(r"match\s")
+    if matches:
+        paint(33, "Внимание: в настройках sshd есть блоки Match (для отдельных пользователей или адресов). Они могут вести себя иначе:")
+        for line in matches:
+            print("  " + line)
+    print(textwrap.fill("Вход по паролю закроется для всех пользователей этого сервера и для всех устройств и скриптов, "
+                        "которые заходят паролем. Консоль хостера продолжит работать. Сейчас вы вошли по ключу, он останется рабочим.", width=92))
+    if not confirm_yes("Отключить вход по паролю? Введи «да»: "):
+        print("Отменено.")
+        return
+    for keyword in ("KbdInteractiveAuthentication", "ChallengeResponseAuthentication"):
+        write_nopass_file(keyword)
+        if sshd_config_valid():
+            break
+    else:
+        SSH_NOPASS_FILE.unlink(missing_ok=True)
+        print("sshd не принял новую настройку, ничего не изменено.")
+        return
+    subprocess.run(["systemd-run", "--quiet", "--collect", "--unit=" + SSH_NOPASS_UNIT,
+                    f"--on-active={SSH_NOPASS_WINDOW + 30}s", str(MENU_FILE), "--ssh-password-restore"],
+                   check=False, capture_output=True)
+    if not reload_sshd():
+        restore_password_login(announce=False)
+        print("Не удалось перезагрузить sshd, настройка отменена.")
+        return
+    if password_login_open():
+        restore_password_login(announce=False)
+        print("Вход по паролю остаётся включённым: настройку перебивает другой файл. Настройка отменена. Найдено:")
+        for line in ssh_config_hits(r"(passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication)\s+yes"):
+            print("  " + line)
+        return
+    print()
+    print(textwrap.fill("Теперь откройте НОВОЕ окно терминала и зайдите на сервер по ключу. "
+                        "Если не получится, ничего не вводите: настройка сама вернётся.", width=92))
+    if ask_yes_within(f"Зашли по ключу в новом окне? Введите «да» за {SSH_NOPASS_WINDOW} с: ",
+                      "Зашли по ключу в новом окне? Введите «да»: ", SSH_NOPASS_WINDOW):
+        stop_nopass_timer()
+        print("Вход по паролю выключен. Вернуть: fw-menu → 2 → 6 → «Вернуть вход по паролю».")
+    else:
+        print("Подтверждения нет. Возвращаю вход по паролю.")
+        restore_password_login()
+
+
+def enable_password_login():
+    restore_password_login()
+
+
+def ssh_attempts(log):
+    # По журналу sshd: адрес -> {"conns": множество (адрес, порт), "users": {логин: сколько раз}}. Подключение считается один раз.
+    found = {}
+    for line in log.splitlines():
+        for pattern in SSH_ATTEMPT_PATTERNS:
+            match = pattern.search(line)
+            if match:
+                user, address, port = match.groups()
+                entry = found.setdefault(address, {"conns": set(), "users": {}})
+                if port not in entry["conns"]:
+                    entry["conns"].add(port)
+                    entry["users"][user] = entry["users"].get(user, 0) + 1
+                break
+    return found
+
+
+def show_ssh_attempts(say):
+    # Нужен, когда вход только по ключам: пароли подобрать нельзя, но видно, кто пробует. True — блок показан.
+    import time
+    if password_login_open():
+        return False
+    print("\nПеребор на SSH")
+    log = ssh_login_log(time.time() - DAY)
+    if not log:
+        say("Журнал sshd прочитать не удалось (нет journalctl и /var/log/auth.log).")
+        return True
+    found = ssh_attempts(log)
+    if not found:
+        say("Вход по паролю выключен. За последние сутки попыток входа с неверными данными в журнале sshd нет.")
+        return True
+    total = sum(len(entry["conns"]) for entry in found.values())
+    say(f"Вход по паролю выключен, подобрать пароль нельзя. По журналу sshd за сутки: подключений с попыткой входа: {total}, "
+        f"с разных адресов: {len(found)}. Самые активные (подключений, какие логины пробовали):")
+    for address, entry in sorted(found.items(), key=lambda item: (-len(item[1]["conns"]), item[0]))[:10]:
+        users = ", ".join(user for user, _count in sorted(entry["users"].items(), key=lambda item: (-item[1], item[0]))[:3])
+        print(f"  {address:<39} {len(entry['conns']):>5}  {users}")
+    return True
+
+
+'''
+menu = replace_once(menu, 'def apply_rules():\n', SSH_PASSWORD_CODE + 'def apply_rules():\n', "вход по паролю: код")
+menu = replace_once(menu, '''            ("SSH-ключ для входа (создать, показать, удалить)", (
+                ("Создать SSH-ключ для входа", create_ssh_key),
+                ("Показать созданный ключ ещё раз", show_ssh_key_again),
+                ("Показать ключи, созданные через fw-menu", boxed("SSH-ключи", show_ssh_keys)),
+                ("Удалить ключ", remove_ssh_key),
+            )),
+''', '''            ("SSH-ключ и вход по паролю", (
+                ("Создать SSH-ключ для входа", create_ssh_key),
+                ("Показать созданный ключ ещё раз", show_ssh_key_again),
+                ("Показать ключи и состояние входа по паролю", boxed("SSH-ключи", show_ssh_keys)),
+                ("Удалить ключ", remove_ssh_key),
+                ("Отключить вход по паролю (только по ключу)", disable_password_login),
+                ("Вернуть вход по паролю", enable_password_login),
+            )),
+''', "вход по паролю: меню")
+menu = replace_once(menu, '''def show_ssh_keys():
+    sweep_ssh_keys()
+    items = load_ssh_keys()
+    if not items:
+''', '''def show_ssh_keys():
+    sweep_ssh_keys()
+    print("Вход по паролю: " + ("включён" if password_login_open() else "выключен, вход только по ключам"))
+    items = load_ssh_keys()
+    if not items:
+''', "вход по паролю: статус")
+menu = replace_once(menu, '    if sys.argv[1:] == ["--ssh-key-sweep"]:\n',
+    '    if sys.argv[1:] == ["--ssh-password-restore"]:\n        restore_password_login(announce=False)\n        return\n'
+    '    if sys.argv[1:] == ["--ssh-key-sweep"]:\n', "вход по паролю: команда отката")
+# «Кто стучится»: блок про перебор на SSH
+menu = replace_once(menu, '''    if not seen and slow:
+        return
+''', '''    if not seen and slow:
+        show_ssh_attempts(say)
+        return
+''', "кто стучится: ssh при медленном nft")
+menu = replace_once(menu, '''        say("Примените правила заново: «Проверить и применить правила» → «Применить правила и включить таймер».")
+        return
+''', '''        say("Примените правила заново: «Проверить и применить правила» → «Применить правила и включить таймер».")
+        show_ssh_attempts(say)
+        return
+''', "кто стучится: ssh без статистики")
+menu = replace_once(menu, '''    print("\\nЧего здесь нет")
+    if ssh_stats:
+''', '''    attempts_shown = show_ssh_attempts(say)
+    print("\\nЧего здесь нет")
+    if attempts_shown:
+        say("Попытки входа по SSH взяты из журнала sshd (блок «Перебор на SSH»), а не из файрвола: порт SSH он не фильтрует по странам.")
+    if ssh_stats:
+''', "кто стучится: блок SSH")
+menu = replace_once(menu, '''    else:
+        say("Попытки входа по SSH сюда не попадают: порт SSH файрвол не фильтрует (смотрите журнал sshd). "''',
+'''    elif not attempts_shown:
+        say("Попытки входа по SSH сюда не попадают: порт SSH файрвол не фильтрует (смотрите журнал sshd). "''', "кто стучится: подпись")
+menu = replace_once(menu, 'HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Превысили лимит SSH", "Чего здесь нет")',
+                    'HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Превысили лимит SSH", "Перебор на SSH", "Чего здесь нет")', "кто стучится: заголовок")
 
 # ---------------------------------------------------------------- сборка
 new_text = text

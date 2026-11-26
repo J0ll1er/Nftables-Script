@@ -5,6 +5,7 @@ import importlib.util
 import io
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 
@@ -146,6 +147,17 @@ class Password(unittest.TestCase):
     def test_established_clients_parse_v4_and_v6(self):
         self.menu.probe_output = lambda *c, **k: "0 0 100.64.0.2:22 100.64.0.1:5555\n0 0 [5f00::2]:22 [5f00::1]:6666\n"
         self.assertEqual(self.menu.ssh_established_clients(), {("100.64.0.1", "5555"), ("5f00::1", "6666")})
+
+    def test_owner_name_has_no_url_decoration(self):
+        self.assertEqual(self.menu.tidy_owner("https://dmzhost.co, NL, AS47890"), "dmzhost.co, NL, AS47890")
+        self.assertEqual(self.menu.tidy_owner("http://www.example.com/, DE, AS1"), "example.com, DE, AS1")
+        self.assertEqual(self.menu.tidy_owner("TM ONE Cloud, MY, AS18206"), "TM ONE Cloud, MY, AS18206")
+
+    def test_cached_owner_is_tidied_on_read(self):
+        self.menu.DIRECTORY = Path(self.tmp.name)
+        (Path(self.tmp.name) / self.menu.OWNER_CACHE_FILE).write_text(
+            '{"5f00::1": ["https://dmzhost.co, NL, AS47890", %d]}' % int(time.time()))
+        self.assertEqual(self.menu.lookup_owner("5f00::1"), "dmzhost.co, NL, AS47890")
 
     def test_restore_removes_file(self):
         self.menu.SSH_NOPASS_FILE.write_text("x")

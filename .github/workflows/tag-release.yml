@@ -30,7 +30,7 @@ jobs:
           done
       - name: Тег для верхней версии
         run: |
-          top=$(grep -m1 '^## ' CHANGELOG.md | sed 's/^## //; s/[[:space:]]*$//')
+          top=$(grep -m1 -E '^## [0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$' CHANGELOG.md | sed 's/^## //; s/[[:space:]]*$//')
           [[ "$top" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Не удалось прочитать версию: '$top'"; exit 1; }
           grep -q "FW_VERSION='$top'" fw-install.sh || { echo "fw-install.sh не содержит FW_VERSION='$top'"; exit 1; }
           if git ls-remote --exit-code --tags origin "refs/tags/v$top" >/dev/null 2>&1; then

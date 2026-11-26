@@ -89,6 +89,13 @@ class Versions(unittest.TestCase):
             found = re.search(r"FW_VERSION[ =]+['\"](\d+\.\d+\.\d+)['\"]", (ROOT / name).read_text(encoding="utf-8"))
             self.assertEqual(found.group(1), top, name)
 
+    def test_workflows_read_top_version_the_same_way(self):
+        # Заголовок вроде «## Не выпущено» сверху не должен ни ломать выпуск, ни путать версии между проверками.
+        pattern = "^## [0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$"
+        for name in ("version-check.yml", "tag-release.yml"):
+            text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+            self.assertIn(pattern, text, name)
+
     def test_shows_newer_versions_and_fixes(self):
         output, _ = self.call(self.menu.show_versions)
         self.assertIn("Доступна новая версия: 1.1.0", output)

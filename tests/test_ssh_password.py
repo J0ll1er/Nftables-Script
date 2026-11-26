@@ -115,6 +115,22 @@ class Password(unittest.TestCase):
         self.assertEqual(self.menu.parse_rdap_owner("не json"), ("", ""))
         self.assertEqual(self.menu.parse_rdap_owner("[]"), ("", ""))
 
+    def test_logins_group_by_method_user_address(self):
+        log = ("sshd[1]: Accepted publickey for root from 100.64.0.1 port 1 ssh2: ED25519 SHA256:a\n"
+               "sshd[2]: Accepted publickey for root from 100.64.0.1 port 2 ssh2: ED25519 SHA256:a\n"
+               "sshd[3]: Accepted password for bob from 5f00::1 port 3 ssh2\n")
+        found = self.menu.ssh_logins(log)
+        self.assertEqual(found[("publickey", "root", "100.64.0.1")], 2)
+        self.assertEqual(found[("password", "bob", "5f00::1")], 1)
+
+    def test_logins_screen_names_method_and_address(self):
+        self.menu.ssh_login_log = lambda since: "sshd[3]: Accepted password for bob from 5f00::1 port 3 ssh2\n"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.menu.show_ssh_logins()
+        self.assertIn("по паролю", out.getvalue())
+        self.assertIn("5f00::1", out.getvalue())
+
     def test_restore_removes_file(self):
         self.menu.SSH_NOPASS_FILE.write_text("x")
         self.menu.sshd_config_valid = lambda: True

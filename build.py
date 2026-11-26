@@ -4086,6 +4086,9 @@ def restore_password_login(announce=True):
 def disable_password_login():
     if not password_login_open():
         print("Вход по паролю уже выключен.")
+        sockets = ssh_session_sockets()
+        if sockets:
+            print(f"Текущее подключение: {sockets[1][0]}, порт {sockets[1][1]}.")
         return
     used = current_session_used_key()
     if used is None:
@@ -4178,6 +4181,34 @@ def short_owner(owner, width):
     return (name[:room - 1] + "…" if room > 1 else name[:1] + "…") + ", " + tail
 
 
+SSH_ACCEPTED = re.compile(r"Accepted (\S+) for (\S+) from (\S+) port \d+")
+
+
+def ssh_logins(log):
+    """{(способ, пользователь, адрес): сколько раз} по строкам «Accepted ... for ... from ...» журнала sshd."""
+    found = {}
+    for line in log.splitlines():
+        match = SSH_ACCEPTED.search(line)
+        if match:
+            key = match.groups()
+            found[key] = found.get(key, 0) + 1
+    return found
+
+
+def show_ssh_logins():
+    # Кто заходил на сервер за сутки: способ входа, пользователь, адрес. Видно и вход по паролю, и по ключу.
+    import time
+    log = ssh_login_log(time.time() - DAY)
+    found = ssh_logins(log)
+    print("Успешные входы по SSH за сутки (способ, пользователь, адрес, раз):")
+    if not found:
+        print("  нет или журнал sshd прочитать не удалось")
+        return
+    names = {"publickey": "по ключу", "password": "по паролю", "keyboard-interactive/pam": "по паролю (PAM)"}
+    for (method, user, address), count in sorted(found.items(), key=lambda item: (-item[1], item[0])):
+        print(f"  {names.get(method, method):<16} {user:<12} {address:<39} {count}")
+
+
 def show_ssh_attempts(say):
     # Нужен, когда вход только по ключам: пароли подобрать нельзя, но видно, кто пробует. True — блок показан.
     import time
@@ -4227,6 +4258,8 @@ menu = replace_once(menu, '''def show_ssh_keys():
 ''', '''def show_ssh_keys():
     sweep_ssh_keys()
     print("Вход по паролю: " + ("включён" if password_login_open() else "выключен, вход только по ключам"))
+    show_ssh_logins()
+    print()
     items = load_ssh_keys()
     if not items:
 ''', "вход по паролю: статус")

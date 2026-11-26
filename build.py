@@ -935,6 +935,11 @@ def clean_text(value):
     return "".join(char for char in text if unicodedata.category(char) not in ("Cc", "Cf"))
 
 
+def tidy_owner(owner):
+    # Название владельца без ссылочной обвязки: «https://www.example.co/» превращается в «example.co».
+    return re.sub(r"\bhttps?://(?:www\.)?", "", owner, flags=re.I).replace("/,", ",").rstrip("/ ")
+
+
 def box_cells(raw):
     # Строка в виде списка (символ, цвет). Цвет хранится как накопленные коды ANSI.
     # Из остального текста убираются любые другие управляющие последовательности: цвет — единственное, что пропускаем.
@@ -2791,7 +2796,7 @@ def lookup_owner(address):
     entry = cache.get(address)
     if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], int) \
             and now - entry[1] < OWNER_CACHE_DAYS * 86400 and isinstance(entry[0], str):
-        return clean_text(entry[0])
+        return tidy_owner(clean_text(entry[0]))
     answer = fetch_ripe(address) or fetch_ripe(address)  # при сбое сети или лимите RIPEstat пробуем ещё раз
     owner = parse_ripe_owner(answer)
     from_ripe = bool(owner)
@@ -2824,6 +2829,7 @@ def lookup_owner(address):
                 cache = loaded if isinstance(loaded, dict) else cache
             except (OSError, ValueError):
                 pass
+            owner = tidy_owner(owner)
             cache[address] = [owner, now]
             fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list)
                            and len(item[1]) == 2 and isinstance(item[1][1], int) else 0)[:OWNER_CACHE_LIMIT]
@@ -2831,7 +2837,7 @@ def lookup_owner(address):
                 write_text_atomic(path, json.dumps(dict(fresh), ensure_ascii=False))
             except OSError:
                 pass
-    return owner
+    return tidy_owner(owner)
 
 
 def screen_columns():

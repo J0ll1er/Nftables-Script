@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.9.0'
+FW_VERSION='1.9.1'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -2142,6 +2142,11 @@ def clean_text(value):
     return "".join(char for char in text if unicodedata.category(char) not in ("Cc", "Cf"))
 
 
+def tidy_owner(owner):
+    # Название владельца без ссылочной обвязки: «https://www.example.co/» превращается в «example.co».
+    return re.sub(r"\bhttps?://(?:www\.)?", "", owner, flags=re.I).replace("/,", ",").rstrip("/ ")
+
+
 def box_cells(raw):
     # Строка в виде списка (символ, цвет). Цвет хранится как накопленные коды ANSI.
     # Из остального текста убираются любые другие управляющие последовательности: цвет — единственное, что пропускаем.
@@ -2624,7 +2629,7 @@ def lookup_owner(address):
     entry = cache.get(address)
     if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], int) \
             and now - entry[1] < OWNER_CACHE_DAYS * 86400 and isinstance(entry[0], str):
-        return clean_text(entry[0])
+        return tidy_owner(clean_text(entry[0]))
     answer = fetch_ripe(address) or fetch_ripe(address)  # при сбое сети или лимите RIPEstat пробуем ещё раз
     owner = parse_ripe_owner(answer)
     from_ripe = bool(owner)
@@ -2657,6 +2662,7 @@ def lookup_owner(address):
                 cache = loaded if isinstance(loaded, dict) else cache
             except (OSError, ValueError):
                 pass
+            owner = tidy_owner(owner)
             cache[address] = [owner, now]
             fresh = sorted(cache.items(), key=lambda item: -item[1][1] if isinstance(item[1], list)
                            and len(item[1]) == 2 and isinstance(item[1][1], int) else 0)[:OWNER_CACHE_LIMIT]
@@ -2664,7 +2670,7 @@ def lookup_owner(address):
                 write_text_atomic(path, json.dumps(dict(fresh), ensure_ascii=False))
             except OSError:
                 pass
-    return owner
+    return tidy_owner(owner)
 
 
 def screen_columns():
@@ -4956,7 +4962,7 @@ def show_error_log():
 
 import hashlib
 
-FW_VERSION = "1.9.0"
+FW_VERSION = "1.9.1"
 FW_REPO = "J0ll1er/Nftables-Script"
 HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -7143,7 +7149,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    '8ef5e7a32eedb38f3616feef274529906ca707fcf332361372161add543ed0f8' "$stage/fw-menu" \
+    'b7ede19904ad23b006ed80fc8c38200c2a00f14ca23942bc836ed5f0b7cd5ba5' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

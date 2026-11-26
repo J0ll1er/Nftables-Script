@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.7.2'
+FW_VERSION='1.8.0'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -165,6 +165,10 @@ for ssh_port in $SSH_PORTS; do
 done
 [[ "$MIN_PREFIX4" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || fail_keep "MIN_PREFIX4 должен быть от 1 до 32"
 [[ "$MIN_PREFIX6" =~ ^([1-9][0-9]?|1[01][0-9]|12[0-8])$ ]] || fail_keep "MIN_PREFIX6 должен быть от 1 до 128"
+# Предельный размер ответа в байтах: геобаза и всё остальное (списки сканеров, ответы по ASN).
+MAX_GEO_BYTES="${MAX_GEO_BYTES:-50000000}"; MAX_LIST_BYTES="${MAX_LIST_BYTES:-20000000}"
+[[ "$MAX_GEO_BYTES" =~ ^[1-9][0-9]{0,11}$ ]] || fail_keep "MAX_GEO_BYTES должен быть числом байт"
+[[ "$MAX_LIST_BYTES" =~ ^[1-9][0-9]{0,11}$ ]] || fail_keep "MAX_LIST_BYTES должен быть числом байт"
 python3 - "$MAX_GROWTH" "$MIN_KEEP" "$MAX_CACHE_DAYS" <<'PY' || fail_keep "неверные лимиты списков"
 import math
 import sys
@@ -413,6 +417,21 @@ except (OSError, AttributeError, KeyError, TypeError, ValueError) as error:
 PY
 }
 
+# dl ПРЕДЕЛ_БАЙТ ФАЙЛ АРГУМЕНТЫ_CURL...: скачивает в файл не больше предела; больше — отказ (код 1).
+dl() {
+  local limit=$1 target=$2 code size
+  shift 2
+  command curl -fs --max-filesize "$limit" "$@" | head -c "$((limit + 1))" > "$target"
+  code=${PIPESTATUS[0]}
+  size=$(wc -c < "$target" 2>/dev/null || echo 0)
+  if [ "$size" -gt "$limit" ]; then
+    rm -f -- "$target"
+    note "WARN: ответ больше предела $limit байт — отброшен"
+    return 1
+  fi
+  return "$code"
+}
+
 # fetch_asn ASN НАЗНАЧЕНИЕ
 # Сначала RIPEstat, затем ежедневный снимок ipverse (обычные файлы на GitHub).
 # Код 0 — ответ получен (пустой файл значит, что у ASN нет анонсов),
@@ -423,7 +442,7 @@ fetch_asn() {
   export FW_WIDE_LABEL="$asn"
   # Если RIPEstat не ответил, остальные ASN этого запуска сразу идут в запасной источник.
   if [ "$RIPE_DOWN" = 0 ]; then
-    if curl -fs --proto '=https' --connect-timeout 4 --max-time 10 --retry 1 --retry-delay 1 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=$asn" > "$TMP/asn.json"; then
+    if dl "$MAX_LIST_BYTES" "$TMP/asn.json" --proto '=https' --connect-timeout 4 --max-time 10 --retry 1 --retry-delay 1 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=$asn"; then
       if reason=$(asn_prefixes "$asn" "$TMP/asn.json" "$destination" 2>&1); then
         SRC_RIPE=$((SRC_RIPE+1))
         return 0
@@ -438,8 +457,9 @@ fetch_asn() {
   for base in \
     "https://raw.githubusercontent.com/ipverse/as-ip-blocks/master/as/$number" \
     "https://cdn.jsdelivr.net/gh/ipverse/as-ip-blocks@master/as/$number"; do
-    curl -fsL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$base/ipv4-aggregated.txt" > "$TMP/asn_alt" || continue
-    curl -fsL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$base/ipv6-aggregated.txt" >> "$TMP/asn_alt" || continue
+    dl "$MAX_LIST_BYTES" "$TMP/asn_alt" -L --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$base/ipv4-aggregated.txt" || continue
+    dl "$MAX_LIST_BYTES" "$TMP/asn_alt6" -L --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$base/ipv6-aggregated.txt" || continue
+    cat "$TMP/asn_alt6" >> "$TMP/asn_alt"
     if reason=$(normalize_scanners "$TMP/asn_alt" "$destination" "$MIN_PREFIX4" "$MIN_PREFIX6" 2>&1) && [ -s "$destination" ]; then
       SRC_IPVERSE=$((SRC_IPVERSE+1))
       echo "Запасной источник для $asn: ipverse"
@@ -554,7 +574,7 @@ fetch_scanner_file() {
     "https://raw.githubusercontent.com/${spec%%@*}/${spec#*@}" \
     "https://cdn.jsdelivr.net/gh/$spec" \
     "https://fastly.jsdelivr.net/gh/$spec"; do
-    curl -fsL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$url" > "$TMP/one" || continue
+    dl "$MAX_LIST_BYTES" "$TMP/one" -L --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$url" || continue
     if ! reason=$(normalize_scanners "$TMP/one" "$destination" "$MIN_PREFIX4" "$MIN_PREFIX6" 2>&1); then
       note "WARN: ${spec##*/} с ${url#https://} отклонён: $reason"
       continue
@@ -574,7 +594,7 @@ fetch_scanner_file() {
 # Адрес подходит, только если файл скачался, разобрался и список не подозрительно мал.
 geo_ok=0
 for url in "$ZKEEN_URL" $ZKEEN_MIRRORS; do
-  if ! curl -fsL --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 60 -o "$TMP/geo.dat" "$url"; then
+  if ! dl "$MAX_GEO_BYTES" "$TMP/geo.dat" -L --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 60 "$url"; then
     note "WARN: геобаза не скачалась с ${url#https://}"
     continue
   fi
@@ -841,6 +861,17 @@ split "$TMP/api_raw" "$TMP/ap4" "$TMP/ap6"
 if [ -n "$API_PORTS" ] && [ ! -s "$TMP/ap4" ] && [ ! -s "$TMP/ap6" ]; then
   fail_keep "API_PORTS задан, а API_ALLOW пустой — так закрылся бы доступ панели"
 fi
+
+# SSH-порт под геофильтром: туда пускают только Россию и доверенные адреса, и это легко сделать по ошибке.
+ssh_ports_now=$(timeout 5 sshd -T 2>/dev/null | awk '$1=="port" {print $2}')
+[ -n "$ssh_ports_now" ] || ssh_ports_now=$(awk 'tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2}' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
+[ -n "$ssh_ports_now" ] || ssh_ports_now=22
+geo_ports_now=$(printf '%s ' $GEO_PORTS)
+for ssh_port in $ssh_ports_now; do
+  case " $geo_ports_now" in
+    *" $ssh_port "*) note "WARN: порт SSH $ssh_port входит в GEO_PORTS — вход по SSH будет только из России и с доверенных адресов; если так не задумано, уберите порт из GEO_PORTS" ;;
+  esac
+done
 
 # 5. Сборка nft
 set_def() { echo "  set $1 { type $2; flags interval; auto-merge;"; [ -s "$3" ] && echo "    elements = { $(paste -sd, "$3") }"; echo "  }"; }
@@ -1316,10 +1347,12 @@ def parse_asn(value):
 
 def announced_prefixes(asn):
     url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource={asn}"
-    result = subprocess.run(["curl", "-fsS", "--max-time", "30", url],
+    result = subprocess.run(["curl", "-fsS", "--max-time", "30", "--max-filesize", str(MAX_REPLY_BYTES), url],
                             text=True, capture_output=True, check=False)
     if result.returncode:
         raise ValueError(f"RIPEstat не ответил для {asn}: {result.stderr.strip() or 'запрос не прошёл'}")
+    if len(result.stdout) > MAX_REPLY_BYTES:
+        raise ValueError(f"ответ RIPEstat для {asn} больше предела {MAX_REPLY_BYTES} байт")
     try:
         payload = json.loads(result.stdout)
         resource = str(payload["data"]["resource"]).upper().removeprefix("AS")
@@ -2481,11 +2514,12 @@ def fetch_ripe(address):
     """Ответ RIPEstat про адрес (номер AS и владелец); пусто, если сеть не ответила."""
     url = f"https://stat.ripe.net/data/prefix-overview/data.json?resource={address}"
     try:
-        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4", url],
+        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4",
+                                 "--max-filesize", str(MAX_OWNER_BYTES), url],
                                 text=True, capture_output=True, timeout=6, check=False)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return result.stdout if result.returncode == 0 else ""
+    return result.stdout if result.returncode == 0 and len(result.stdout) <= MAX_OWNER_BYTES else ""
 
 
 def parse_ripe_owner(text):
@@ -2504,11 +2538,12 @@ def fetch_whois(address):
     """Запись о блоке адресов у регистратора через RIPEstat; пусто, если сеть не ответила."""
     url = f"https://stat.ripe.net/data/whois/data.json?resource={address}"
     try:
-        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4", url],
+        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4",
+                                 "--max-filesize", str(MAX_OWNER_BYTES), url],
                                 text=True, capture_output=True, timeout=6, check=False)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return result.stdout if result.returncode == 0 else ""
+    return result.stdout if result.returncode == 0 and len(result.stdout) <= MAX_OWNER_BYTES else ""
 
 
 def parse_whois_owner(text):
@@ -4050,11 +4085,13 @@ def show_error_log():
 
 import hashlib
 
-FW_VERSION = "1.7.2"
+FW_VERSION = "1.8.0"
 FW_REPO = "J0ll1er/Nftables-Script"
 HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
+MAX_REPLY_BYTES = 20_000_000  # ответ RIPEstat про ASN
+MAX_OWNER_BYTES = 1_000_000  # ответ RIPEstat про один адрес
 
 
 def version_key(version):
@@ -4070,6 +4107,8 @@ def fetch_text(url, limit=3_000_000):
          "--max-time", "30", "--max-filesize", str(limit), url], capture_output=True, check=False)
     if result.returncode:
         raise OSError(f"не скачалось: {url}")
+    if len(result.stdout) > limit:
+        raise OSError(f"ответ больше предела {limit} байт: {url}")
     return result.stdout.decode("utf-8-sig")
 
 
@@ -6209,8 +6248,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    'e8aee21243616035f71880471d6953f325fc997109e9aaf9a395bca6bf87b2f4' "$stage/update-fw.sh" \
-    'ac0661c3d43a5f3943db2cc21897a8f2db576d2fc272c67045b2007a45334afa' "$stage/fw-menu" \
+    'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
+    'a49f3dad8aa7ec3d2b467c25e4c424d4740a8a3d3c461c8d0370ff72f8fefbb2' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1
@@ -6394,6 +6433,18 @@ geo_ports="${geo_port_list[*]}"
 case " $geo_ports " in
   *" 80 "*) echo 'Внимание: порт 80 под геофильтром сломает продление сертификата Let'\''s Encrypt.' ;;
 esac
+# SSH-порт и геофильтр (установка)
+ssh_found=$(timeout 5 sshd -T 2>/dev/null | awk '$1=="port" {print $2}')
+ssh_conn=${SSH_CONNECTION:-}
+ssh_conn=${ssh_conn##* }
+case "$ssh_conn" in ''|*[!0-9]*) ssh_conn='' ;; esac
+for ssh_port in $(printf '%s
+' $ssh_found $ssh_conn | sort -u); do
+  case " $geo_ports " in
+    *" $ssh_port "*) echo "Внимание: порт SSH $ssh_port входит в геофильтр — вход по SSH будет только из России и с доверенных адресов (адрес этого подключения добавится в доверенные). Если так не задумано, укажите порты без SSH." ;;
+  esac
+done
+# конец проверки SSH-порта
 
 panel_ip=''
 if [ -n "$NODE_PORTS" ]; then

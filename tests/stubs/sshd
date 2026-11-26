@@ -1,0 +1,4 @@
+#!/bin/bash
+# Заглушка sshd -T: порт задаёт STUB_SSH_PORT (по умолчанию 22).
+echo "port ${STUB_SSH_PORT:-22}"
+echo "listenaddress 0.0.0.0"

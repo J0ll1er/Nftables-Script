@@ -388,6 +388,69 @@ upd = replace_once(upd, 'echo "OK: применено"\n',
 upd = upd.replace("curl -fsSL ", "curl -fsL ").replace("curl -fsS ", "curl -fs ")
 upd = upd.replace('note "WARN: из списков сканеров удалено пересечений', 'note "INFO: из списков сканеров удалено пересечений')
 
+# ------------------------------------------------ предел размера загрузок (1.7.0)
+# Всё, что скачивает обновлятор, режется по размеру: --max-filesize ловит большой Content-Length,
+# а head -c обрезает ответ без длины. Больше предела — ответ отбрасывается как недоступный источник.
+upd = replace_once(upd, '[[ "$MIN_PREFIX6" =~ ^([1-9][0-9]?|1[01][0-9]|12[0-8])$ ]] || fail_keep "MIN_PREFIX6 должен быть от 1 до 128"\n',
+    '[[ "$MIN_PREFIX6" =~ ^([1-9][0-9]?|1[01][0-9]|12[0-8])$ ]] || fail_keep "MIN_PREFIX6 должен быть от 1 до 128"\n'
+    '# Предельный размер ответа в байтах: геобаза и всё остальное (списки сканеров, ответы по ASN).\n'
+    'MAX_GEO_BYTES="${MAX_GEO_BYTES:-50000000}"; MAX_LIST_BYTES="${MAX_LIST_BYTES:-20000000}"\n'
+    '[[ "$MAX_GEO_BYTES" =~ ^[1-9][0-9]{0,11}$ ]] || fail_keep "MAX_GEO_BYTES должен быть числом байт"\n'
+    '[[ "$MAX_LIST_BYTES" =~ ^[1-9][0-9]{0,11}$ ]] || fail_keep "MAX_LIST_BYTES должен быть числом байт"\n',
+    "пределы загрузок")
+upd = replace_once(upd, '# fetch_asn ASN НАЗНАЧЕНИЕ\n',
+    '# dl ПРЕДЕЛ_БАЙТ ФАЙЛ АРГУМЕНТЫ_CURL...: скачивает в файл не больше предела; больше — отказ (код 1).\n'
+    'dl() {\n'
+    '  local limit=$1 target=$2 code size\n'
+    '  shift 2\n'
+    '  command curl -fs --max-filesize "$limit" "$@" | head -c "$((limit + 1))" > "$target"\n'
+    '  code=${PIPESTATUS[0]}\n'
+    '  size=$(wc -c < "$target" 2>/dev/null || echo 0)\n'
+    '  if [ "$size" -gt "$limit" ]; then\n'
+    '    rm -f -- "$target"\n'
+    '    echo "WARN: ответ больше предела $limit байт — отброшен" >&2\n'
+    '    return 1\n'
+    '  fi\n'
+    '  return "$code"\n'
+    '}\n\n'
+    '# fetch_asn ASN НАЗНАЧЕНИЕ\n', "функция dl")
+upd = replace_once(upd,
+    """curl -fs --proto '=https' --connect-timeout 4 --max-time 10 --retry 1 --retry-delay 1 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=$asn" > "$TMP/asn.json\"""",
+    """dl "$MAX_LIST_BYTES" "$TMP/asn.json" --proto '=https' --connect-timeout 4 --max-time 10 --retry 1 --retry-delay 1 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=$asn\"""",
+    "лимит RIPEstat")
+upd = replace_once(upd,
+    """    curl -fsL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$base/ipv4-aggregated.txt" > "$TMP/asn_alt" || continue
+    curl -fsL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$base/ipv6-aggregated.txt" >> "$TMP/asn_alt" || continue
+""",
+    """    dl "$MAX_LIST_BYTES" "$TMP/asn_alt" -L --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$base/ipv4-aggregated.txt" || continue
+    dl "$MAX_LIST_BYTES" "$TMP/asn_alt6" -L --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$base/ipv6-aggregated.txt" || continue
+    cat "$TMP/asn_alt6" >> "$TMP/asn_alt"
+""", "лимит ipverse")
+upd = replace_once(upd,
+    """curl -fsL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$url" > "$TMP/one" || continue""",
+    """dl "$MAX_LIST_BYTES" "$TMP/one" -L --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 10 "$url" || continue""",
+    "лимит списков сканеров")
+upd = replace_once(upd,
+    """if ! curl -fsL --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 60 -o "$TMP/geo.dat" "$url"; then""",
+    """if ! dl "$MAX_GEO_BYTES" "$TMP/geo.dat" -L --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 60 "$url"; then""",
+    "лимит геобазы")
+
+# ------------------------------------------------ SSH-порт под геофильтром (1.7.0)
+upd = replace_once(upd, '# 5. Сборка nft\n',
+    '# SSH-порт под геофильтром: туда пускают только Россию и доверенные адреса, и это легко сделать по ошибке.\n'
+    'ssh_ports_now=$(timeout 5 sshd -T 2>/dev/null | awk \'$1=="port" {print $2}\')\n'
+    '[ -n "$ssh_ports_now" ] || ssh_ports_now=$(awk \'tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2}\' '
+    '/etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)\n'
+    '[ -n "$ssh_ports_now" ] || ssh_ports_now=22\n'
+    'geo_ports_now=$(printf \'%s \' $GEO_PORTS)\n'
+    'for ssh_port in $ssh_ports_now; do\n'
+    '  case " $geo_ports_now" in\n'
+    '    *" $ssh_port "*) echo "WARN: порт SSH $ssh_port входит в GEO_PORTS — вход по SSH будет только из России и с доверенных адресов; '
+    'если так не задумано, уберите порт из GEO_PORTS" >&2 ;;\n'
+    '  esac\n'
+    'done\n\n'
+    '# 5. Сборка nft\n', "предупреждение про SSH-порт")
+
 # Слишком широкая сеть: пропускается только она сама, а не весь список; решение — в fw-menu (wide-ok.txt).
 WIDE_LOAD = """approved = set()
 okfile = os.environ.get("FW_WIDE_OK")
@@ -607,6 +670,19 @@ upd = replace_once(
 
 # ----------------------------------------------------------------- fw-menu
 menu = parts["menu"][2]
+# Меню: ответ RIPEstat про ASN тоже ограничен по размеру.
+menu = replace_once(menu, '''    result = subprocess.run(["curl", "-fsS", "--max-time", "30", url],
+                            text=True, capture_output=True, check=False)
+    if result.returncode:
+        raise ValueError(f"RIPEstat не ответил для {asn}: {result.stderr.strip() or 'запрос не прошёл'}")
+''', '''    result = subprocess.run(["curl", "-fsS", "--max-time", "30", "--max-filesize", str(MAX_REPLY_BYTES), url],
+                            text=True, capture_output=True, check=False)
+    if result.returncode:
+        raise ValueError(f"RIPEstat не ответил для {asn}: {result.stderr.strip() or 'запрос не прошёл'}")
+    if len(result.stdout) > MAX_REPLY_BYTES:
+        raise ValueError(f"ответ RIPEstat для {asn} больше предела {MAX_REPLY_BYTES} байт")
+''', "предел ответа RIPEstat в меню")
+
 # Имя процесса из ss попадает на экран администратора: управляющие символы убираем (clean_text ниже, в блоке BOXED).
 menu = replace_once(menu, '''    return "xray" if raw.startswith("xray-linux") else raw''',
     '''    return "xray" if raw.startswith("xray-linux") else clean_text(raw)''', "очистка имени процесса")
@@ -1304,7 +1380,7 @@ menu = replace_once(menu, '${LAN_ALLOW-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 1
                     '${LAN_ALLOW-}', "показ LAN")
 
 # ---------------------------------------------------------------- версии, обновление и откат скрипта
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 VERSIONS_CODE = r'''import hashlib
 
 FW_VERSION = "@@VERSION@@"
@@ -1312,6 +1388,8 @@ FW_REPO = "J0ll1er/Nftables-Script"
 HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
+MAX_REPLY_BYTES = 20_000_000  # ответ RIPEstat про ASN
+MAX_OWNER_BYTES = 1_000_000  # ответ RIPEstat про один адрес
 
 
 def version_key(version):
@@ -1327,6 +1405,8 @@ def fetch_text(url, limit=3_000_000):
          "--max-time", "30", "--max-filesize", str(limit), url], capture_output=True, check=False)
     if result.returncode:
         raise OSError(f"не скачалось: {url}")
+    if len(result.stdout) > limit:
+        raise OSError(f"ответ больше предела {limit} байт: {url}")
     return result.stdout.decode("utf-8-sig")
 
 
@@ -2600,11 +2680,12 @@ def fetch_ripe(address):
     """Ответ RIPEstat про адрес (номер AS и владелец); пусто, если сеть не ответила."""
     url = f"https://stat.ripe.net/data/prefix-overview/data.json?resource={address}"
     try:
-        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4", url],
+        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4",
+                                 "--max-filesize", str(MAX_OWNER_BYTES), url],
                                 text=True, capture_output=True, timeout=6, check=False)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return result.stdout if result.returncode == 0 else ""
+    return result.stdout if result.returncode == 0 and len(result.stdout) <= MAX_OWNER_BYTES else ""
 
 
 def parse_ripe_owner(text):
@@ -2623,11 +2704,12 @@ def fetch_whois(address):
     """Запись о блоке адресов у регистратора через RIPEstat; пусто, если сеть не ответила."""
     url = f"https://stat.ripe.net/data/whois/data.json?resource={address}"
     try:
-        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4", url],
+        result = subprocess.run(["curl", "-fsS", "--proto", "=https", "--connect-timeout", "3", "--max-time", "4",
+                                 "--max-filesize", str(MAX_OWNER_BYTES), url],
                                 text=True, capture_output=True, timeout=6, check=False)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return result.stdout if result.returncode == 0 else ""
+    return result.stdout if result.returncode == 0 and len(result.stdout) <= MAX_OWNER_BYTES else ""
 
 
 def parse_whois_owner(text):
@@ -3384,6 +3466,24 @@ for key, replacement in (("menu", menu), ("update", upd)):
     parts[key] = (a2, b2, new_text[a2:b2])
 
 # Установщик вне heredoc также патчится при сборке.
+# Установка: порт SSH под геофильтром — предупреждаем сразу, до записи файлов.
+new_text = replace_once(new_text, """  *" 80 "*) echo 'Внимание: порт 80 под геофильтром сломает продление сертификата Let'\\''s Encrypt.' ;;
+esac
+""", """  *" 80 "*) echo 'Внимание: порт 80 под геофильтром сломает продление сертификата Let'\\''s Encrypt.' ;;
+esac
+# SSH-порт и геофильтр (установка)
+ssh_found=$(timeout 5 sshd -T 2>/dev/null | awk '$1=="port" {print $2}')
+ssh_conn=${SSH_CONNECTION:-}
+ssh_conn=${ssh_conn##* }
+case "$ssh_conn" in ''|*[!0-9]*) ssh_conn='' ;; esac
+for ssh_port in $(printf '%s\n' $ssh_found $ssh_conn | sort -u); do
+  case " $geo_ports " in
+    *" $ssh_port "*) echo "Внимание: порт SSH $ssh_port входит в геофильтр — вход по SSH будет только из России и с доверенных адресов (адрес этого подключения добавится в доверенные). Если так не задумано, укажите порты без SSH." ;;
+  esac
+done
+# конец проверки SSH-порта
+""", "предупреждение про SSH-порт в установщике")
+
 new_text = replace_once(new_text, 'TIMER=/etc/systemd/system/fw-update.timer\n',
     'TIMER=/etc/systemd/system/fw-update.timer\n'
     'NFT_DROPIN=/etc/systemd/system/nftables.service.d/10-fw-restore.conf\n', "путь drop-in")

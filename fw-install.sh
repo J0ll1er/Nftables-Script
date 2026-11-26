@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.8.0'
+FW_VERSION='1.8.1'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -1221,10 +1221,11 @@ def add_trusted():
             print("Все указанные записи уже есть.")
             return
         append_entries(TRUSTED, addresses)
-    print(f"Добавлено: {', '.join(addresses)}. Чтобы обновить правила, открой «Проверить и применить правила».")
+    print(f"Добавлено: {', '.join(addresses)}.")
     if any(isinstance(item, str) for item in items):
         print("DDNS-адрес превращается в IP при каждом плановом обновлении. Чтобы смену IP подхватывало быстрее,")
         print("задай частоту: «Проверить и применить правила» → «Настроить расписание обновления» → 3 (раз в 3 часа).")
+    offer_apply()
 
 
 TRUSTED_OLD_DAYS = 14
@@ -1328,7 +1329,7 @@ def remove_trusted():
     print(f"Удалено: {', '.join(dict.fromkeys(removed))}.")
     if client and client in chosen:
         print("Это адрес вашего текущего подключения: если он не российский, после применения правил 443 для него закроется. SSH это не затрагивает.")
-    print("Чтобы правила обновились, открой «Проверить и применить правила» → «Применить правила и включить таймер».")
+    offer_apply()
 
 
 def parse_asn(value):
@@ -1390,7 +1391,8 @@ def lookup_asn():
             print(f"{asn} уже есть в {ASN_FILE}.")
             return
         append_entries(ASN_FILE, [asn])
-    print(f"{asn} сохранён. Чтобы обновить правила, открой «Проверить и применить правила».")
+    print(f"{asn} сохранён.")
+    offer_apply()
 
 
 def extra_covers(network):
@@ -1416,7 +1418,8 @@ def add_blocked_address():
         if extra_covers(network):
             return
         append_entries(EXTRA, [address])
-    print(f"Добавлено в extra.txt: {address}. Дальше открой «Проверить и применить правила».")
+    print(f"Добавлено в extra.txt: {address}.")
+    offer_apply()
 
 
 def parse_source(value):
@@ -1521,8 +1524,8 @@ def add_source():
             print(f"Список {spec} уже добавлен.")
             return
         append_entries(SOURCES, [spec])
-    print("Список сохранён и будет обновляться вместе со штатными. "
-          "Чтобы обновить правила, открой «Проверить и применить правила».")
+    print("Список сохранён и будет обновляться вместе со штатными.")
+    offer_apply()
 
 
 def manage_presets():
@@ -1590,8 +1593,8 @@ def remove_manual_entries():
             if not value or normalize(value) not in targets:
                 kept.append(line)
         write_text_atomic(path, "".join(kept))
-    print("Записи удалены. Чтобы обновить правила, открой «Проверить и применить правила».")
-    print("Адрес может оставаться заблокированным через другие ASN, подсети, списки или пресеты.")
+    print("Записи удалены. Адрес может оставаться заблокированным через другие ASN, подсети, списки или пресеты.")
+    offer_apply()
 
 
 def run(*command):
@@ -3316,6 +3319,16 @@ def show_server_overview():
         print(textwrap.fill(line, width=width, subsequent_indent="  ", break_long_words=False, break_on_hyphens=False))
 
 
+def offer_apply():
+    print("Правила начнут действовать только после применения.")
+    print("Применить сейчас — «да» на вопросе ниже. Позже: fw-menu → 4 → 2.")
+    try:
+        apply_rules()
+    except EOFError:
+        print()
+        print("Применить позже: fw-menu → 4 → 2.")
+
+
 def apply_rules():
     client = ssh_client()
     if client and not any(ipaddress.ip_address(client) in network for network in trusted_networks()):
@@ -4085,7 +4098,7 @@ def show_error_log():
 
 import hashlib
 
-FW_VERSION = "1.8.0"
+FW_VERSION = "1.8.1"
 FW_REPO = "J0ll1er/Nftables-Script"
 HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -6249,7 +6262,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    'a49f3dad8aa7ec3d2b467c25e4c424d4740a8a3d3c461c8d0370ff72f8fefbb2' "$stage/fw-menu" \
+    '9c91ff5e2c15421acc2e7b415d5a3fbc4a9ab1e6c8eced70a2db9c1847519429' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

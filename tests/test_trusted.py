@@ -28,6 +28,8 @@ class Trusted(unittest.TestCase):
             f"198.51.100.50  # авто, добавлен {self.old}\n198.51.100.55  # авто, добавлен {self.today}\n", encoding="utf-8")
         (self.dir / "trusted.local.txt").write_text("203.0.113.7  # свой\n# просто комментарий\n", encoding="utf-8")
         self.menu.ssh_client = lambda: "198.51.100.55"
+        self.applied = []
+        self.menu.apply_rules = lambda: self.applied.append(True)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -39,6 +41,24 @@ class Trusted(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             function()
         return out.getvalue()
+
+    def test_remove_offers_to_apply_rules(self):
+        text = self.run_with_input(self.menu.remove_trusted, "1", "да")
+        self.assertEqual(self.applied, [True])
+        self.assertIn("fw-menu → 4 → 2", text)
+
+    def test_cancelled_remove_does_not_offer_apply(self):
+        self.run_with_input(self.menu.remove_trusted, "1", "нет")
+        self.assertEqual(self.applied, [])
+
+    def test_offer_apply_survives_closed_input(self):
+        def closed():
+            raise EOFError
+        self.menu.apply_rules = closed
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.menu.offer_apply()
+        self.assertIn("fw-menu → 4 → 2", out.getvalue())
 
     def test_records_know_auto_and_date(self):
         records = self.menu.trusted_records()

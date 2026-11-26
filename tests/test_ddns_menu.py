@@ -28,6 +28,8 @@ class DdnsMenu(unittest.TestCase):
         self.menu.reload_timer = lambda active: True
         self.menu.show_schedule_status = lambda: None
         self.menu.run = lambda *command: True
+        self.applied = []
+        self.menu.apply_rules = lambda: self.applied.append(True)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -39,6 +41,11 @@ class DdnsMenu(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             function()
         return out.getvalue()
+
+    def test_add_offers_to_apply_rules(self):
+        text = self.drive(self.menu.add_trusted, "5.6.7.8")
+        self.assertEqual(self.applied, [True])
+        self.assertIn("fw-menu → 4 → 2", text)
 
     def test_add_name_is_stored_lowercase_and_hints_at_schedule(self):
         text = self.drive(self.menu.add_trusted, "Home.Example.com")

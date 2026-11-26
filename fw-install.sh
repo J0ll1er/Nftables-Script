@@ -3935,10 +3935,12 @@ def show_ssh_attempts(say):
         return True
     total = sum(len(entry["conns"]) for entry in found.values())
     say(f"Вход по паролю выключен, подобрать пароль нельзя. По журналу sshd за сутки: подключений с попыткой входа: {total}, "
-        f"с разных адресов: {len(found)}. Самые активные (подключений, какие логины пробовали):")
-    for address, entry in sorted(found.items(), key=lambda item: (-len(item[1]["conns"]), item[0]))[:10]:
+        f"с разных адресов: {len(found)}. Самые активные (адрес, подключений, чей адрес, какие логины пробовали):")
+    top = sorted(found.items(), key=lambda item: (-len(item[1]["conns"]), item[0]))[:10]
+    owners = resolve_owners([address for address, _entry in top], "ssh", {})
+    for address, entry in top:
         users = ", ".join(user for user, _count in sorted(entry["users"].items(), key=lambda item: (-item[1], item[0]))[:3])
-        print(f"  {address:<39} {len(entry['conns']):>5}  {users}")
+        print(f"  {address:<39} {len(entry['conns']):>5}  {owners.get(address, 'неизвестно')[:34]:<34}  {users}")
     return True
 
 
@@ -6890,7 +6892,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    'cdf9c2d86cb6e77f578786f04f40f3243f26b5304cc7235b3be2d58af50c8ca9' "$stage/fw-menu" \
+    'ada78f8c183466b48fde717086f00e8d958143608c323a21660015649e7c9894' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

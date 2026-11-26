@@ -4141,10 +4141,12 @@ def show_ssh_attempts(say):
         return True
     total = sum(len(entry["conns"]) for entry in found.values())
     say(f"Вход по паролю выключен, подобрать пароль нельзя. По журналу sshd за сутки: подключений с попыткой входа: {total}, "
-        f"с разных адресов: {len(found)}. Самые активные (подключений, какие логины пробовали):")
-    for address, entry in sorted(found.items(), key=lambda item: (-len(item[1]["conns"]), item[0]))[:10]:
+        f"с разных адресов: {len(found)}. Самые активные (адрес, подключений, чей адрес, какие логины пробовали):")
+    top = sorted(found.items(), key=lambda item: (-len(item[1]["conns"]), item[0]))[:10]
+    owners = resolve_owners([address for address, _entry in top], "ssh", {})
+    for address, entry in top:
         users = ", ".join(user for user, _count in sorted(entry["users"].items(), key=lambda item: (-item[1], item[0]))[:3])
-        print(f"  {address:<39} {len(entry['conns']):>5}  {users}")
+        print(f"  {address:<39} {len(entry['conns']):>5}  {owners.get(address, 'неизвестно')[:34]:<34}  {users}")
     return True
 
 

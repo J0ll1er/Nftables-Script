@@ -63,6 +63,7 @@ class Password(unittest.TestCase):
     def test_block_shown_when_keys_only(self):
         self.sshd("passwordauthentication no\nkbdinteractiveauthentication no\n")
         self.menu.ssh_login_log = lambda since: LOG
+        self.menu.resolve_owners = lambda addresses, kind, sources: {a: "Тест-хостинг" for a in addresses}
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertTrue(self.menu.show_ssh_attempts(print))
@@ -70,6 +71,7 @@ class Password(unittest.TestCase):
         self.assertIn("Перебор на SSH", text)
         self.assertIn("5f00::1", text)
         self.assertIn("admin", text)
+        self.assertIn("Тест-хостинг", text)
 
     def test_restore_removes_file(self):
         self.menu.SSH_NOPASS_FILE.write_text("x")

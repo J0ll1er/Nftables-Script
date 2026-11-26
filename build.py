@@ -3944,6 +3944,8 @@ def show_ssh_keys():
         print(f"{number}. {item['comment']}, пользователь {item['user']}")
         print(f"   {item['fingerprint']}")
         print(f"   {ssh_key_state_text(item)}")
+        for text in key_presence_lines(item.get("fingerprint", ""), key_log, clients):
+            print(f"   {text}")
 
 
 def remove_ssh_key():
@@ -4195,6 +4197,47 @@ def ssh_logins(log):
     return found
 
 
+SSH_ACCEPTED_KEY = re.compile(r"Accepted publickey for (\S+) from (\S+) port (\d+) .*?(SHA256:\S+)")
+
+
+def ssh_established_clients():
+    """Множество (адрес, порт) клиентов, у которых сейчас открыто TCP-соединение с этим сервером."""
+    clients = set()
+    for line in probe_output("ss", "-Htn", "state", "established").splitlines():
+        fields = line.split()
+        if len(fields) >= 4:
+            host, _, port = fields[-1].rpartition(":")
+            if port.isdigit():
+                clients.add((host.strip("[]").partition("%")[0], port))
+    return clients
+
+
+def key_logins(fingerprint, log):
+    """[(пользователь, адрес, порт)] входов по ключу с этим отпечатком, по порядку журнала."""
+    if not fingerprint:
+        return []
+    result = []
+    for line in log.splitlines():
+        match = SSH_ACCEPTED_KEY.search(line)
+        if match and match.group(4) == fingerprint:
+            result.append((match.group(1), match.group(2), match.group(3)))
+    return result
+
+
+def key_presence_lines(fingerprint, log, clients):
+    """Строки для списка ключей: с каких адресов входили и в сети ли ключ сейчас."""
+    logins = key_logins(fingerprint, log)
+    if not logins:
+        return []
+    counts = {}
+    for _user, address, _port in logins:
+        counts[address] = counts.get(address, 0) + 1
+    online = sorted({address for _user, address, port in logins if (address, port) in clients})
+    lines = ["входили с адресов: " + ", ".join(f"{address} ({count})" for address, count in sorted(counts.items(), key=lambda item: -item[1]))]
+    lines.append("сейчас в сети, адрес: " + ", ".join(online) if online else "сейчас не в сети")
+    return lines
+
+
 def show_ssh_logins():
     # Кто заходил на сервер за сутки: способ входа, пользователь, адрес. Видно и вход по паролю, и по ключу.
     import time
@@ -4260,6 +4303,9 @@ menu = replace_once(menu, '''def show_ssh_keys():
     print("Вход по паролю: " + ("включён" if password_login_open() else "выключен, вход только по ключам"))
     show_ssh_logins()
     print()
+    import time
+    key_log = ssh_login_log(time.time() - 30 * 24 * 3600)
+    clients = ssh_established_clients()
     items = load_ssh_keys()
     if not items:
 ''', "вход по паролю: статус")

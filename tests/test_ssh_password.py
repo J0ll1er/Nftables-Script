@@ -131,6 +131,22 @@ class Password(unittest.TestCase):
         self.assertIn("по паролю", out.getvalue())
         self.assertIn("5f00::1", out.getvalue())
 
+    def test_key_presence_shows_addresses_and_online(self):
+        log = ("sshd[1]: Accepted publickey for root from 100.64.0.1 port 11 ssh2: ED25519 SHA256:abc\n"
+               "sshd[2]: Accepted publickey for root from 100.64.0.1 port 12 ssh2: ED25519 SHA256:abc\n"
+               "sshd[3]: Accepted publickey for root from 5f00::1 port 13 ssh2: ED25519 SHA256:other\n")
+        online = self.menu.key_presence_lines("SHA256:abc", log, {("100.64.0.1", "12")})
+        self.assertEqual(online[0], "входили с адресов: 100.64.0.1 (2)")
+        self.assertEqual(online[1], "сейчас в сети, адрес: 100.64.0.1")
+        offline = self.menu.key_presence_lines("SHA256:abc", log, set())
+        self.assertEqual(offline[1], "сейчас не в сети")
+        self.assertEqual(self.menu.key_presence_lines("SHA256:none", log, set()), [])
+        self.assertEqual(self.menu.key_presence_lines("", log, set()), [])
+
+    def test_established_clients_parse_v4_and_v6(self):
+        self.menu.probe_output = lambda *c, **k: "0 0 100.64.0.2:22 100.64.0.1:5555\n0 0 [5f00::2]:22 [5f00::1]:6666\n"
+        self.assertEqual(self.menu.ssh_established_clients(), {("100.64.0.1", "5555"), ("5f00::1", "6666")})
+
     def test_restore_removes_file(self):
         self.menu.SSH_NOPASS_FILE.write_text("x")
         self.menu.sshd_config_valid = lambda: True

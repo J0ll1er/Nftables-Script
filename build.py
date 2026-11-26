@@ -4340,6 +4340,131 @@ menu = replace_once(menu, '''    else:
 menu = replace_once(menu, 'HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Превысили лимит SSH", "Чего здесь нет")',
                     'HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Превысили лимит SSH", "Перебор на SSH", "Чего здесь нет")', "кто стучится: заголовок")
 
+# ---------------------------------------------------------------- уведомление о новой версии при входе по SSH (1.9.0)
+MOTD_CODE = r"""MOTD_STATE = DIRECTORY / "motd-notice"
+MOTD_CACHE = DIRECTORY / "latest-version.json"
+MOTD_DIR = Path("/etc/update-motd.d")
+MOTD_HOOK = MOTD_DIR / "99-fw-update"
+MOTD_PROFILE_HOOK = Path("/etc/profile.d/fw-update-notice.sh")
+MOTD_TTL = 24 * 3600
+
+
+def motd_hook_path():
+    return MOTD_HOOK if MOTD_DIR.is_dir() else MOTD_PROFILE_HOOK
+
+
+def motd_hook_text(path):
+    head = "# Создан fw-menu: сообщает при входе, что вышла новая версия. Выключается в fw-menu → 5 → 4.\n"
+    if path == MOTD_HOOK:
+        return f"#!/bin/sh\n{head}[ -x {MENU_FILE} ] && {MENU_FILE} --motd 2>/dev/null\nexit 0\n"
+    return head + f'case $- in *i*) [ "$(id -u)" = 0 ] && [ -x {MENU_FILE} ] && {MENU_FILE} --motd 2>/dev/null;; esac\n'
+
+
+def write_motd_state(value):
+    write_text_atomic(MOTD_STATE, value + "\n")
+
+
+def enable_motd_notice():
+    path = motd_hook_path()
+    write_text_atomic(path, motd_hook_text(path))
+    os.chmod(path, 0o755 if path == MOTD_HOOK else 0o644)
+    write_motd_state("on")
+
+
+def disable_motd_notice():
+    for path in (MOTD_HOOK, MOTD_PROFILE_HOOK):
+        path.unlink(missing_ok=True)
+    write_motd_state("off")
+
+
+def remove_motd_notice():
+    for path in (MOTD_HOOK, MOTD_PROFILE_HOOK):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def load_latest_cache():
+    try:
+        data = json.loads(MOTD_CACHE.read_text(encoding="utf-8"))
+        return str(data.get("version", "")), float(data.get("checked", 0))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return "", 0.0
+
+
+def save_latest_cache(version, checked):
+    write_text_atomic(MOTD_CACHE, json.dumps({"version": version, "checked": checked}) + "\n")
+
+
+def refresh_latest_version():
+    import time
+    version, _ = load_latest_cache()
+    try:
+        releases = parse_changelog(fetch_ref("main", "CHANGELOG.md"))
+        if releases:
+            version = releases[0]["version"]
+    except OSError:
+        pass
+    save_latest_cache(version, time.time())
+
+
+def motd_notice():
+    # Вызывается при входе по SSH: только читает кэш; устаревший кэш обновляется в фоне, вход не задерживается.
+    import time
+    version, checked = load_latest_cache()
+    if time.time() - checked > MOTD_TTL:
+        try:
+            save_latest_cache(version, time.time())  # чтобы параллельные входы не запускали проверку одновременно
+            subprocess.Popen([str(MENU_FILE), "--refresh-latest"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+    if version and VERSION_RE.fullmatch(version) and version_key(version) > version_key(FW_VERSION):
+        print(f"Файрвол: вышла версия {version} (у вас {FW_VERSION}). Обновить: fw-menu → 5 → 2")
+
+
+def motd_state():
+    try:
+        return MOTD_STATE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def ensure_motd_notice():
+    # При первом запуске меню уведомление включается само (один раз); дальше решает состояние «on» или «off».
+    if motd_state():
+        return
+    try:
+        enable_motd_notice()
+    except OSError:
+        return
+    print(textwrap.fill("Включено уведомление о новой версии при входе по SSH. Отключить: fw-menu → 5 → 4.", width=92))
+
+
+def toggle_motd_notice():
+    if motd_state() == "off":
+        enable_motd_notice()
+        print("Уведомление о новой версии при входе по SSH включено.")
+    else:
+        disable_motd_notice()
+        print("Уведомление о новой версии при входе по SSH выключено.")
+
+
+"""
+menu = replace_once(menu, 'def apply_rules():\n', MOTD_CODE + 'def apply_rules():\n', "MOTD: код")
+menu = replace_once(menu, '            ("Откатить скрипт к другой версии", rollback_script),\n        )),\n        ("Отключить или удалить"',
+    '            ("Откатить скрипт к другой версии", rollback_script),\n'
+    '            ("Уведомление о новой версии при входе по SSH (включить или выключить)", toggle_motd_notice),\n'
+    '        )),\n        ("Отключить или удалить"', "MOTD: меню")
+menu = replace_once(menu, '    if sys.argv[1:] == ["--check-proxy"]:\n',
+    '    if sys.argv[1:] == ["--motd"]:\n        motd_notice()\n        return\n'
+    '    if sys.argv[1:] == ["--refresh-latest"]:\n        refresh_latest_version()\n        return\n'
+    '    if sys.argv[1:] == ["--check-proxy"]:\n', "MOTD: команды")
+menu = replace_once(menu, '    sweep_ssh_keys()\n    entries = (\n', '    sweep_ssh_keys()\n    ensure_motd_notice()\n    entries = (\n', "MOTD: при запуске меню")
+menu = replace_once(menu, '            for path in installed_files:\n                path.unlink()\n',
+    '            for path in installed_files:\n                path.unlink()\n            remove_motd_notice()\n', "MOTD: удаление")
+
 # ---------------------------------------------------------------- сборка
 new_text = text
 for key, replacement in (("menu", menu), ("update", upd)):

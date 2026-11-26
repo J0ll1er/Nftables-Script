@@ -4421,7 +4421,7 @@ def motd_notice():
         except OSError:
             pass
     if version and VERSION_RE.fullmatch(version) and version_key(version) > version_key(FW_VERSION):
-        print(f"Файрвол: вышла версия {version} (у вас {FW_VERSION}). Обновить: fw-menu → 5 → 2")
+        print(f"\n\033[1;33m▶ Файрвол: вышла версия {version} (у вас {FW_VERSION}). Обновить: fw-menu → 5 → 2\033[0m\n")
 
 
 def motd_state():

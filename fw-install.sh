@@ -4156,7 +4156,7 @@ def motd_notice():
         except OSError:
             pass
     if version and VERSION_RE.fullmatch(version) and version_key(version) > version_key(FW_VERSION):
-        print(f"Файрвол: вышла версия {version} (у вас {FW_VERSION}). Обновить: fw-menu → 5 → 2")
+        print(f"\n\033[1;33m▶ Файрвол: вышла версия {version} (у вас {FW_VERSION}). Обновить: fw-menu → 5 → 2\033[0m\n")
 
 
 def motd_state():
@@ -7143,7 +7143,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    '73924a5325e0aad567c93ca63736be3db7899c6bdfe6b848958d948104b08d96' "$stage/fw-menu" \
+    '8ef5e7a32eedb38f3616feef274529906ca707fcf332361372161add543ed0f8' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

@@ -146,6 +146,16 @@ class SshKey(unittest.TestCase):
         self.menu.sweep_ssh_keys()
         self.assertTrue(Path(item["file"]).is_file())
 
+    def test_empty_fingerprint_never_counts_as_a_login(self):
+        self.create()
+        items = self.menu.load_ssh_keys()
+        items[0]["fingerprint"] = ""
+        self.menu.save_ssh_keys(items)
+        self.log = f"Accepted publickey for {ME} from 100.64.0.5 port 1 ssh2: ED25519 SHA256:любой\n"
+        self.menu.sweep_ssh_keys()
+        self.assertTrue(Path(items[0]["file"]).is_file())
+        self.assertEqual(self.menu.load_ssh_keys()[0]["state"], "pending")
+
     def test_unused_key_expires_after_a_day_and_is_revoked(self):
         self.create()
         items = self.menu.load_ssh_keys()

@@ -3721,6 +3721,8 @@ def ssh_login_log(since):
 
 
 def ssh_key_used(fingerprint, since):
+    if not fingerprint:  # пустая строка «входит» в любую строку журнала и засчитала бы чужой вход
+        return False
     return any("Accepted publickey" in line and fingerprint in line for line in ssh_login_log(since).splitlines())
 
 

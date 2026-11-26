@@ -3527,6 +3527,8 @@ def ssh_login_log(since):
 
 
 def ssh_key_used(fingerprint, since):
+    if not fingerprint:  # пустая строка «входит» в любую строку журнала и засчитала бы чужой вход
+        return False
     return any("Accepted publickey" in line and fingerprint in line for line in ssh_login_log(since).splitlines())
 
 
@@ -6650,7 +6652,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    '1e1be300e33204f09092d0c15ec76af64a06024c1981e7a7d52b59829fcb234f' "$stage/fw-menu" \
+    '6328623ed8d5fe74d533dcc9c7e85ebffd942781e575c05d4cdd0217a7661e04' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

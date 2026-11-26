@@ -45,7 +45,6 @@ class Trusted(unittest.TestCase):
     def test_remove_offers_to_apply_rules(self):
         text = self.run_with_input(self.menu.remove_trusted, "1", "да")
         self.assertEqual(self.applied, [True])
-        self.assertIn("fw-menu → 4 → 2", text)
 
     def test_cancelled_remove_does_not_offer_apply(self):
         self.run_with_input(self.menu.remove_trusted, "1", "нет")

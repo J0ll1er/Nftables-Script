@@ -45,7 +45,6 @@ class DdnsMenu(unittest.TestCase):
     def test_add_offers_to_apply_rules(self):
         text = self.drive(self.menu.add_trusted, "5.6.7.8")
         self.assertEqual(self.applied, [True])
-        self.assertIn("fw-menu → 4 → 2", text)
 
     def test_add_name_is_stored_lowercase_and_hints_at_schedule(self):
         text = self.drive(self.menu.add_trusted, "Home.Example.com")

@@ -3320,8 +3320,6 @@ def show_server_overview():
 
 
 def offer_apply():
-    print("Правила начнут действовать только после применения.")
-    print("Применить сейчас — «да» на вопросе ниже. Позже: fw-menu → 4 → 2.")
     try:
         apply_rules()
     except EOFError:
@@ -6262,7 +6260,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    '9c91ff5e2c15421acc2e7b415d5a3fbc4a9ab1e6c8eced70a2db9c1847519429' "$stage/fw-menu" \
+    'f9c1219282e3a22484ee168daa919a1485e20452e990ee916175ee5d76af6017' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

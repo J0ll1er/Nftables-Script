@@ -83,10 +83,12 @@ class Password(unittest.TestCase):
     def test_disable_refused_without_key_session(self):
         self.sshd("")
         self.menu.current_session_used_key = lambda: False
+        self.menu.ssh_session_sockets = lambda: (("100.64.0.2", 22), ("100.64.0.7", 5555))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.menu.disable_password_login()
         self.assertIn("не по ключу", out.getvalue())
+        self.assertIn("100.64.0.7", out.getvalue())
         self.assertFalse(self.menu.SSH_NOPASS_FILE.exists())
 
 

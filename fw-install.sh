@@ -3833,7 +3833,10 @@ def disable_password_login():
         print(textwrap.fill("Не удалось определить текущее SSH-подключение (возможно, вы в консоли хостера). "
                             "Зайдите на сервер по SSH по ключу и повторите.", width=92))
         return
+    sockets = ssh_session_sockets()
+    client = f"{sockets[1][0]}, порт {sockets[1][1]}" if sockets else ""
     if not used:
+        print(f"Текущее подключение: {client}, вход был не по ключу.")
         print(textwrap.fill("Это подключение прошло не по ключу. Если отключить пароль сейчас, вход потеряется, "
                             "если ключ не работает. Зайдите на сервер по ключу (например, с -i файл_ключа) и повторите отсюда.", width=92))
         return
@@ -3846,6 +3849,7 @@ def disable_password_login():
         paint(33, "Внимание: в настройках sshd есть блоки Match (для отдельных пользователей или адресов). Они могут вести себя иначе:")
         for line in matches:
             print("  " + line)
+    print(f"Текущее подключение: {client}, вход по ключу.")
     print(textwrap.fill("Вход по паролю закроется для всех пользователей этого сервера и для всех устройств и скриптов, "
                         "которые заходят паролем. Консоль хостера продолжит работать. Сейчас вы вошли по ключу, он останется рабочим.", width=92))
     if not confirm_yes("Отключить вход по паролю? Введи «да»: "):
@@ -6875,7 +6879,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    '536569578a9c73339c62589556cc2cff1561f97e2a1be080df89d43eef995bd0' "$stage/fw-menu" \
+    '3fa9f426bae4c7bde0d7779c6eba73eab71cbe8c42c947b34911a9b8220109d5' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

@@ -4125,6 +4125,17 @@ def ssh_attempts(log):
     return found
 
 
+def short_owner(owner, width):
+    """Сокращает только название («ИМЯ, СТРАНА, AS123»): страна и номер AS остаются целыми."""
+    if len(owner) <= width:
+        return owner
+    name, sep, tail = owner.partition(", ")
+    if not sep:
+        return owner[:width - 1] + "…"
+    room = width - len(tail) - 2
+    return (name[:room - 1] + "…" if room > 1 else name[:1] + "…") + ", " + tail
+
+
 def show_ssh_attempts(say):
     # Нужен, когда вход только по ключам: пароли подобрать нельзя, но видно, кто пробует. True — блок показан.
     import time
@@ -4146,7 +4157,7 @@ def show_ssh_attempts(say):
     owners = resolve_owners([address for address, _entry in top], "ssh", {})
     for address, entry in top:
         users = ", ".join(user for user, _count in sorted(entry["users"].items(), key=lambda item: (-item[1], item[0]))[:3])
-        print(f"  {address:<39} {len(entry['conns']):>5}  {owners.get(address, 'неизвестно')[:34]:<34}  {users}")
+        print(f"  {address:<39} {len(entry['conns']):>5}  {short_owner(owners.get(address, 'неизвестно'), 40):<40}  {users}")
     return True
 
 

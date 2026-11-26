@@ -3919,6 +3919,17 @@ def ssh_attempts(log):
     return found
 
 
+def short_owner(owner, width):
+    """Сокращает только название («ИМЯ, СТРАНА, AS123»): страна и номер AS остаются целыми."""
+    if len(owner) <= width:
+        return owner
+    name, sep, tail = owner.partition(", ")
+    if not sep:
+        return owner[:width - 1] + "…"
+    room = width - len(tail) - 2
+    return (name[:room - 1] + "…" if room > 1 else name[:1] + "…") + ", " + tail
+
+
 def show_ssh_attempts(say):
     # Нужен, когда вход только по ключам: пароли подобрать нельзя, но видно, кто пробует. True — блок показан.
     import time
@@ -3940,7 +3951,7 @@ def show_ssh_attempts(say):
     owners = resolve_owners([address for address, _entry in top], "ssh", {})
     for address, entry in top:
         users = ", ".join(user for user, _count in sorted(entry["users"].items(), key=lambda item: (-item[1], item[0]))[:3])
-        print(f"  {address:<39} {len(entry['conns']):>5}  {owners.get(address, 'неизвестно')[:34]:<34}  {users}")
+        print(f"  {address:<39} {len(entry['conns']):>5}  {short_owner(owners.get(address, 'неизвестно'), 40):<40}  {users}")
     return True
 
 
@@ -6892,7 +6903,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    'ada78f8c183466b48fde717086f00e8d958143608c323a21660015649e7c9894' "$stage/fw-menu" \
+    'f83affafd90511a8fd6f4435267c6dfe0067f2a788d8b94a474e5efe5d4084a7' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

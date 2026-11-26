@@ -73,6 +73,12 @@ class Password(unittest.TestCase):
         self.assertIn("admin", text)
         self.assertIn("Тест-хостинг", text)
 
+    def test_short_owner_keeps_country_and_as(self):
+        text = self.menu.short_owner("DMZHOST TECHOFF SRV LIMITED LONG NAME, AD, AS47890", 40)
+        self.assertTrue(text.endswith(", AD, AS47890"))
+        self.assertLessEqual(len(text), 40)
+        self.assertEqual(self.menu.short_owner("bshield, TR, AS154383", 40), "bshield, TR, AS154383")
+
     def test_restore_removes_file(self):
         self.menu.SSH_NOPASS_FILE.write_text("x")
         self.menu.sshd_config_valid = lambda: True

@@ -3499,6 +3499,43 @@ menu = replace_once(menu, """    print("Записи удалены. Чтобы 
     offer_apply()
 """, "предложение после удаления записей")
 
+# Подтверждение после применения: лишний Enter или опечатка не должны молча откатывать правила, пока не вышло время.
+menu = replace_once(menu, """def ask_confirmation(timeout):
+    import select
+    print(f"Правила работают? Введите «да» за {timeout} с: ", end="", flush=True)
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not ready:
+        print()
+    return bool(ready and sys.stdin.readline().strip().casefold() == "да")
+""", """def ask_confirmation(timeout):
+    import select
+    import time
+    # Читаем напрямую из дескриптора: если ввод пришёл пачкой (вставка, лишний Enter), буфер Python не прячет оставшиеся строки от select.
+    fd = sys.stdin.fileno()
+    pending = b""
+    deadline = time.monotonic() + timeout
+    print(f"Правила работают? Введите «да» за {timeout} с: ", end="", flush=True)
+    while True:
+        while b"\\n" not in pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                print()
+                return False
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                print()
+                return False
+            pending += chunk
+        line, _, pending = pending.partition(b"\\n")
+        raw = line.decode("utf-8", "replace").strip()
+        if raw.casefold() == "да":
+            return True
+        if raw.casefold() in ("нет", "отмена"):
+            return False
+        print(explain_unclear_answer(raw, "«да», пока не вышло время; «нет» вернёт прежние правила"))
+        print("Правила работают? Введите «да»: ", end="", flush=True)
+""", "подтверждение применения: повторный вопрос")
+
 # ---------------------------------------------------------------- сборка
 new_text = text
 for key, replacement in (("menu", menu), ("update", upd)):

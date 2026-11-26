@@ -3050,11 +3050,31 @@ def health_check():
 
 def ask_confirmation(timeout):
     import select
+    import time
+    # Читаем напрямую из дескриптора: если ввод пришёл пачкой (вставка, лишний Enter), буфер Python не прячет оставшиеся строки от select.
+    fd = sys.stdin.fileno()
+    pending = b""
+    deadline = time.monotonic() + timeout
     print(f"Правила работают? Введите «да» за {timeout} с: ", end="", flush=True)
-    ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    if not ready:
-        print()
-    return bool(ready and sys.stdin.readline().strip().casefold() == "да")
+    while True:
+        while b"\n" not in pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                print()
+                return False
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                print()
+                return False
+            pending += chunk
+        line, _, pending = pending.partition(b"\n")
+        raw = line.decode("utf-8", "replace").strip()
+        if raw.casefold() == "да":
+            return True
+        if raw.casefold() in ("нет", "отмена"):
+            return False
+        print(explain_unclear_answer(raw, "«да», пока не вышло время; «нет» вернёт прежние правила"))
+        print("Правила работают? Введите «да»: ", end="", flush=True)
 
 
 WIDE_PENDING = DIRECTORY / "wide-pending.txt"
@@ -6260,7 +6280,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    'f9c1219282e3a22484ee168daa919a1485e20452e990ee916175ee5d76af6017' "$stage/fw-menu" \
+    '001073e4f644fb9150b38fbbb9a309301a932eb7c496571d36ffe94a2f494c2d' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

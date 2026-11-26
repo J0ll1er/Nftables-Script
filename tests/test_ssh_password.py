@@ -79,6 +79,23 @@ class Password(unittest.TestCase):
         self.assertLessEqual(len(text), 40)
         self.assertEqual(self.menu.short_owner("bshield, TR, AS154383", 40), "bshield, TR, AS154383")
 
+    def test_owner_falls_back_to_registry_without_asn(self):
+        self.menu.DIRECTORY = Path(self.tmp.name)
+        calls = []
+        self.menu.fetch_ripe = lambda address: calls.append(address) or '{"data": {"asns": []}}'
+        whois = '{"data": {"records": [[{"key": "netname", "value": "EXAMPLE-NET"}, {"key": "country", "value": "NL"}]]}}'
+        self.menu.fetch_whois = lambda address: whois
+        self.assertEqual(self.menu.lookup_owner("5f00::1"), "EXAMPLE-NET, NL")
+        self.assertEqual(len(calls), 1)
+
+    def test_owner_request_is_repeated_once_on_failure(self):
+        self.menu.DIRECTORY = Path(self.tmp.name)
+        calls = []
+        self.menu.fetch_ripe = lambda address: calls.append(address) or ""
+        self.menu.fetch_whois = lambda address: self.fail("при недоступном RIPEstat whois не нужен")
+        self.assertEqual(self.menu.lookup_owner("5f00::1"), "")
+        self.assertEqual(len(calls), 2)
+
     def test_restore_removes_file(self):
         self.menu.SSH_NOPASS_FILE.write_text("x")
         self.menu.sshd_config_valid = lambda: True

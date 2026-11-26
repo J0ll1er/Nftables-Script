@@ -2592,9 +2592,13 @@ def lookup_owner(address):
     if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], int) \
             and now - entry[1] < OWNER_CACHE_DAYS * 86400 and isinstance(entry[0], str):
         return clean_text(entry[0])
-    answer = fetch_ripe(address)
+    answer = fetch_ripe(address) or fetch_ripe(address)  # при сбое сети или лимите RIPEstat пробуем ещё раз
     owner = parse_ripe_owner(answer)
-    if owner:
+    if not owner and answer:
+        # сеть не анонсируется (нет номера AS) или RIPEstat не знает адрес: берём название блока у регистратора
+        name, country = parse_whois_owner(fetch_whois(address))
+        owner = ", ".join(part for part in (name[:OWNER_TEXT_WIDTH], country) if part)
+    elif owner:
         # название из записи блока (регистратор) точнее владельца AS: берём его, если оно есть
         name, country = parse_whois_owner(fetch_whois(address))
         holder, _, asn = owner.rpartition(" ")
@@ -6903,7 +6907,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    'f83affafd90511a8fd6f4435267c6dfe0067f2a788d8b94a474e5efe5d4084a7' "$stage/fw-menu" \
+    'dc249efee80dc878ad65b2b8b9fd25d1f16263da486846eb22e36502c3350c58' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

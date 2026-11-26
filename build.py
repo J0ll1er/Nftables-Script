@@ -2759,9 +2759,13 @@ def lookup_owner(address):
     if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], int) \
             and now - entry[1] < OWNER_CACHE_DAYS * 86400 and isinstance(entry[0], str):
         return clean_text(entry[0])
-    answer = fetch_ripe(address)
+    answer = fetch_ripe(address) or fetch_ripe(address)  # при сбое сети или лимите RIPEstat пробуем ещё раз
     owner = parse_ripe_owner(answer)
-    if owner:
+    if not owner and answer:
+        # сеть не анонсируется (нет номера AS) или RIPEstat не знает адрес: берём название блока у регистратора
+        name, country = parse_whois_owner(fetch_whois(address))
+        owner = ", ".join(part for part in (name[:OWNER_TEXT_WIDTH], country) if part)
+    elif owner:
         # название из записи блока (регистратор) точнее владельца AS: берём его, если оно есть
         name, country = parse_whois_owner(fetch_whois(address))
         holder, _, asn = owner.rpartition(" ")

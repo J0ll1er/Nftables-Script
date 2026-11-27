@@ -3346,6 +3346,105 @@ menu = replace_once(menu, '''        rows = collected[kind]
         summary = summarize_hits(rows)
 ''', "SSH-статистика: пустая группа")
 
+# ---------------------------------------------------------------- список blocklist.de для SSH (1.10.0)
+# Необязательно, по умолчанию выключено: BLOCKLIST_SSH=1. Адреса из ssh.txt (замеченные в переборе SSH
+# за последние 48 часов) отбрасываются только на портах SSH; доверенные и LAN_ALLOW пропускаются раньше.
+upd = replace_once(upd, 'SSH_RATE_LIMIT="${SSH_RATE_LIMIT:-0}"; SSH_PORTS="${SSH_PORTS-}"\n',
+                   'SSH_RATE_LIMIT="${SSH_RATE_LIMIT:-0}"; SSH_PORTS="${SSH_PORTS-}"\n'
+                   'BLOCKLIST_SSH="${BLOCKLIST_SSH:-0}"; BLOCKLIST_URL="https://lists.blocklist.de/lists/ssh.txt"\n'
+                   'BLOCKLIST_REFRESH_MIN=360; BLOCKLIST_MAX_AGE_MIN=4320\n', "blocklist: настройки")
+upd = replace_once(upd, 'for ssh_port in $SSH_PORTS; do\n',
+                   '[[ "$BLOCKLIST_SSH" =~ ^[01]$ ]] || fail_keep "BLOCKLIST_SSH: 0 (выключено) или 1"\n'
+                   'for ssh_port in $SSH_PORTS; do\n', "blocklist: проверка настройки")
+upd = replace_once(upd, 'SSH_RULES=0\nif [ "$SSH_RATE_LIMIT" -gt 0 ]; then\n', r'''# blocklist.de: скачивание и проверка. В список попадают только отдельные публичные адреса.
+fetch_blocklist() {
+  dl "$MAX_LIST_BYTES" "$TMP/bl_raw" --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 15 "$BLOCKLIST_URL" || return 1
+  python3 - "$TMP/bl_raw" "$1" <<'PY'
+import ipaddress
+from pathlib import Path
+import sys
+SKIP = [ipaddress.ip_network(net) for net in (
+    "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
+    "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")]
+found = set()
+for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict").splitlines():
+    line = line.partition("#")[0].strip()
+    if not line:
+        continue
+    try:
+        address = ipaddress.ip_address(line)
+    except ValueError:
+        sys.exit("в списке не адрес: " + line[:40])
+    if any(address.version == net.version and address in net for net in SKIP):
+        continue
+    found.add(address)
+if not found or len(found) > 200000:
+    sys.exit("в списке %d адресов" % len(found))
+Path(sys.argv[2]).write_text("".join(f"{a}\n" for a in sorted(found, key=lambda a: (a.version, int(a)))), encoding="utf-8")
+PY
+}
+# Файл не старше N минут (кэш списка живёт недолго: в нём адреса за двое суток).
+bl_younger_than() { [ -s "$1" ] && [ -n "$(find "$1" -maxdepth 0 -mmin "-$2" 2>/dev/null)" ]; }
+BL_RULES=0; BL_FRESH=0
+if [ "$BLOCKLIST_SSH" = 1 ]; then
+  BL_CACHE=$SCAN_CACHE/blocklist_ssh
+  BL_PORTS="{ $(echo ${SSH_PORTS:-$(ssh_ports_detect)} | tr ' ' ',') }"
+  : > "$TMP/bl"
+  if bl_younger_than "$BL_CACHE" "$BLOCKLIST_REFRESH_MIN"; then
+    cat "$BL_CACHE" > "$TMP/bl"
+  elif fetch_blocklist "$TMP/bl_new" && growth_ok "$TMP/bl_new" "$BL_CACHE" "blocklist.de SSH"; then
+    cat "$TMP/bl_new" > "$TMP/bl"; BL_FRESH=1
+  elif bl_younger_than "$BL_CACHE" "$BLOCKLIST_MAX_AGE_MIN"; then
+    cat "$BL_CACHE" > "$TMP/bl"
+    note "WARN: список blocklist.de недоступен или подозрителен, использую кэш"
+  else
+    note "WARN: список blocklist.de недоступен и свежего кэша нет — в этот раз без него"
+  fi
+  if [ -s "$TMP/bl" ]; then
+    BL_RULES=1
+    split "$TMP/bl" "$TMP/bl4" "$TMP/bl6"
+  fi
+fi
+SSH_RULES=0
+if [ "$SSH_RATE_LIMIT" -gt 0 ]; then
+''', "blocklist: загрузка")
+upd = replace_once(upd, '''  set_def ap4 ipv4_addr "$TMP/ap4"; set_def ap6 ipv6_addr "$TMP/ap6"
+''', '''  set_def ap4 ipv4_addr "$TMP/ap4"; set_def ap6 ipv6_addr "$TMP/ap6"
+  if [ "$BL_RULES" = 1 ]; then set_def bl4 ipv4_addr "$TMP/bl4"; set_def bl6 ipv6_addr "$TMP/bl6"; fi
+''', "blocklist: наборы")
+upd = replace_once(upd, '''    if [ "$SSH_RULES" = 1 ]; then stat_set sr4 ipv4_addr; stat_set sr6 ipv6_addr; fi
+''', '''    if [ "$SSH_RULES" = 1 ]; then stat_set sr4 ipv4_addr; stat_set sr6 ipv6_addr; fi
+    if [ "$BL_RULES" = 1 ]; then stat_set bs4 ipv4_addr; stat_set bs6 ipv6_addr; fi
+''', "blocklist: наборы статистики")
+upd = replace_once(upd, '''  if [ "$SSH_RULES" = 1 ]; then
+    # Отбрасывается только избыток''', r'''  if [ "$BL_RULES" = 1 ]; then
+    # Только порты SSH. Запись в набор статистики стоит до drop и считает пару «адрес + порт».
+    BL_ADD4=""; BL_ADD6=""
+    if [ "$STATS" = 1 ]; then
+      BL_ADD4=" add @bs4 { ip saddr . tcp dport }"; BL_ADD6=" add @bs6 { ip6 saddr . tcp dport }"
+    fi
+    echo "    tcp dport $BL_PORTS ip saddr @bl4$BL_ADD4 counter drop comment \"blocklist-ssh\""
+    echo "    tcp dport $BL_PORTS ip6 saddr @bl6$BL_ADD6 counter drop comment \"blocklist-ssh\""
+  fi
+  if [ "$SSH_RULES" = 1 ]; then
+    # Отбрасывается только избыток''', "blocklist: правила")
+upd = replace_once(upd, 'for stat in ss4 ss6 sn4 sn6 sr4 sr6; do\n  : >', 'for stat in ss4 ss6 sn4 sn6 sr4 sr6 bs4 bs6; do\n  : >', "blocklist: перенос статистики")
+upd = replace_once(upd, '  for stat in ss4 ss6 sn4 sn6 sr4 sr6; do : >', '  for stat in ss4 ss6 sn4 sn6 sr4 sr6 bs4 bs6; do : >', "blocklist: сброс переноса")
+upd = replace_once(upd, '''wide_finish
+if [ "$DRY" = 1 ]''', '''[ "$BL_RULES" = 0 ] || echo "blocklist.de SSH: $(cat "$TMP/bl4" "$TMP/bl6" | wc -l) адр. на портах $BL_PORTS"
+wide_finish
+if [ "$DRY" = 1 ]''', "blocklist: строка итога")
+upd = replace_once(upd, '# Кэш своих списков, убранных из sources.txt, больше не нужен.\n', r'''if [ "$BL_FRESH" = 1 ]; then
+  mkdir -p "$SCAN_CACHE" || fail_save "не создался каталог кэша списков"
+  staged_cache=$(mktemp "$SCAN_CACHE/.new.XXXXXXXX") || fail_save "не создался временный файл для blocklist.de"
+  if ! cat "$TMP/bl" > "$staged_cache" || ! mv -fT "$staged_cache" "$SCAN_CACHE/blocklist_ssh"; then
+    rm -f -- "$staged_cache"
+    fail_save "не сохранился кэш blocklist.de"
+  fi
+fi
+# Кэш своих списков, убранных из sources.txt, больше не нужен.
+''', "blocklist: сохранение кэша")
+
 # ---------------------------------------------------------------- «Статус файрвола»: читаемость (1.7.0)
 menu = replace_once(menu, "import concurrent.futures\n", "import concurrent.futures\nimport contextlib\nimport io\n", "статус: импорты")
 menu = replace_once(menu, '    "Профиль сервера",\n    "Служба и таймер",\n',
@@ -4472,6 +4571,110 @@ menu = replace_once(menu, '            for path in installed_files:\n           
     '            for path in installed_files:\n                path.unlink()\n            remove_motd_notice()\n', "MOTD: удаление")
 
 # ---------------------------------------------------------------- сборка
+# ---------------------------------------------------------------- список blocklist.de в fw-menu (1.10.0)
+menu = replace_once(menu, '"non-RU": "non_ru", "ssh-rate": "ssh_rate"}\n',
+                    '"non-RU": "non_ru", "ssh-rate": "ssh_rate", "blocklist-ssh": "blocklist"}\n', "blocklist: вид правила")
+menu = replace_once(menu, 'and rule.get("comment") != "ssh-rate":\n',
+                    'and rule.get("comment") not in ("ssh-rate", "blocklist-ssh"):\n', "blocklist: правило не служебное")
+menu = replace_once(menu, '"scanners", "non_ru", "ssh_rate", "other"}:',
+                    '"scanners", "non_ru", "ssh_rate", "blocklist", "other"}:', "blocklist: объединение правил")
+menu = replace_once(menu, '        elif kind == "ssh_rate":\n', '''        elif kind == "blocklist":
+            steps.append(CountedStep(f"{ports_phrase(group['ports'], 'SSH, порт', 'SSH, порты')}: адреса из списка blocklist.de "
+                                     "(замечены в переборе SSH за последние 48 часов) отбрасываются. "
+                                     "Доверенные адреса и LAN_ALLOW пропускаются раньше.", group))
+        elif kind == "ssh_rate":
+''', "blocklist: пояснение в статусе")
+menu = replace_once(menu, '("ssh_rate", "sr4"), ("ssh_rate", "sr6"))\n',
+                    '("ssh_rate", "sr4"), ("ssh_rate", "sr6"), ("blocklist", "bs4"), ("blocklist", "bs6"))\n', "blocklist: наборы в меню")
+menu = replace_once(menu, '"Превысили лимит SSH", "Перебор на SSH"',
+                    '"Превысили лимит SSH", "Из списка blocklist.de", "Перебор на SSH"', "blocklist: заголовки")
+menu = replace_once(menu, 'collected = {"scanners": [], "non_ru": [], "ssh_rate": []}\n    ages = {"scanners": {}, "non_ru": {}, "ssh_rate": {}}\n    ssh_stats = False\n',
+                    'collected = {"scanners": [], "non_ru": [], "ssh_rate": [], "blocklist": []}\n'
+                    '    ages = {"scanners": {}, "non_ru": {}, "ssh_rate": {}, "blocklist": {}}\n    ssh_stats = False\n    bl_stats = False\n',
+                    "blocklist: сбор статистики")
+menu = replace_once(menu, '            ssh_stats = ssh_stats or kind == "ssh_rate"\n',
+                    '            ssh_stats = ssh_stats or kind == "ssh_rate"\n            bl_stats = bl_stats or kind == "blocklist"\n', "blocklist: набор есть")
+menu = replace_once(menu, '    attempts_shown = show_ssh_attempts(say)\n', r'''    if bl_stats:
+        print("\nИз списка blocklist.de")
+        if collected["blocklist"]:
+            summary = summarize_hits(collected["blocklist"])
+            say(f"Из списка blocklist.de попыток на SSH: {summary['packets']}, адресов: {summary['sources']}")
+        else:
+            say("Список blocklist.de включён, пока никто из него не стучался на порты SSH.")
+    attempts_shown = show_ssh_attempts(say)
+''', "blocklist: строка в «Кто стучится»")
+menu = replace_once(menu, 'def show_ssh_attempts(say):\n', r'''def blocklist_listed(addresses):
+    # Какие из адресов сейчас в наборе blocklist.de (nft get element сам ищет и среди диапазонов).
+    listed = set()
+    for address in addresses:
+        try:
+            version = ipaddress.ip_address(address).version
+        except ValueError:
+            continue
+        answer = probe_output("nft", "-n", "get", "element", "inet", "fw", "bl4" if version == 4 else "bl6",
+                              "{ " + address + " }", timeout=3)
+        if "elements" in answer:
+            listed.add(address)
+    return listed
+
+
+def show_ssh_attempts(say):
+''', "blocklist: поиск адресов")
+menu = replace_once(menu, '''    owners = resolve_owners([address for address, _entry in top], "ssh", {})
+''', '''    owners = resolve_owners([address for address, _entry in top], "ssh", {})
+    listed = blocklist_listed([address for address, _entry in top])
+''', "blocklist: адреса в списке")
+menu = replace_once(menu, '''{short_owner(owners.get(address, 'неизвестно'), 40):<40}  {users}")
+''', '''{short_owner(owners.get(address, 'неизвестно'), 40):<40}  {users}"
+              + ("  · в blocklist.de" if address in listed else ""))
+    if listed:
+        say("Пометка «в blocklist.de»: адрес уже в списке и блокируется на портах SSH, пока список включён и применён.")
+''', "blocklist: пометка")
+# Пункт стоит после подменю SSH-ключей, чтобы не сдвинуть номера, на которые ссылаются подсказки (2 → 6).
+menu = replace_once(menu, '''                ("Вернуть вход по паролю", enable_password_login),
+            )),
+''', '''                ("Вернуть вход по паролю", enable_password_login),
+            )),
+            ("Блокировать на SSH адреса из списка blocklist.de", configure_blocklist_ssh),
+''', "blocklist: пункт меню")
+menu = replace_once(menu, 'def command_output(*command):\n', r'''BLOCKLIST_BEGIN, BLOCKLIST_END = "# BEGIN FW-MENU BLOCKLIST", "# END FW-MENU BLOCKLIST"
+
+
+def blocklist_setting():
+    # Действующее BLOCKLIST_SSH из fw.conf и local.conf.
+    script = 'source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; printf "%s" "${BLOCKLIST_SSH:-0}"'
+    return probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).strip() == "1"
+
+
+def configure_blocklist_ssh():
+    enabled = blocklist_setting()
+    print(textwrap.fill("Список blocklist.de: адреса, которых за последние 48 часов заметили в переборе SSH на чужих серверах "
+                        "(отчёты присылают администраторы по всему миру). Если включить, такие адреса не смогут подключаться "
+                        "к портам SSH этой ноды. Другие порты не затрагиваются; доверенные адреса и LAN_ALLOW пропускаются раньше. "
+                        "Список скачивается при каждом обновлении правил, но не чаще раза в 6 часов.", width=92))
+    print(textwrap.fill("Осторожно: под одним адресом бывает много людей (мобильный интернет, общий NAT), и если на нём кто-то "
+                        "перебирал пароли, адрес попадёт в список вместе со всеми. Свой адрес для входа добавьте в доверенные.", width=92))
+    print(f"Сейчас: {'включено' if enabled else 'выключено'}")
+    value = 0 if enabled else 1
+    if not confirm_yes(("Выключить" if enabled else "Включить") + " блокировку адресов из blocklist.de на SSH? Введи «да» или «нет»: "):
+        print("Отменено, настройка не изменена.")
+        return
+    managed_block = re.compile(r"(?ms)^" + re.escape(BLOCKLIST_BEGIN) + r"\n.*?^" + re.escape(BLOCKLIST_END) + r"(?:\n|$)")
+    with (DIRECTORY / ".api.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = LOCAL_CONFIG.read_text(encoding="utf-8") if LOCAL_CONFIG.exists() else ""
+        current, count = managed_block.subn("", current)
+        if count > 1 or BLOCKLIST_BEGIN in current or BLOCKLIST_END in current:
+            raise ValueError("проверь границы блока FW-MENU BLOCKLIST в local.conf")
+        prefix = current.rstrip("\n") + "\n\n" if current.rstrip("\n") else ""
+        write_text_atomic(LOCAL_CONFIG, f"{prefix}{BLOCKLIST_BEGIN}\nBLOCKLIST_SSH={value}\n{BLOCKLIST_END}\n")
+    print("Настройка сохранена. Дальше открой «Проверить и применить правила»: проверка без применения, "
+          "затем применение с подтверждением и автооткатом.")
+
+
+def command_output(*command):
+''', "blocklist: настройка в меню")
+
 new_text = text
 for key, replacement in (("menu", menu), ("update", upd)):
     a, b, _ = parts[key]

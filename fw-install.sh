@@ -4,7 +4,7 @@ bash <<'INSTALL_FW'
 # Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
 set -euo pipefail
 umask 022
-FW_VERSION='1.9.1'
+FW_VERSION='1.10.0'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo 'Запусти блок от root.' >&2
@@ -151,6 +151,8 @@ source "$DIR/fw.conf"
 API_PORTS="${API_PORTS:-}"; API_ALLOW="${API_ALLOW:-}"
 LAN_ALLOW="${LAN_ALLOW-}"
 SSH_RATE_LIMIT="${SSH_RATE_LIMIT:-0}"; SSH_PORTS="${SSH_PORTS-}"
+BLOCKLIST_SSH="${BLOCKLIST_SSH:-0}"; BLOCKLIST_URL="https://lists.blocklist.de/lists/ssh.txt"
+BLOCKLIST_REFRESH_MIN=360; BLOCKLIST_MAX_AGE_MIN=4320
 MAX_GROWTH="${MAX_GROWTH:-3}"; MIN_KEEP="${MIN_KEEP:-0.2}"; MAX_CACHE_DAYS="${MAX_CACHE_DAYS:-14}"
 # Самая широкая сеть, которую можно принять из чужого списка или анонса ASN.
 # Записи из extra.txt этим порогом не ограничены: их вносит администратор.
@@ -159,6 +161,7 @@ HOOK="${HOOK:-input}"
 ZKEEN_MIRRORS="${ZKEEN_MIRRORS-https://raw.githubusercontent.com/jameszeroX/zkeen-ip/master/release/zkeenip.dat https://cdn.jsdelivr.net/gh/jameszeroX/zkeen-ip@master/release/zkeenip.dat https://fastly.jsdelivr.net/gh/jameszeroX/zkeen-ip@master/release/zkeenip.dat}"
 [ "$HOOK" = input ] || [ "$HOOK" = prerouting ] || fail_keep "HOOK должен быть input или prerouting"
 [[ "$SSH_RATE_LIMIT" =~ ^[0-9]{1,4}$ ]] || fail_keep "SSH_RATE_LIMIT: число новых подключений в минуту (0 — выключено)"
+[[ "$BLOCKLIST_SSH" =~ ^[01]$ ]] || fail_keep "BLOCKLIST_SSH: 0 (выключено) или 1"
 for ssh_port in $SSH_PORTS; do
   [[ "$ssh_port" =~ ^[0-9]{1,5}$ ]] && [ "$ssh_port" -ge 1 ] && [ "$ssh_port" -le 65535 ] \
     || fail_keep "SSH_PORTS: порты от 1 до 65535"
@@ -895,6 +898,55 @@ ssh_ports_detect() {
   [ -n "$found" ] || found=$(awk 'tolower($1) == "port" && $2 ~ /^[0-9]+$/ { print $2 }' /etc/ssh/sshd_config 2>/dev/null | sort -un | tr '\n' ' ')
   echo "${found:-22}"
 }
+# blocklist.de: скачивание и проверка. В список попадают только отдельные публичные адреса.
+fetch_blocklist() {
+  dl "$MAX_LIST_BYTES" "$TMP/bl_raw" --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 15 "$BLOCKLIST_URL" || return 1
+  python3 - "$TMP/bl_raw" "$1" <<'PY'
+import ipaddress
+from pathlib import Path
+import sys
+SKIP = [ipaddress.ip_network(net) for net in (
+    "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
+    "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")]
+found = set()
+for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict").splitlines():
+    line = line.partition("#")[0].strip()
+    if not line:
+        continue
+    try:
+        address = ipaddress.ip_address(line)
+    except ValueError:
+        sys.exit("в списке не адрес: " + line[:40])
+    if any(address.version == net.version and address in net for net in SKIP):
+        continue
+    found.add(address)
+if not found or len(found) > 200000:
+    sys.exit("в списке %d адресов" % len(found))
+Path(sys.argv[2]).write_text("".join(f"{a}\n" for a in sorted(found, key=lambda a: (a.version, int(a)))), encoding="utf-8")
+PY
+}
+# Файл не старше N минут (кэш списка живёт недолго: в нём адреса за двое суток).
+bl_younger_than() { [ -s "$1" ] && [ -n "$(find "$1" -maxdepth 0 -mmin "-$2" 2>/dev/null)" ]; }
+BL_RULES=0; BL_FRESH=0
+if [ "$BLOCKLIST_SSH" = 1 ]; then
+  BL_CACHE=$SCAN_CACHE/blocklist_ssh
+  BL_PORTS="{ $(echo ${SSH_PORTS:-$(ssh_ports_detect)} | tr ' ' ',') }"
+  : > "$TMP/bl"
+  if bl_younger_than "$BL_CACHE" "$BLOCKLIST_REFRESH_MIN"; then
+    cat "$BL_CACHE" > "$TMP/bl"
+  elif fetch_blocklist "$TMP/bl_new" && growth_ok "$TMP/bl_new" "$BL_CACHE" "blocklist.de SSH"; then
+    cat "$TMP/bl_new" > "$TMP/bl"; BL_FRESH=1
+  elif bl_younger_than "$BL_CACHE" "$BLOCKLIST_MAX_AGE_MIN"; then
+    cat "$BL_CACHE" > "$TMP/bl"
+    note "WARN: список blocklist.de недоступен или подозрителен, использую кэш"
+  else
+    note "WARN: список blocklist.de недоступен и свежего кэша нет — в этот раз без него"
+  fi
+  if [ -s "$TMP/bl" ]; then
+    BL_RULES=1
+    split "$TMP/bl" "$TMP/bl4" "$TMP/bl6"
+  fi
+fi
 SSH_RULES=0
 if [ "$SSH_RATE_LIMIT" -gt 0 ]; then
   SSH_LIST=$(echo ${SSH_PORTS:-$(ssh_ports_detect)})
@@ -917,10 +969,12 @@ emit_rules() {
   set_def sc4 ipv4_addr "$TMP/sc4"; set_def sc6 ipv6_addr "$TMP/sc6"
   set_def ru4 ipv4_addr "$TMP/ru4"; set_def ru6 ipv6_addr "$TMP/ru6"
   set_def ap4 ipv4_addr "$TMP/ap4"; set_def ap6 ipv6_addr "$TMP/ap6"
+  if [ "$BL_RULES" = 1 ]; then set_def bl4 ipv4_addr "$TMP/bl4"; set_def bl6 ipv6_addr "$TMP/bl6"; fi
   if [ "$STATS" = 1 ]; then
     stat_set ss4 ipv4_addr; stat_set ss6 ipv6_addr; stat_set sn4 ipv4_addr; stat_set sn6 ipv6_addr
     # Адреса, превысившие лимит SSH: счёт по паре «адрес + порт», как у сканеров (экран «Кто стучится»).
     if [ "$SSH_RULES" = 1 ]; then stat_set sr4 ipv4_addr; stat_set sr6 ipv6_addr; fi
+    if [ "$BL_RULES" = 1 ]; then stat_set bs4 ipv4_addr; stat_set bs6 ipv6_addr; fi
   fi
   echo "  chain input {"
   if [ "$HOOK" = prerouting ]; then
@@ -955,6 +1009,15 @@ emit_rules() {
   fi
   echo "    ip saddr @sc4 counter drop comment \"scanners\""
   echo "    ip6 saddr @sc6 counter drop comment \"scanners\""
+  if [ "$BL_RULES" = 1 ]; then
+    # Только порты SSH. Запись в набор статистики стоит до drop и считает пару «адрес + порт».
+    BL_ADD4=""; BL_ADD6=""
+    if [ "$STATS" = 1 ]; then
+      BL_ADD4=" add @bs4 { ip saddr . tcp dport }"; BL_ADD6=" add @bs6 { ip6 saddr . tcp dport }"
+    fi
+    echo "    tcp dport $BL_PORTS ip saddr @bl4$BL_ADD4 counter drop comment \"blocklist-ssh\""
+    echo "    tcp dport $BL_PORTS ip6 saddr @bl6$BL_ADD6 counter drop comment \"blocklist-ssh\""
+  fi
   if [ "$SSH_RULES" = 1 ]; then
     # Отбрасывается только избыток: больше SSH_RATE_LIMIT новых подключений в минуту с одного адреса
     # (для IPv6 считается вся сеть /64). Через минуту доступ возвращается сам.
@@ -979,13 +1042,13 @@ emit_rules() {
 # принялось, сначала собираем без перенесённых записей, затем без статистики:
 # правила важнее неё и всегда применяются.
 STATS=1
-for stat in ss4 ss6 sn4 sn6 sr4 sr6; do
+for stat in ss4 ss6 sn4 sn6 sr4 sr6 bs4 bs6; do
   : > "$TMP/stats.$stat"
   nft -n list set inet fw "$stat" 2>/dev/null | stat_elements > "$TMP/stats.$stat" || true
 done
 emit_rules > "$TMP/new.nft"
 if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
-  for stat in ss4 ss6 sn4 sn6 sr4 sr6; do : > "$TMP/stats.$stat"; done
+  for stat in ss4 ss6 sn4 sn6 sr4 sr6 bs4 bs6; do : > "$TMP/stats.$stat"; done
   emit_rules > "$TMP/new.nft"
   if ! nft -c -f "$TMP/new.nft" >/dev/null 2>&1; then
     STATS=0
@@ -996,6 +1059,7 @@ fi
 nft -c -f "$TMP/new.nft" || fail_keep "nft -c не прошёл"
 echo "RU v4/v6: $(wc -l < "$TMP/ru4")/$(wc -l < "$TMP/ru6") | сканеры v4/v6: $(wc -l < "$TMP/sc4")/$(wc -l < "$TMP/sc6") | trusted: $(cat "$TMP/tr4" "$TMP/tr6" | wc -l) | API: ${API_PORTS:-off} <- $(cat "$TMP/ap4" "$TMP/ap6" | wc -l) адр. | списков $ok/${#SCAN_FILES[@]} (своих $custom_total) | из кэша $cached | ASN $asn_total, из кэша $asn_cached | без данных $missing"
 [ "$SSH_RULES" = 0 ] || echo "SSH: не больше $SSH_RATE_LIMIT новых подключений в минуту с одного адреса (порты: $SSH_LIST)"
+[ "$BL_RULES" = 0 ] || echo "blocklist.de SSH: $(cat "$TMP/bl4" "$TMP/bl6" | wc -l) адр. на портах $BL_PORTS"
 wide_finish
 if [ "$DRY" = 1 ]; then echo "DRY: синтаксис ок, ничего не применено"; verdict "проверка прошла, правила не менялись"; exit 0; fi
 nft -f "$TMP/new.nft" || fail_keep "nft не применил новые правила"
@@ -1018,6 +1082,14 @@ if [ "$ok" -gt 0 ]; then
       fail_save "не сохранился кэш $name"
     fi
   done
+fi
+if [ "$BL_FRESH" = 1 ]; then
+  mkdir -p "$SCAN_CACHE" || fail_save "не создался каталог кэша списков"
+  staged_cache=$(mktemp "$SCAN_CACHE/.new.XXXXXXXX") || fail_save "не создался временный файл для blocklist.de"
+  if ! cat "$TMP/bl" > "$staged_cache" || ! mv -fT "$staged_cache" "$SCAN_CACHE/blocklist_ssh"; then
+    rm -f -- "$staged_cache"
+    fail_save "не сохранился кэш blocklist.de"
+  fi
 fi
 # Кэш своих списков, убранных из sources.txt, больше не нужен.
 for stale in "$SCAN_CACHE"/custom_*; do
@@ -1983,7 +2055,7 @@ def rule_protocols(expressions):
 
 def rule_kind(rule):
     comments = {"api-lock": "api_lock", "api-allow": "api_allow", "LAN_ALLOW": "lan", "scanners": "scanners",
-                "non-RU": "non_ru", "ssh-rate": "ssh_rate"}
+                "non-RU": "non_ru", "ssh-rate": "ssh_rate", "blocklist-ssh": "blocklist"}
     if rule.get("comment") in comments:
         return comments[rule["comment"]]
     expressions = rule.get("expr", [])
@@ -2050,11 +2122,11 @@ def explain_rules(items):
         rule = item.get("rule")
         if not rule or rule.get("chain") != "input":
             continue
-        if any("set" in expression for expression in rule.get("expr", [])) and rule.get("comment") != "ssh-rate":
+        if any("set" in expression for expression in rule.get("expr", [])) and rule.get("comment") not in ("ssh-rate", "blocklist-ssh"):
             continue  # служебная строка статистики «Кто стучится», не правило отбора (правило SSH-лимита тоже пишет в набор)
         kind = rule_kind(rule)
         packets, size = rule_counter(rule)
-        if groups and groups[-1]["kind"] == kind and kind in {"api_lock", "api_allow", "trusted", "lan", "scanners", "non_ru", "ssh_rate", "other"}:
+        if groups and groups[-1]["kind"] == kind and kind in {"api_lock", "api_allow", "trusted", "lan", "scanners", "non_ru", "ssh_rate", "blocklist", "other"}:
             groups[-1]["packets"] += packets
             groups[-1]["size"] += size
             groups[-1]["count"] += 1
@@ -2101,6 +2173,10 @@ def explain_rules(items):
             steps.append("Адреса LAN_ALLOW — пропускаются до списков сканеров и геофильтра.")
         elif kind == "scanners":
             steps.append(CountedStep("Сканеры и сети ведомств — отбрасываются на всех портах.", group))
+        elif kind == "blocklist":
+            steps.append(CountedStep(f"{ports_phrase(group['ports'], 'SSH, порт', 'SSH, порты')}: адреса из списка blocklist.de "
+                                     "(замечены в переборе SSH за последние 48 часов) отбрасываются. "
+                                     "Доверенные адреса и LAN_ALLOW пропускаются раньше.", group))
         elif kind == "ssh_rate":
             steps.append(CountedStep(f"{ports_phrase(group['ports'], 'SSH, порт', 'SSH, порты')}: с одного адреса не больше "
                                      f"{group['rate']} новых подключений в минуту, лишние отбрасываются. "
@@ -2300,7 +2376,7 @@ def boxed(title, function, headings=()):
 
 
 HIT_SETS = (("scanners", "ss4"), ("scanners", "ss6"), ("non_ru", "sn4"), ("non_ru", "sn6"),
-            ("ssh_rate", "sr4"), ("ssh_rate", "sr6"))
+            ("ssh_rate", "sr4"), ("ssh_rate", "sr6"), ("blocklist", "bs4"), ("blocklist", "bs6"))
 HIT_RE = re.compile(r"([0-9a-fA-F:.]+) \. (\d+) counter packets (\d+) bytes (\d+)")
 PORT_NAMES = {
     21: "FTP", 22: "SSH", 23: "Telnet", 25: "почта (SMTP)", 53: "DNS", 80: "HTTP", 110: "почта (POP3)",
@@ -2691,7 +2767,7 @@ def screen_columns():
 COMPACT_BELOW = 100
 
 
-HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Превысили лимит SSH", "Перебор на SSH", "Чего здесь нет")
+HITS_HEADINGS = ("Сканеры и сети ведомств", "Из других стран", "Превысили лимит SSH", "Из списка blocklist.de", "Перебор на SSH", "Чего здесь нет")
 
 
 def resolve_owners(addresses, kind, sources):
@@ -2723,9 +2799,10 @@ def show_hits():
     groups = (("scanners", "Сканеры и сети ведомств (любые порты)"),
               ("non_ru", "Из других стран (на защищённых портах)"),
               ("ssh_rate", "Превысили лимит SSH (слишком частые новые подключения)"))
-    collected = {"scanners": [], "non_ru": [], "ssh_rate": []}
-    ages = {"scanners": {}, "non_ru": {}, "ssh_rate": {}}
+    collected = {"scanners": [], "non_ru": [], "ssh_rate": [], "blocklist": []}
+    ages = {"scanners": {}, "non_ru": {}, "ssh_rate": {}, "blocklist": {}}
     ssh_stats = False
+    bl_stats = False
     full = set()
     sources = load_scanner_sources()
     seen = False
@@ -2743,6 +2820,7 @@ def show_hits():
         elif text:
             seen = True
             ssh_stats = ssh_stats or kind == "ssh_rate"
+            bl_stats = bl_stats or kind == "blocklist"
             collected[kind].extend(parse_hits(text))
             for address, age in parse_hit_ages(text).items():
                 ages[kind][address] = max(ages[kind].get(address, 0), age)
@@ -2845,6 +2923,13 @@ def show_hits():
             else:
                 print(f"  {address:<{width}}  {owner[:owner_width]:<{owner_width}}  "
                       f"{hits_bar_view(packets, biggest, 8, color)} {packets:>6}  портов: {count}")
+    if bl_stats:
+        print("\nИз списка blocklist.de")
+        if collected["blocklist"]:
+            summary = summarize_hits(collected["blocklist"])
+            say(f"Из списка blocklist.de попыток на SSH: {summary['packets']}, адресов: {summary['sources']}")
+        else:
+            say("Список blocklist.de включён, пока никто из него не стучался на порты SSH.")
     attempts_shown = show_ssh_attempts(say)
     print("\nЧего здесь нет")
     if attempts_shown:
@@ -4057,6 +4142,21 @@ def show_ssh_logins():
         print(f"  {names.get(method, method):<16} {user:<12} {address:<39} {count}")
 
 
+def blocklist_listed(addresses):
+    # Какие из адресов сейчас в наборе blocklist.de (nft get element сам ищет и среди диапазонов).
+    listed = set()
+    for address in addresses:
+        try:
+            version = ipaddress.ip_address(address).version
+        except ValueError:
+            continue
+        answer = probe_output("nft", "-n", "get", "element", "inet", "fw", "bl4" if version == 4 else "bl6",
+                              "{ " + address + " }", timeout=3)
+        if "elements" in answer:
+            listed.add(address)
+    return listed
+
+
 def show_ssh_attempts(say):
     # Нужен, когда вход только по ключам: пароли подобрать нельзя, но видно, кто пробует. True — блок показан.
     import time
@@ -4076,9 +4176,13 @@ def show_ssh_attempts(say):
         f"с разных адресов: {len(found)}. Самые активные (адрес, подключений, чей адрес, какие логины пробовали):")
     top = sorted(found.items(), key=lambda item: (-len(item[1]["conns"]), item[0]))[:10]
     owners = resolve_owners([address for address, _entry in top], "ssh", {})
+    listed = blocklist_listed([address for address, _entry in top])
     for address, entry in top:
         users = ", ".join(user for user, _count in sorted(entry["users"].items(), key=lambda item: (-item[1], item[0]))[:3])
-        print(f"  {address:<39} {len(entry['conns']):>5}  {short_owner(owners.get(address, 'неизвестно'), 40):<40}  {users}")
+        print(f"  {address:<39} {len(entry['conns']):>5}  {short_owner(owners.get(address, 'неизвестно'), 40):<40}  {users}"
+              + ("  · в blocklist.de" if address in listed else ""))
+    if listed:
+        say("Пометка «в blocklist.de»: адрес уже в списке и блокируется на портах SSH, пока список включён и применён.")
     return True
 
 
@@ -4556,6 +4660,41 @@ def configure_ssh_limit():
         paint(33, "Внимание: адрес этого подключения не определён: проверь, что он есть в доверенных.")
 
 
+BLOCKLIST_BEGIN, BLOCKLIST_END = "# BEGIN FW-MENU BLOCKLIST", "# END FW-MENU BLOCKLIST"
+
+
+def blocklist_setting():
+    # Действующее BLOCKLIST_SSH из fw.conf и local.conf.
+    script = 'source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; printf "%s" "${BLOCKLIST_SSH:-0}"'
+    return probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).strip() == "1"
+
+
+def configure_blocklist_ssh():
+    enabled = blocklist_setting()
+    print(textwrap.fill("Список blocklist.de: адреса, которых за последние 48 часов заметили в переборе SSH на чужих серверах "
+                        "(отчёты присылают администраторы по всему миру). Если включить, такие адреса не смогут подключаться "
+                        "к портам SSH этой ноды. Другие порты не затрагиваются; доверенные адреса и LAN_ALLOW пропускаются раньше. "
+                        "Список скачивается при каждом обновлении правил, но не чаще раза в 6 часов.", width=92))
+    print(textwrap.fill("Осторожно: под одним адресом бывает много людей (мобильный интернет, общий NAT), и если на нём кто-то "
+                        "перебирал пароли, адрес попадёт в список вместе со всеми. Свой адрес для входа добавьте в доверенные.", width=92))
+    print(f"Сейчас: {'включено' if enabled else 'выключено'}")
+    value = 0 if enabled else 1
+    if not confirm_yes(("Выключить" if enabled else "Включить") + " блокировку адресов из blocklist.de на SSH? Введи «да» или «нет»: "):
+        print("Отменено, настройка не изменена.")
+        return
+    managed_block = re.compile(r"(?ms)^" + re.escape(BLOCKLIST_BEGIN) + r"\n.*?^" + re.escape(BLOCKLIST_END) + r"(?:\n|$)")
+    with (DIRECTORY / ".api.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = LOCAL_CONFIG.read_text(encoding="utf-8") if LOCAL_CONFIG.exists() else ""
+        current, count = managed_block.subn("", current)
+        if count > 1 or BLOCKLIST_BEGIN in current or BLOCKLIST_END in current:
+            raise ValueError("проверь границы блока FW-MENU BLOCKLIST в local.conf")
+        prefix = current.rstrip("\n") + "\n\n" if current.rstrip("\n") else ""
+        write_text_atomic(LOCAL_CONFIG, f"{prefix}{BLOCKLIST_BEGIN}\nBLOCKLIST_SSH={value}\n{BLOCKLIST_END}\n")
+    print("Настройка сохранена. Дальше открой «Проверить и применить правила»: проверка без применения, "
+          "затем применение с подтверждением и автооткатом.")
+
+
 def command_output(*command):
     return subprocess.run(command, text=True, stdout=subprocess.PIPE, check=True).stdout
 
@@ -4962,7 +5101,7 @@ def show_error_log():
 
 import hashlib
 
-FW_VERSION = "1.9.1"
+FW_VERSION = "1.10.0"
 FW_REPO = "J0ll1er/Nftables-Script"
 HASH_LINE = re.compile(r"^\s*sha256 fw-install\.sh:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 BACKUP_ROOT = Path("/root/fw-rollbacks")
@@ -5386,6 +5525,7 @@ def main():
                 ("Отключить вход по паролю (только по ключу)", disable_password_login),
                 ("Вернуть вход по паролю", enable_password_login),
             )),
+            ("Блокировать на SSH адреса из списка blocklist.de", configure_blocklist_ssh),
         )),
         ("Настроить блокировки", (
             ("Посмотреть подсети ASN и добавить ASN в блокировку", lookup_asn),
@@ -7148,8 +7288,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    'cba0403dcbc0075c5be30c3359d690965a779d371303e99fe80e78c23d62b456' "$stage/update-fw.sh" \
-    'b7ede19904ad23b006ed80fc8c38200c2a00f14ca23942bc836ed5f0b7cd5ba5' "$stage/fw-menu" \
+    '00a004bdd7841063f0d25f40bcb0b7a85af40d1dc9959455a54c3bd0b84b67ea' "$stage/update-fw.sh" \
+    '8ec7d791b59bc631bf0409f9f39e38fcd1705f9e9807ecdaad4aaaeba5190fa5' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

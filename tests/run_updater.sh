@@ -33,6 +33,15 @@ import os, sys, time
 age = time.time() - float(sys.argv[2]) * 86400
 os.utime(sys.argv[1], (age, age))
 PY
+# TEST_BL_CACHE="адреса": кэш списка blocklist.de возрастом TEST_BL_CACHE_AGE_HOURS часов.
+if [ -n "${TEST_BL_CACHE:-}" ]; then
+  printf '%s\n' "$TEST_BL_CACHE" > "$T/fw/scanner-cache/blocklist_ssh"
+  python3 - "$T/fw/scanner-cache/blocklist_ssh" "${TEST_BL_CACHE_AGE_HOURS:-0}" <<'PY'
+import os, sys, time
+age = time.time() - float(sys.argv[2]) * 3600
+os.utime(sys.argv[1], (age, age))
+PY
+fi
 case "${CACHE_ASN:-0}" in
   1) CACHE_LIST="61280 34500" ;;
   0) CACHE_LIST="" ;;

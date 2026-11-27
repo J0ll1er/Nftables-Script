@@ -4933,6 +4933,10 @@ menu = replace_once(menu, '''            ("Что ещё есть на серв�
             ("Статус файрвола подробно", boxed("Статус файрвола подробно", show_status, BOX_HEADINGS)),
 ''', "статус: подробный пункт")
 
+menu = replace_once(menu, 'if quiet("nft", "-t", "list", "table", "inet", "fw") or (DIRECTORY / "fw.nft").exists():',
+                    'if quiet("nft", "list", "chain", "inet", "fw", "input") or (DIRECTORY / "fw.nft").exists():  # цепочка читается быстро, вся таблица с тысячами адресов нет',
+                    "профиль: проверка загруженных правил без чтения всей таблицы")
+
 new_text = text
 for key, replacement in (("menu", menu), ("update", upd)):
     a, b, _ = parts[key]

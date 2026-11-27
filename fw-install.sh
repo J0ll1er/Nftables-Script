@@ -1996,7 +1996,7 @@ def show_profile():
     if not result["entries"]:
         print("  Известных сервисов на внешних портах нет.")
     findings = profile_findings(result, geo_ports, api_ports, hook)
-    if quiet("nft", "-t", "list", "table", "inet", "fw") or (DIRECTORY / "fw.nft").exists():
+    if quiet("nft", "list", "chain", "inet", "fw", "input") or (DIRECTORY / "fw.nft").exists():  # цепочка читается быстро, вся таблица с тысячами адресов нет
         disabled = [unit for unit in ("fw-update.service", "fw-update.timer")
                     if not quiet("systemctl", "is-enabled", "--quiet", unit)]
         if disabled:
@@ -7469,7 +7469,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '04d6e3f3f69a373a0ef52161e3f05895c733e5d662b6cc21704d6831618b9466' "$stage/update-fw.sh" \
-    '42a2bcda2bbbab4d930b7a906ffc5d8caaf7581ca7470a246bce1a1aae4ae049' "$stage/fw-menu" \
+    '311e84ee9527190ca9a90fc4f8f6bc80f2714d828080db12dd4d190c209c92d8' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

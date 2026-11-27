@@ -4733,18 +4733,33 @@ menu = replace_once(menu, '''def dropped_line(group):
     return "     " + text[0].upper() + text[1:]
 ''', '''def dropped_line(group):
     text = dropped_text(group)
-    line = "     " + text[0].upper() + text[1:]
-    if group.get("addresses") is not None:
-        line += f". Адресов за 7 дней: {group['addresses']}"
-    return line
+    return "     " + text[0].upper() + text[1:]
+
+
+def addresses_word(count):
+    tail = count % 100
+    if 11 <= tail <= 14 or count % 10 == 0 or count % 10 >= 5:
+        return "адресов"
+    return "адрес" if count % 10 == 1 else "адреса"
+
+
+def stats_line(group):
+    # Статистика «Кто стучится» живёт 7 дней и не сбрасывается при применении правил, в отличие от счётчика пакетов.
+    count = group.get("addresses")
+    if count is None:
+        return ""
+    return f"     В статистике «Кто стучится»: {count} {addresses_word(count)} за 7 дней"
 ''', "статус: строка с адресами")
 menu = replace_once(menu, '''            else:
                 print(dropped_line(text.group))
 ''', '''            else:
                 print(dropped_line(text.group))
+            if stats_line(text.group):
+                print(stats_line(text.group))
     if any(isinstance(text, CountedStep) for text in steps):
         print(textwrap.fill("Пакет — одно сетевое сообщение: одна попытка подключения состоит из нескольких пакетов. "
-                            "Адреса взяты из статистики «Кто стучится» (она хранится 7 дней).", width=92,
+                            "Пакеты считаются с последнего применения правил, а статистика адресов хранится 7 дней и "
+                            "при применении не сбрасывается.", width=92,
                             initial_indent="  ", subsequent_indent="  "))
 ''', "статус: пояснение про пакеты")
 menu = replace_once(menu, '''                ("SSH_RATE_LIMIT", f"{ssh_rate} в минуту" if ssh_rate else "выключено", "включено" if ssh_rate else ""),

@@ -219,16 +219,22 @@ class AddressCounts(unittest.TestCase):
         text = self.render({"bs4": [self.pair("198.51.100.7", 22), self.pair("198.51.100.7", 2222), self.pair("203.0.113.9", 22)],
                             "bs6": [self.pair("2001:db8:5::1", 22)]}, "blocklist-ssh",
                            [{"set": {"op": "add", "elem": {}, "set": "@bs4"}}])
-        self.assertRegex(text, r"Отброшено пакетов: 40.*Адресов за 7 дней: 3")
+        self.assertRegex(text, r"Отброшено пакетов: 40.*\n\s+В статистике «Кто стучится»: 3 адреса за 7 дней")
 
     def test_scanner_step_gets_the_same_line(self):
         text = self.render({"ss4": [self.pair("192.0.2.5", 80), self.pair("192.0.2.6", 80)], "ss6": []}, "scanners")
-        self.assertRegex(text, r"Отброшено пакетов: 40.*Адресов за 7 дней: 2")
+        self.assertRegex(text, r"Отброшено пакетов: 40.*\n\s+В статистике «Кто стучится»: 2 адреса за 7 дней")
 
     def test_no_address_count_without_the_stats_sets(self):
         text = self.render({}, "scanners")
         self.assertIn("Отброшено пакетов: 40", text)
-        self.assertNotIn("Адресов за 7 дней", text)
+        self.assertNotIn("В статистике", text)
+
+    def test_russian_plural(self):
+        menu = load()
+        words = {n: menu.addresses_word(n) for n in (0, 1, 2, 4, 5, 11, 21, 22, 111, 3242, 1137)}
+        self.assertEqual(words, {0: "адресов", 1: "адрес", 2: "адреса", 4: "адреса", 5: "адресов", 11: "адресов",
+                                 21: "адрес", 22: "адреса", 111: "адресов", 3242: "адреса", 1137: "адресов"})
 
     def test_packet_is_explained_once(self):
         text = self.render({"ss4": [self.pair("192.0.2.5", 80)], "ss6": []}, "scanners")

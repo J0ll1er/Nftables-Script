@@ -2097,10 +2097,22 @@ class CountedStep(str):
 
 def dropped_line(group):
     text = dropped_text(group)
-    line = "     " + text[0].upper() + text[1:]
-    if group.get("addresses") is not None:
-        line += f". Адресов за 7 дней: {group['addresses']}"
-    return line
+    return "     " + text[0].upper() + text[1:]
+
+
+def addresses_word(count):
+    tail = count % 100
+    if 11 <= tail <= 14 or count % 10 == 0 or count % 10 >= 5:
+        return "адресов"
+    return "адрес" if count % 10 == 1 else "адреса"
+
+
+def stats_line(group):
+    # Статистика «Кто стучится» живёт 7 дней и не сбрасывается при применении правил, в отличие от счётчика пакетов.
+    count = group.get("addresses")
+    if count is None:
+        return ""
+    return f"     В статистике «Кто стучится»: {count} {addresses_word(count)} за 7 дней"
 
 
 def dropped_text(group):
@@ -2233,9 +2245,12 @@ def explain_rules(items):
                 paint(33, dropped_line(text.group))
             else:
                 print(dropped_line(text.group))
+            if stats_line(text.group):
+                print(stats_line(text.group))
     if any(isinstance(text, CountedStep) for text in steps):
         print(textwrap.fill("Пакет — одно сетевое сообщение: одна попытка подключения состоит из нескольких пакетов. "
-                            "Адреса взяты из статистики «Кто стучится» (она хранится 7 дней).", width=92,
+                            "Пакеты считаются с последнего применения правил, а статистика адресов хранится 7 дней и "
+                            "при применении не сбрасывается.", width=92,
                             initial_indent="  ", subsequent_indent="  "))
 
 
@@ -7341,7 +7356,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '04d6e3f3f69a373a0ef52161e3f05895c733e5d662b6cc21704d6831618b9466' "$stage/update-fw.sh" \
-    'e6f24a4e340a31fa3083d6b3c2cc3e342ac42ac5f22f4b3c48c8c721a4059dc9' "$stage/fw-menu" \
+    'a2e1574a5c2060ab07dedd809bd7801e28c604ef1bb9f5d1d864689ac53eafc8' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

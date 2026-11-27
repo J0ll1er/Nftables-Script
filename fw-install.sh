@@ -1,7 +1,7 @@
 bash <<'INSTALL_FW'
 # Файрвол /opt/fw: геофильтр RU, блокировка сканеров, защита порта управления.
 # Один блок и для новой установки, и для обновления существующей.
-# Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет
+# Без диалога: FW_GEO_PORTS="443 8443" FW_PANEL_IP="203.0.113.10" FW_DEFAULT_ASN=да|нет FW_BLOCKLIST_SSH=да|нет
 set -euo pipefail
 umask 022
 FW_VERSION='1.10.0'
@@ -76,6 +76,7 @@ DIR=/opt/fw
 CACHE=$DIR/fw.nft
 SCAN_CACHE=$DIR/scanner-cache
 DRY=0; [ "${1:-}" = "--dry" ] && DRY=1
+BL_ONLY=0; [ "${1:-}" = "--blocklist" ] && BL_ONLY=1
 PENDING=${FW_PENDING:-0}; [ "$PENDING" = 0 ] || [ "$PENDING" = 1 ] || exit 2
 MODE=apply; [ "$DRY" = 1 ] && MODE=dry
 ERRLOG=$DIR/errors.log
@@ -434,6 +435,76 @@ dl() {
   fi
   return "$code"
 }
+
+# blocklist.de: скачивание и проверка. В список попадают только отдельные публичные адреса.
+fetch_blocklist() {
+  dl "$MAX_LIST_BYTES" "$TMP/bl_raw" --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 15 "$BLOCKLIST_URL" || return 1
+  python3 - "$TMP/bl_raw" "$1" <<'PY'
+import ipaddress
+from pathlib import Path
+import sys
+SKIP = [ipaddress.ip_network(net) for net in (
+    "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
+    "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")]
+found = set()
+for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict").splitlines():
+    line = line.partition("#")[0].strip()
+    if not line:
+        continue
+    try:
+        address = ipaddress.ip_address(line)
+    except ValueError:
+        sys.exit("в списке не адрес: " + line[:40])
+    if any(address.version == net.version and address in net for net in SKIP):
+        continue
+    found.add(address)
+if not found or len(found) > 200000:
+    sys.exit("в списке %d адресов" % len(found))
+Path(sys.argv[2]).write_text("".join(f"{a}\n" for a in sorted(found, key=lambda a: (a.version, int(a)))), encoding="utf-8")
+PY
+}
+# Файл не старше N минут (кэш списка живёт недолго: в нём адреса за двое суток).
+bl_younger_than() { [ -s "$1" ] && [ -n "$(find "$1" -maxdepth 0 -mmin "-$2" 2>/dev/null)" ]; }
+
+# schedule_blocklist: следующее обновление списка через 6 часов (разовый таймер systemd, живёт до перезагрузки;
+# после неё цепочку заново запускает ближайшее суточное обновление).
+schedule_blocklist() {
+  [ "$DRY" = 0 ] && [ "$BLOCKLIST_SSH" = 1 ] || return 0
+  command -v systemd-run >/dev/null || return 0
+  systemctl is-enabled --quiet fw-update.timer 2>/dev/null || return 0
+  systemctl stop 'fw-blocklist-*.timer' >/dev/null 2>&1 || true
+  systemd-run --quiet --collect --unit="fw-blocklist-$(date +%s)" --on-active=6h "$DIR/update-fw.sh" --blocklist >/dev/null 2>&1 || true
+}
+if [ "$BL_ONLY" = 1 ]; then
+  [ "$BLOCKLIST_SSH" = 1 ] || exit 0
+  systemctl is-enabled --quiet fw-update.timer 2>/dev/null || exit 0   # автообновление выключено вручную
+  for state in "$DIR"/.rollback-*; do [ ! -d "$state" ] || { echo "Идёт применение правил, список обновится позже"; exit 0; }; done
+  if ! nft list set inet fw bl4 >/dev/null 2>&1 || ! nft list set inet fw bl6 >/dev/null 2>&1; then
+    echo "Правила blocklist.de ещё не загружены, список обновится при полном обновлении"; exit 0
+  fi
+  BL_CACHE=$SCAN_CACHE/blocklist_ssh
+  if ! fetch_blocklist "$TMP/bl_new" || ! growth_ok "$TMP/bl_new" "$BL_CACHE" "blocklist.de SSH"; then
+    note "WARN: список blocklist.de недоступен или подозрителен, оставляю прежний"
+    schedule_blocklist; exit 0
+  fi
+  split "$TMP/bl_new" "$TMP/bl4" "$TMP/bl6"
+  {
+    for family in 4 6; do
+      echo "flush set inet fw bl$family"
+      [ ! -s "$TMP/bl$family" ] || echo "add element inet fw bl$family { $(paste -sd, "$TMP/bl$family") }"
+    done
+  } > "$TMP/bl.nft"
+  nft -c -f "$TMP/bl.nft" || fail_keep "nft -c не принял список blocklist.de"
+  nft -f "$TMP/bl.nft" || fail_keep "nft не применил список blocklist.de"
+  mkdir -p "$SCAN_CACHE" || fail_save "не создался каталог кэша списков"
+  staged_cache=$(mktemp "$SCAN_CACHE/.new.XXXXXXXX") || fail_save "не создался временный файл для blocklist.de"
+  if ! cat "$TMP/bl_new" > "$staged_cache" || ! mv -fT "$staged_cache" "$BL_CACHE"; then
+    rm -f -- "$staged_cache"
+    fail_save "не сохранился кэш blocklist.de"
+  fi
+  echo "blocklist.de SSH обновлён: $(cat "$TMP/bl4" "$TMP/bl6" | wc -l) адр."
+  schedule_blocklist; exit 0
+fi
 
 # fetch_asn ASN НАЗНАЧЕНИЕ
 # Сначала RIPEstat, затем ежедневный снимок ipverse (обычные файлы на GitHub).
@@ -898,35 +969,6 @@ ssh_ports_detect() {
   [ -n "$found" ] || found=$(awk 'tolower($1) == "port" && $2 ~ /^[0-9]+$/ { print $2 }' /etc/ssh/sshd_config 2>/dev/null | sort -un | tr '\n' ' ')
   echo "${found:-22}"
 }
-# blocklist.de: скачивание и проверка. В список попадают только отдельные публичные адреса.
-fetch_blocklist() {
-  dl "$MAX_LIST_BYTES" "$TMP/bl_raw" --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 15 "$BLOCKLIST_URL" || return 1
-  python3 - "$TMP/bl_raw" "$1" <<'PY'
-import ipaddress
-from pathlib import Path
-import sys
-SKIP = [ipaddress.ip_network(net) for net in (
-    "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
-    "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")]
-found = set()
-for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict").splitlines():
-    line = line.partition("#")[0].strip()
-    if not line:
-        continue
-    try:
-        address = ipaddress.ip_address(line)
-    except ValueError:
-        sys.exit("в списке не адрес: " + line[:40])
-    if any(address.version == net.version and address in net for net in SKIP):
-        continue
-    found.add(address)
-if not found or len(found) > 200000:
-    sys.exit("в списке %d адресов" % len(found))
-Path(sys.argv[2]).write_text("".join(f"{a}\n" for a in sorted(found, key=lambda a: (a.version, int(a)))), encoding="utf-8")
-PY
-}
-# Файл не старше N минут (кэш списка живёт недолго: в нём адреса за двое суток).
-bl_younger_than() { [ -s "$1" ] && [ -n "$(find "$1" -maxdepth 0 -mmin "-$2" 2>/dev/null)" ]; }
 BL_RULES=0; BL_FRESH=0
 if [ "$BLOCKLIST_SSH" = 1 ]; then
   BL_CACHE=$SCAN_CACHE/blocklist_ssh
@@ -1110,6 +1152,7 @@ for fresh in "$TMP/asn/"*; do
   fi
 done
 if [ "$missing" -gt 0 ]; then schedule_retry; else rm -f -- "$DIR/.retry"; fi
+schedule_blocklist
 echo "OK: применено"
 if [ "$PENDING" = 1 ]; then verdict "правила загружены и ждут подтверждения"; else verdict "правила применены"; fi
 FW_UPDATER_FILE
@@ -2220,7 +2263,7 @@ def explain_rules(items):
             updated = blocklist_updated()
             steps.append(CountedStep(f"{ports_phrase(group['ports'], 'SSH, порт', 'SSH, порты')}: адреса из списка blocklist.de "
                                      "(перебирали SSH за последние 48 часов) отбрасываются. "
-                                     "Список обновляется вместе с правилами" + (f", обновлён {updated}." if updated else "."), group))
+                                     "Список обновляется каждые 6 часов и при суточном обновлении правил" + (f", обновлён {updated}." if updated else "."), group))
         elif kind == "ssh_rate":
             steps.append(CountedStep(f"{ports_phrase(group['ports'], 'SSH, порт', 'SSH, порты')}: с одного адреса не больше "
                                      f"{group['rate']} новых подключений в минуту, лишние отбрасываются. "
@@ -2987,6 +3030,9 @@ def show_hits():
             say(f"Из списка blocklist.de попыток на SSH: {summary['packets']}, адресов: {summary['sources']}")
         else:
             say("Список blocklist.de включён, пока никто из него не стучался на порты SSH.")
+        password_note = blocklist_password_note()
+        if password_note:
+            say("Вход по паролю на этом сервере отключён, поэтому список защищает дополнительно: подбор паролей здесь всё равно не сработает.")
     attempts_shown = show_ssh_attempts(say)
     print("\nЧего здесь нет")
     if attempts_shown:
@@ -3141,7 +3187,7 @@ def status_body(problems):
         for name, shown, note in (
                 ("LAN_ALLOW", values[0] or "выключено", ""),
                 ("SSH_RATE_LIMIT", f"{ssh_rate} в минуту" if ssh_rate else "выключено", "включено" if ssh_rate else ""),
-                ("BLOCKLIST_SSH", "включено" if blocklist_on else "выключено", "" if blocklist_on else not_default),
+                ("BLOCKLIST_SSH", "включено" if blocklist_on else "выключено", blocklist_password_note() if blocklist_on else not_default),
                 ("CONFIRM_TIMEOUT", f"{values[1]} с", not_default if values[1] != "60" else ""),
                 ("MAX_GROWTH", values[2], not_default if values[2] != "3" else ""),
                 ("MIN_KEEP", values[3], not_default if values[3] != "0.2" else ""),
@@ -4286,6 +4332,11 @@ def show_ssh_logins():
         print(f"  {names.get(method, method):<16} {user:<12} {address:<39} {count}")
 
 
+def blocklist_password_note():
+    # Список нужен против подбора паролей. Если sshd паролей не принимает, он защищает только дополнительно.
+    return "" if password_login_open() else "вход по паролю на сервере отключён, список защищает дополнительно"
+
+
 def blocklist_updated():
     # Как давно скачан список blocklist.de (по времени файла кэша); пусто, если файла нет.
     import time
@@ -4853,10 +4904,13 @@ def configure_blocklist_ssh():
     print(textwrap.fill("Список blocklist.de: адреса, которых за последние 48 часов заметили в переборе SSH на чужих серверах "
                         "(отчёты присылают администраторы по всему миру). Если включить, такие адреса не смогут подключаться "
                         "к портам SSH этой ноды. Другие порты не затрагиваются; доверенные адреса и LAN_ALLOW пропускаются раньше. "
-                        "Список обновляется вместе с правилами, по таймеру (по умолчанию раз в сутки); чаще чем раз в 6 часов он не скачивается.", width=92))
+                        "Список обновляется каждые 6 часов (пока включено автообновление) и при суточном обновлении правил.", width=92))
     print(textwrap.fill("Осторожно: под одним адресом бывает много людей (мобильный интернет, общий NAT), и если на нём кто-то "
                         "перебирал пароли, адрес попадёт в список вместе со всеми. Свой адрес для входа добавьте в доверенные.", width=92))
     print(f"Сейчас: {'включено' if enabled else 'выключено'}")
+    if enabled and blocklist_password_note():
+        print(textwrap.fill("Вход по паролю на сервере отключён, подбор паролей здесь не сработает: список защищает дополнительно "
+                            "(он сокращает шум в журнале и лишние подключения).", width=92))
     value = 0 if enabled else 1
     if not confirm_yes(("Выключить" if enabled else "Включить") + " блокировку адресов из blocklist.de на SSH? Введи «да» или «нет»: "):
         print("Отменено, настройка не изменена.")
@@ -7468,8 +7522,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    '04d6e3f3f69a373a0ef52161e3f05895c733e5d662b6cc21704d6831618b9466' "$stage/update-fw.sh" \
-    '311e84ee9527190ca9a90fc4f8f6bc80f2714d828080db12dd4d190c209c92d8' "$stage/fw-menu" \
+    'e40760cfe339b767f6cc5df05202e8a958a2d2be86d3f240cde4f9cab4d21a7a' "$stage/update-fw.sh" \
+    'cad9257fad3f633cffa47d654dc59bc14cde23bc9d8ba09c6fc36271d944a9f4' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1
@@ -7709,6 +7763,19 @@ if [ -n "$lan_candidate" ]; then
   if [ "$enable_lan" = да ]; then lan_default=$lan_candidate; fi
 fi
 
+# --- вопрос про blocklist.de ---
+blocklist_ssh=${FW_BLOCKLIST_SSH:-}
+if [ -z "$blocklist_ssh" ]; then
+  echo 'Список blocklist.de: адреса, замеченные в переборе SSH за последние 48 часов, блокируются на портах SSH.'
+  echo 'Доверенные адреса не затрагиваются. Список обновляется каждые 6 часов.'
+  ask blocklist_ssh 'Включить блокировку по blocklist.de? да/нет' 'да'
+fi
+case "$blocklist_ssh" in
+  да|yes|y|1) blocklist_ssh=да ;;
+  нет|no|n|0) blocklist_ssh=нет ;;
+  *) echo 'Для blocklist.de нужен ответ да или нет (FW_BLOCKLIST_SSH). Ничего не установлено.' >&2; exit 1 ;;
+esac
+# --- конец вопроса про blocklist.de ---
 install -d -m 0755 /opt
 mkdir -m 0700 "$FW"
 {
@@ -7734,6 +7801,13 @@ fi
 if [ -n "$panel_ip" ]; then
   printf "# BEGIN FW-MENU API\nAPI_PORTS='%s'\nAPI_ALLOW='%s'\n# END FW-MENU API\n" "$NODE_PORTS" "$panel_ip" > "$FW/local.conf"
   echo "Порт $NODE_PORTS будет открыт только для: $panel_ip"
+fi
+
+if [ "$blocklist_ssh" = нет ]; then
+  printf '# BEGIN FW-MENU BLOCKLIST\nBLOCKLIST_SSH=0\n# END FW-MENU BLOCKLIST\n' >> "$FW/local.conf"
+  echo 'blocklist.de выключен. Включить: fw-menu → 2 → 7.'
+else
+  echo 'blocklist.de включён: SSH-перебор с адресов из списка будет блокироваться.'
 fi
 
 install_seed

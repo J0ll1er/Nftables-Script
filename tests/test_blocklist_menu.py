@@ -217,7 +217,7 @@ class StatusText(unittest.TestCase):
         self.assertIn("порт 22", text)
         self.assertRegex(text, r"Отброшено пакетов: 4")
         self.assertRegex(text, r"Адреса blocklist\.de, блокируются на SSH")
-        self.assertIn("обновляется вместе с правилами", text)
+        self.assertIn("обновляется каждые 6 часов", text)
         self.assertIn("обновлён 3 ч назад", text)
 
 
@@ -264,7 +264,7 @@ class AddressCounts(unittest.TestCase):
 
     def test_blocklist_step_says_how_the_list_is_refreshed(self):
         text = self.render({}, "blocklist-ssh")
-        self.assertIn("обновляется вместе с правилами", text)
+        self.assertIn("обновляется каждые 6 часов", text)
 
 
 class FirstPacket(unittest.TestCase):
@@ -283,3 +283,46 @@ class FirstPacket(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PasswordNote(unittest.TestCase):
+    NOTE = "вход по паролю на сервере отключён, список защищает дополнительно"
+
+    def test_note_when_passwords_are_off(self):
+        menu = load()
+        menu.password_login_open = lambda: False
+        self.assertEqual(menu.blocklist_password_note(), self.NOTE)
+
+    def test_no_note_when_passwords_are_open(self):
+        menu = load()
+        menu.password_login_open = lambda: True
+        self.assertEqual(menu.blocklist_password_note(), "")
+
+    def test_configure_screen_mentions_it_only_when_enabled(self):
+        for enabled, passwords_open, expected in ((True, False, True), (True, True, False), (False, False, False)):
+            menu = load()
+            menu.password_login_open = lambda value=passwords_open: value
+            menu.blocklist_setting = lambda value=enabled: value
+            menu.confirm_yes = lambda prompt="": False
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                menu.configure_blocklist_ssh()
+            self.assertEqual("защищает дополнительно" in " ".join(out.getvalue().split()), expected, (enabled, passwords_open))
+
+    def test_hits_screen_says_it_when_passwords_are_off(self):
+        menu = load()
+        menu.password_login_open = lambda: False
+        menu.lookup_owner = lambda address: ""
+        menu.screen_columns = lambda: 120
+        menu.show_ssh_attempts = lambda say: False
+        rows = "elements = { 198.51.100.7 . 22 counter packets 5 bytes 300 expires 6d }"
+        menu.probe_output = lambda *c, **_: rows if c[-1] == "bs4" else ""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            menu.show_hits()
+        self.assertIn("подбор паролей здесь всё равно не сработает", " ".join(out.getvalue().split()))
+        menu.password_login_open = lambda: True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            menu.show_hits()
+        self.assertNotIn("подбор паролей здесь всё равно не сработает", " ".join(out.getvalue().split()))

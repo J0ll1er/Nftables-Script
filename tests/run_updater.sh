@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 name=$1; shift
 T=$ROOT/t/$name
 rm -rf "$T"; mkdir -p "$T/fw/scanner-cache" "$T/stubs"
-cp "$ROOT/tests/stubs/curl" "$ROOT/tests/stubs/nft" "$ROOT/tests/stubs/flock" "$ROOT/tests/stubs/sshd" "$T/stubs/"
+cp "$ROOT/tests/stubs/curl" "$ROOT/tests/stubs/nft" "$ROOT/tests/stubs/flock" "$ROOT/tests/stubs/sshd" "$ROOT/tests/stubs/systemctl" "$ROOT/tests/stubs/systemd-run" "$T/stubs/"
 chmod +x "$T/stubs/"*
 python3 -I "$ROOT/tests/mkgeo.py" "$T/geo.dat"
 sed "s#^DIR=/opt/fw#DIR=$T/fw#" "$ROOT/build/update-fw.sh" > "$T/fw/update-fw.sh"

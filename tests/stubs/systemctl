@@ -1,0 +1,7 @@
+#!/bin/bash
+# Заглушка systemctl: пишет вызовы; is-enabled отвечает кодом STUB_TIMER_ENABLED (0 — таймер включён).
+echo "systemctl $*" >> "$STUB_DIR/systemctl_calls"
+case "$1" in
+  is-enabled) exit "${STUB_TIMER_ENABLED:-0}" ;;
+esac
+exit 0

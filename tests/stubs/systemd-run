@@ -1,0 +1,4 @@
+#!/bin/bash
+# Заглушка systemd-run: пишет аргументы разовых таймеров.
+echo "systemd-run $*" >> "$STUB_DIR/systemd_run_calls"
+exit 0

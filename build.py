@@ -4933,34 +4933,6 @@ menu = replace_once(menu, '''            ("Что ещё есть на серв�
             ("Статус файрвола подробно", boxed("Статус файрвола подробно", show_status, BOX_HEADINGS)),
 ''', "статус: подробный пункт")
 
-STATUS_PREFETCH_CODE = r'''STATUS_PREFETCH = {}
-
-
-def prefetch_status():
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-    STATUS_PREFETCH["profile"] = pool.submit(collect_profile)
-    STATUS_PREFETCH["table"] = pool.submit(
-        lambda: subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
-                               text=True, capture_output=True, check=False))
-    pool.shutdown(wait=False)
-
-
-def prefetched(name, fallback):
-    future = STATUS_PREFETCH.pop(name, None)
-    return future.result() if future else fallback()
-
-
-def status_body(problems):
-'''
-menu = replace_once(menu, "def status_body(problems):\n", STATUS_PREFETCH_CODE, "статус: параллельные запросы (определение)")
-menu = replace_once(menu, '    print("Проверка файлов и команд")\n', '    prefetch_status()  # самые долгие запросы идут параллельно с остальной проверкой\n    print("Проверка файлов и команд")\n', "статус: запуск параллельных запросов")
-menu = replace_once(menu, "def show_profile():\n    result = collect_profile()\n", "def show_profile():\n    result = prefetched(\"profile\", collect_profile)\n", "статус: профиль из параллельного запроса")
-menu = replace_once(menu, '''    table = subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
-                           text=True, capture_output=True, check=False)
-    if table.returncode:''', '''    table = prefetched("table", lambda: subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
-                                                       text=True, capture_output=True, check=False))
-    if table.returncode:''', "статус: правила из параллельного запроса")
-
 new_text = text
 for key, replacement in (("menu", menu), ("update", upd)):
     a, b, _ = parts[key]

@@ -2447,7 +2447,7 @@ PORT_NAMES = {
 
 def parse_hits(text):
     """Строки «адрес . порт counter packets N bytes M» из вывода `nft list set`."""
-    return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
+    return [(address, int(port), max(int(packets), 1), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
 
 
 HIT_AGE_RE = re.compile(r"([0-9a-fA-F:.]+) \. \d+ counter packets \d+ bytes \d+(?: timeout \S+)? expires ([0-9dhms]+)")
@@ -3125,7 +3125,8 @@ def status_body(problems):
     if trusted_names():
         print(f"  Доверенных DDNS-адресов — {len(trusted_names())} (IP подставляется при каждом обновлении)")
     warn_old_trusted()
-    warn_reverse_proxy()
+    if not STATUS_COMPACT:  # в коротком виде этот блок не показывается, значит docker, ss и nsenter запускать незачем
+        warn_reverse_proxy()
     findings = show_profile() or []
     if findings:
         problems.append((33, f"расхождения с настройками: {len(findings)} (подробности в блоке «Профиль сервера»)"))
@@ -7447,7 +7448,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '04d6e3f3f69a373a0ef52161e3f05895c733e5d662b6cc21704d6831618b9466' "$stage/update-fw.sh" \
-    'fda9f42ce0a65ee00c2b45f8577b12567097733ec18a8c02d5e7d86349e1d78c' "$stage/fw-menu" \
+    '4c0ad3bb2bcc032f2a0ffdf4b4d4f503bad635df54aadea0f72fd82096674c9b' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

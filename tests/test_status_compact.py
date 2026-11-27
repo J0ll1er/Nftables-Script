@@ -139,5 +139,31 @@ class MenuEntries(unittest.TestCase):
         self.assertLess(c, source.index('("Настроить доступ"'))
 
 
+class SkipsWastedWork(unittest.TestCase):
+    # Короткий статус не показывает проверку reverse proxy, значит и запускать её (docker, ss, nsenter) незачем.
+    def setUp(self):
+        from tests import test_status_layout as layout
+        self.base = layout.Status("test_everything_fine_gives_one_green_line_first")
+        self.base.setUp()
+        self.menu = self.base.menu
+        self.calls = []
+        self.menu.warn_reverse_proxy = lambda: self.calls.append("proxy")
+
+    def tearDown(self):
+        self.base.tearDown()
+
+    def run_status(self, **kwargs):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.menu.show_status(**kwargs)
+
+    def test_short_status_does_not_probe_the_proxies(self):
+        self.run_status(compact=True)
+        self.assertEqual(self.calls, [])
+
+    def test_detailed_status_still_does(self):
+        self.run_status()
+        self.assertEqual(self.calls, ["proxy"])
+
+
 if __name__ == "__main__":
     unittest.main()

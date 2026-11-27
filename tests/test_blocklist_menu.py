@@ -245,5 +245,19 @@ class AddressCounts(unittest.TestCase):
         self.assertIn("обновляется вместе с правилами", text)
 
 
+class FirstPacket(unittest.TestCase):
+    def test_a_recorded_address_has_at_least_one_packet(self):
+        menu = load()
+        rows = menu.parse_hits("elements = { 198.51.100.7 . 22 counter packets 0 bytes 0 expires 6d, "
+                               "203.0.113.9 . 22 counter packets 5 bytes 300 expires 6d }")
+        self.assertEqual([packets for _a, _p, packets, _s in rows], [1, 5])
+
+    def test_summary_never_has_fewer_packets_than_addresses(self):
+        menu = load()
+        text = "elements = { " + ", ".join(f"198.51.100.{n} . 22 counter packets 0 bytes 0 expires 6d" for n in range(1, 11)) + " }"
+        summary = menu.summarize_hits(menu.parse_hits(text))
+        self.assertGreaterEqual(summary["packets"], summary["sources"])
+
+
 if __name__ == "__main__":
     unittest.main()

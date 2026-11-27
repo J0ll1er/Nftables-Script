@@ -4773,6 +4773,12 @@ menu = replace_once(menu, '''        print("\\nНастройки")
         blocklist_on = blocklist_setting()
 ''', "статус: значение blocklist")
 
+# Запись в наборе статистики появляется от пакета, значит пакетов в ней не меньше одного, даже если счётчик
+# nft показывает 0 (первый пакет он может не засчитывать). Иначе адресов выходило больше, чем пакетов.
+menu = replace_once(menu, '''    return [(address, int(port), int(packets), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
+''', '''    return [(address, int(port), max(int(packets), 1), int(size)) for address, port, packets, size in HIT_RE.findall(text)]
+''', "статистика: не меньше одного пакета на запись")
+
 # ---------------------------------------------------------------- короткий «Статус файрвола» (1.10.0)
 # 1 → 1 показывает коротко: итог, что включено, когда обновление, что делает каждое правило.
 # 1 → 5 — прежний подробный экран (проверка файлов, профиль сервера, списки адресов, настройки).
@@ -4888,6 +4894,12 @@ menu = replace_once(menu, '''        print(textwrap.fill(f"{number}. {text}", wi
 menu = replace_once(menu, '''    if any(isinstance(text, CountedStep) for text in steps):
         print(textwrap.fill("Пакет''', '''    if not STATUS_COMPACT and any(isinstance(text, CountedStep) for text in steps):
         print(textwrap.fill("Пакет''', "статус: пояснение про пакеты только в подробном")
+menu = replace_once(menu, '''    warn_old_trusted()
+    warn_reverse_proxy()
+''', '''    warn_old_trusted()
+    if not STATUS_COMPACT:  # в коротком виде этот блок не показывается, значит docker, ss и nsenter запускать незачем
+        warn_reverse_proxy()
+''', "статус: короткий вид без проверки reverse proxy")
 menu = replace_once(menu, '''def settings_paths():''', '''def show_status_short():
     show_status(compact=True)
 

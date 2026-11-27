@@ -76,3 +76,16 @@ class Install(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FreshInstallChain(unittest.TestCase):
+    def test_chain_starts_right_after_the_timer_is_enabled(self):
+        # На чистой установке первый update-fw.sh идёт до включения таймера и цепочку не ставит:
+        # её запускает apply_rules сразу после «systemctl enable --now fw-update.timer».
+        text = (ROOT / "build" / "fw-menu").read_text(encoding="utf-8")
+        start = text.index("def apply_rules():")
+        body = text[start:text.index("\ndef remove_rules", start)]
+        enabled = body.index('"enable", "--now", "fw-update.timer"')
+        started = body.index('[str(UPDATER), "--blocklist"]')
+        self.assertGreater(started, enabled)
+        self.assertLess(started, body.index("reconcile_reinstall_guard()"))

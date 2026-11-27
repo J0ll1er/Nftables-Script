@@ -5010,6 +5010,13 @@ menu = replace_once(menu, '''    print(f"Сейчас: {'включено' if en
                             "(он сокращает шум в журнале и лишние подключения).", width=92))
 ''', "blocklist: пояснение про пароли (настройка)")
 
+# На чистой установке таймер включается уже после первого запуска update-fw.sh, поэтому цепочку 6-часовых обновлений
+# blocklist.de запускаем сразу после включения таймера, а не ждём суточного обновления.
+menu = replace_once(menu, '''            print("Правила подтверждены. Таймер включён.")
+''', '''            print("Правила подтверждены. Таймер включён.")
+            subprocess.run([str(UPDATER), "--blocklist"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+''', "blocklist: цепочка сразу после включения таймера")
+
 new_text = text
 for key, replacement in (("menu", menu), ("update", upd)):
     a, b, _ = parts[key]

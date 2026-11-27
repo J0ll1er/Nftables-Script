@@ -4593,6 +4593,7 @@ def apply_rules():
             return
         if run("systemctl", "enable", "fw-update.service") and run("systemctl", "enable", "--now", "fw-update.timer"):
             print("Правила подтверждены. Таймер включён.")
+            subprocess.run([str(UPDATER), "--blocklist"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             result = last_result()
             if result == "ok":
                 paint(32, "ИТОГ: ВСЁ В ПОРЯДКЕ — правила применены и подтверждены, таймер включён")
@@ -7523,7 +7524,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     'e40760cfe339b767f6cc5df05202e8a958a2d2be86d3f240cde4f9cab4d21a7a' "$stage/update-fw.sh" \
-    'cad9257fad3f633cffa47d654dc59bc14cde23bc9d8ba09c6fc36271d944a9f4' "$stage/fw-menu" \
+    '2953534d840d64a5426ade94317ee19494a834106f42165d163917b8753a7b6d' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

@@ -3347,14 +3347,14 @@ menu = replace_once(menu, '''        rows = collected[kind]
 ''', "SSH-статистика: пустая группа")
 
 # ---------------------------------------------------------------- список blocklist.de для SSH (1.10.0)
-# Необязательно, по умолчанию выключено: BLOCKLIST_SSH=1. Адреса из ssh.txt (замеченные в переборе SSH
+# По умолчанию включено (BLOCKLIST_SSH=0 выключает). Адреса из ssh.txt (замеченные в переборе SSH
 # за последние 48 часов) отбрасываются только на портах SSH; доверенные и LAN_ALLOW пропускаются раньше.
 upd = replace_once(upd, 'SSH_RATE_LIMIT="${SSH_RATE_LIMIT:-0}"; SSH_PORTS="${SSH_PORTS-}"\n',
                    'SSH_RATE_LIMIT="${SSH_RATE_LIMIT:-0}"; SSH_PORTS="${SSH_PORTS-}"\n'
-                   'BLOCKLIST_SSH="${BLOCKLIST_SSH:-0}"; BLOCKLIST_URL="https://lists.blocklist.de/lists/ssh.txt"\n'
+                   'BLOCKLIST_SSH="${BLOCKLIST_SSH:-1}"; BLOCKLIST_URL="https://lists.blocklist.de/lists/ssh.txt"\n'
                    'BLOCKLIST_REFRESH_MIN=360; BLOCKLIST_MAX_AGE_MIN=4320\n', "blocklist: настройки")
 upd = replace_once(upd, 'for ssh_port in $SSH_PORTS; do\n',
-                   '[[ "$BLOCKLIST_SSH" =~ ^[01]$ ]] || fail_keep "BLOCKLIST_SSH: 0 (выключено) или 1"\n'
+                   '[[ "$BLOCKLIST_SSH" =~ ^[01]$ ]] || fail_keep "BLOCKLIST_SSH: 1 (включено) или 0 (выключено)"\n'
                    'for ssh_port in $SSH_PORTS; do\n', "blocklist: проверка настройки")
 upd = replace_once(upd, 'SSH_RULES=0\nif [ "$SSH_RATE_LIMIT" -gt 0 ]; then\n', r'''# blocklist.de: скачивание и проверка. В список попадают только отдельные публичные адреса.
 fetch_blocklist() {
@@ -4637,12 +4637,19 @@ menu = replace_once(menu, '''                ("Вернуть вход по па
             )),
             ("Блокировать на SSH адреса из списка blocklist.de", configure_blocklist_ssh),
 ''', "blocklist: пункт меню")
+menu = replace_once(menu, '''    if "api_lock" in kinds:
+        rows.append(("Допущенные к порту управления", "ap4", "ap6"))
+''', '''    if "blocklist" in kinds:
+        rows.append(("Адреса blocklist.de, блокируются на SSH", "bl4", "bl6"))
+    if "api_lock" in kinds:
+        rows.append(("Допущенные к порту управления", "ap4", "ap6"))
+''', "blocklist: строка в списках статуса")
 menu = replace_once(menu, 'def command_output(*command):\n', r'''BLOCKLIST_BEGIN, BLOCKLIST_END = "# BEGIN FW-MENU BLOCKLIST", "# END FW-MENU BLOCKLIST"
 
 
 def blocklist_setting():
     # Действующее BLOCKLIST_SSH из fw.conf и local.conf.
-    script = 'source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; printf "%s" "${BLOCKLIST_SSH:-0}"'
+    script = 'source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; printf "%s" "${BLOCKLIST_SSH:-1}"'
     return probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).strip() == "1"
 
 

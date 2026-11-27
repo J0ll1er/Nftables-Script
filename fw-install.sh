@@ -151,7 +151,7 @@ source "$DIR/fw.conf"
 API_PORTS="${API_PORTS:-}"; API_ALLOW="${API_ALLOW:-}"
 LAN_ALLOW="${LAN_ALLOW-}"
 SSH_RATE_LIMIT="${SSH_RATE_LIMIT:-0}"; SSH_PORTS="${SSH_PORTS-}"
-BLOCKLIST_SSH="${BLOCKLIST_SSH:-0}"; BLOCKLIST_URL="https://lists.blocklist.de/lists/ssh.txt"
+BLOCKLIST_SSH="${BLOCKLIST_SSH:-1}"; BLOCKLIST_URL="https://lists.blocklist.de/lists/ssh.txt"
 BLOCKLIST_REFRESH_MIN=360; BLOCKLIST_MAX_AGE_MIN=4320
 MAX_GROWTH="${MAX_GROWTH:-3}"; MIN_KEEP="${MIN_KEEP:-0.2}"; MAX_CACHE_DAYS="${MAX_CACHE_DAYS:-14}"
 # Самая широкая сеть, которую можно принять из чужого списка или анонса ASN.
@@ -161,7 +161,7 @@ HOOK="${HOOK:-input}"
 ZKEEN_MIRRORS="${ZKEEN_MIRRORS-https://raw.githubusercontent.com/jameszeroX/zkeen-ip/master/release/zkeenip.dat https://cdn.jsdelivr.net/gh/jameszeroX/zkeen-ip@master/release/zkeenip.dat https://fastly.jsdelivr.net/gh/jameszeroX/zkeen-ip@master/release/zkeenip.dat}"
 [ "$HOOK" = input ] || [ "$HOOK" = prerouting ] || fail_keep "HOOK должен быть input или prerouting"
 [[ "$SSH_RATE_LIMIT" =~ ^[0-9]{1,4}$ ]] || fail_keep "SSH_RATE_LIMIT: число новых подключений в минуту (0 — выключено)"
-[[ "$BLOCKLIST_SSH" =~ ^[01]$ ]] || fail_keep "BLOCKLIST_SSH: 0 (выключено) или 1"
+[[ "$BLOCKLIST_SSH" =~ ^[01]$ ]] || fail_keep "BLOCKLIST_SSH: 1 (включено) или 0 (выключено)"
 for ssh_port in $SSH_PORTS; do
   [[ "$ssh_port" =~ ^[0-9]{1,5}$ ]] && [ "$ssh_port" -ge 1 ] && [ "$ssh_port" -le 65535 ] \
     || fail_keep "SSH_PORTS: порты от 1 до 65535"
@@ -2142,6 +2142,8 @@ def explain_rules(items):
             ("LAN_ALLOW, пропускаются всегда", "lan4", "lan6"),
             ("Сканеры и сети ведомств, блокируются", "sc4", "sc6"),
             ("Российские адреса, допускаются на защищённые порты", "ru4", "ru6")]
+    if "blocklist" in kinds:
+        rows.append(("Адреса blocklist.de, блокируются на SSH", "bl4", "bl6"))
     if "api_lock" in kinds:
         rows.append(("Допущенные к порту управления", "ap4", "ap6"))
     for label, v4, v6 in rows:
@@ -4665,7 +4667,7 @@ BLOCKLIST_BEGIN, BLOCKLIST_END = "# BEGIN FW-MENU BLOCKLIST", "# END FW-MENU BLO
 
 def blocklist_setting():
     # Действующее BLOCKLIST_SSH из fw.conf и local.conf.
-    script = 'source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; printf "%s" "${BLOCKLIST_SSH:-0}"'
+    script = 'source "$1/fw.conf"; [ -f "$1/local.conf" ] && source "$1/local.conf"; printf "%s" "${BLOCKLIST_SSH:-1}"'
     return probe_output("bash", "-c", script, "fw-menu", str(DIRECTORY)).strip() == "1"
 
 
@@ -7288,8 +7290,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    '00a004bdd7841063f0d25f40bcb0b7a85af40d1dc9959455a54c3bd0b84b67ea' "$stage/update-fw.sh" \
-    '8ec7d791b59bc631bf0409f9f39e38fcd1705f9e9807ecdaad4aaaeba5190fa5' "$stage/fw-menu" \
+    '04d6e3f3f69a373a0ef52161e3f05895c733e5d662b6cc21704d6831618b9466' "$stage/update-fw.sh" \
+    '9ada2a27a9e31b4ff506cbf41a0529d9a14ecec9ad4de6f2d81086046695e0a8' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

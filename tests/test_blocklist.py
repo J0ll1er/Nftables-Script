@@ -20,8 +20,13 @@ class Blocklist(unittest.TestCase):
         return text, snapshot.read_text() if snapshot.exists() else "", \
             len(calls.read_text().split()) if calls.exists() else 0
 
-    def test_off_by_default(self):
-        text, rules, calls = self.run_case("bl_off", "")
+    def test_on_by_default(self):
+        text, rules, calls = self.run_case("bl_default", "", SCEN_BL_CONTENT=LIST)
+        self.assertIn("blocklist-ssh", rules)
+        self.assertEqual(calls, 1)
+
+    def test_explicit_zero_turns_it_off(self):
+        text, rules, calls = self.run_case("bl_off", "BLOCKLIST_SSH=0")
         self.assertNotIn("bl4", rules)
         self.assertNotIn("blocklist-ssh", rules)
         self.assertEqual(calls, 0)

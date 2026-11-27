@@ -173,6 +173,7 @@ class StatusText(unittest.TestCase):
         self.assertIn("blocklist.de", text)
         self.assertIn("порт 22", text)
         self.assertRegex(text, r"Отброшено пакетов: 4")
+        self.assertRegex(text, r"Адреса blocklist\.de, блокируются на SSH")
 
 
 if __name__ == "__main__":

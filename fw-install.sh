@@ -2097,7 +2097,10 @@ class CountedStep(str):
 
 def dropped_line(group):
     text = dropped_text(group)
-    return "     " + text[0].upper() + text[1:]
+    line = "     " + text[0].upper() + text[1:]
+    if group.get("addresses") is not None:
+        line += f". Адресов за 7 дней: {group['addresses']}"
+    return line
 
 
 def dropped_text(group):
@@ -2111,6 +2114,29 @@ def ports_phrase(ports, single, plural):
 
 def protocols_phrase(protocols):
     return " и ".join(name.upper() for name in protocols)
+
+
+STAT_SETS = {"scanners": ("ss4", "ss6"), "non_ru": ("sn4", "sn6"), "ssh_rate": ("sr4", "sr6"), "blocklist": ("bs4", "bs6")}
+
+
+def stat_address_counts(items):
+    # Сколько разных адресов записано в наборах статистики (пара «адрес + порт» считается один раз на адрес).
+    # Группа без наборов статистики в результат не попадает.
+    found = {}
+    for item in items:
+        data = item.get("set")
+        if not data:
+            continue
+        for kind, names in STAT_SETS.items():
+            if data.get("name") in names:
+                addresses = found.setdefault(kind, set())
+                for entry in data.get("elem", []):
+                    value = (entry.get("elem", entry) if isinstance(entry, dict) else entry)
+                    value = value.get("val", value) if isinstance(value, dict) else value
+                    if isinstance(value, dict) and value.get("concat"):
+                        value = value["concat"][0]
+                    addresses.add(str(value))
+    return {kind: len(addresses) for kind, addresses in found.items()}
 
 
 def explain_rules(items):
@@ -2136,6 +2162,9 @@ def explain_rules(items):
                        "protocols": rule_protocols(rule.get("expr", [])),
                        "rate": rule_rate(rule.get("expr", []))})
     kinds = [group["kind"] for group in groups]
+    address_counts = stat_address_counts(items)
+    for group in groups:
+        group["addresses"] = address_counts.get(group["kind"])
 
     print("\nСписки адресов (записей после объединения подсетей):")
     rows = [("Доверенные, пропускаются всегда", "tr4", "tr6"),
@@ -2176,9 +2205,10 @@ def explain_rules(items):
         elif kind == "scanners":
             steps.append(CountedStep("Сканеры и сети ведомств — отбрасываются на всех портах.", group))
         elif kind == "blocklist":
+            updated = blocklist_updated()
             steps.append(CountedStep(f"{ports_phrase(group['ports'], 'SSH, порт', 'SSH, порты')}: адреса из списка blocklist.de "
-                                     "(замечены в переборе SSH за последние 48 часов) отбрасываются. "
-                                     "Доверенные адреса и LAN_ALLOW пропускаются раньше.", group))
+                                     "(перебирали SSH за последние 48 часов) отбрасываются. "
+                                     "Список обновляется вместе с правилами" + (f", обновлён {updated}." if updated else "."), group))
         elif kind == "ssh_rate":
             steps.append(CountedStep(f"{ports_phrase(group['ports'], 'SSH, порт', 'SSH, порты')}: с одного адреса не больше "
                                      f"{group['rate']} новых подключений в минуту, лишние отбрасываются. "
@@ -2203,6 +2233,10 @@ def explain_rules(items):
                 paint(33, dropped_line(text.group))
             else:
                 print(dropped_line(text.group))
+    if any(isinstance(text, CountedStep) for text in steps):
+        print(textwrap.fill("Пакет — одно сетевое сообщение: одна попытка подключения состоит из нескольких пакетов. "
+                            "Адреса взяты из статистики «Кто стучится» (она хранится 7 дней).", width=92,
+                            initial_indent="  ", subsequent_indent="  "))
 
 
 import threading
@@ -3001,9 +3035,11 @@ def status_body(problems):
         ssh_rate = int(values[5]) if values[5].isdigit() else 0
         print("\nНастройки")
         not_default = "не по умолчанию"
+        blocklist_on = blocklist_setting()
         for name, shown, note in (
                 ("LAN_ALLOW", values[0] or "выключено", ""),
                 ("SSH_RATE_LIMIT", f"{ssh_rate} в минуту" if ssh_rate else "выключено", "включено" if ssh_rate else ""),
+                ("BLOCKLIST_SSH", "включено" if blocklist_on else "выключено", "" if blocklist_on else not_default),
                 ("CONFIRM_TIMEOUT", f"{values[1]} с", not_default if values[1] != "60" else ""),
                 ("MAX_GROWTH", values[2], not_default if values[2] != "3" else ""),
                 ("MIN_KEEP", values[3], not_default if values[3] != "0.2" else ""),
@@ -4144,6 +4180,20 @@ def show_ssh_logins():
         print(f"  {names.get(method, method):<16} {user:<12} {address:<39} {count}")
 
 
+def blocklist_updated():
+    # Как давно скачан список blocklist.de (по времени файла кэша); пусто, если файла нет.
+    import time
+    try:
+        age = time.time() - (DIRECTORY / "scanner-cache" / "blocklist_ssh").stat().st_mtime
+    except OSError:
+        return ""
+    if age < 3600:
+        return "меньше часа назад"
+    if age < 48 * 3600:
+        return f"{int(age // 3600)} ч назад"
+    return f"{int(age // 86400)} дн. назад"
+
+
 def blocklist_listed(addresses):
     # Какие из адресов сейчас в наборе blocklist.de (nft get element сам ищет и среди диапазонов).
     listed = set()
@@ -4676,7 +4726,7 @@ def configure_blocklist_ssh():
     print(textwrap.fill("Список blocklist.de: адреса, которых за последние 48 часов заметили в переборе SSH на чужих серверах "
                         "(отчёты присылают администраторы по всему миру). Если включить, такие адреса не смогут подключаться "
                         "к портам SSH этой ноды. Другие порты не затрагиваются; доверенные адреса и LAN_ALLOW пропускаются раньше. "
-                        "Список скачивается при каждом обновлении правил, но не чаще раза в 6 часов.", width=92))
+                        "Список обновляется вместе с правилами, по таймеру (по умолчанию раз в сутки); чаще чем раз в 6 часов он не скачивается.", width=92))
     print(textwrap.fill("Осторожно: под одним адресом бывает много людей (мобильный интернет, общий NAT), и если на нём кто-то "
                         "перебирал пароли, адрес попадёт в список вместе со всеми. Свой адрес для входа добавьте в доверенные.", width=92))
     print(f"Сейчас: {'включено' if enabled else 'выключено'}")
@@ -7291,7 +7341,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '04d6e3f3f69a373a0ef52161e3f05895c733e5d662b6cc21704d6831618b9466' "$stage/update-fw.sh" \
-    '9ada2a27a9e31b4ff506cbf41a0529d9a14ecec9ad4de6f2d81086046695e0a8' "$stage/fw-menu" \
+    'e6f24a4e340a31fa3083d6b3c2cc3e342ac42ac5f22f4b3c48c8c721a4059dc9' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

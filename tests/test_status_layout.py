@@ -42,6 +42,7 @@ class Status(unittest.TestCase):
             return ""
         menu.probe_output = probe
         menu.trusted_networks = lambda: []
+        menu.blocklist_setting = lambda: True  # по умолчанию включено
         menu.trusted_names = lambda: []
         menu.warn_old_trusted = lambda: None
         menu.warn_reverse_proxy = lambda: None
@@ -81,7 +82,7 @@ class Status(unittest.TestCase):
 
     def test_settings_are_one_per_line(self):
         text = self.status()
-        for name in ("LAN_ALLOW", "SSH_RATE_LIMIT", "CONFIRM_TIMEOUT", "MAX_GROWTH", "MIN_KEEP", "MAX_CACHE_DAYS"):
+        for name in ("LAN_ALLOW", "SSH_RATE_LIMIT", "BLOCKLIST_SSH", "CONFIRM_TIMEOUT", "MAX_GROWTH", "MIN_KEEP", "MAX_CACHE_DAYS"):
             self.assertRegex(text, rf"(?m)^  {name} \.+ \S")
         self.assertRegex(text, r"LAN_ALLOW \.+ выключено")
         self.assertRegex(text, r"CONFIRM_TIMEOUT \.+ 60 с")

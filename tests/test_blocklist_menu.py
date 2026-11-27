@@ -156,9 +156,30 @@ class Marks(unittest.TestCase):
         self.assertNotIn("blocklist.de", other)
 
 
+class Updated(unittest.TestCase):
+    def check(self, age_seconds):
+        import os, time
+        menu = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            menu.DIRECTORY = Path(tmp)
+            self.assertEqual(menu.blocklist_updated(), "")
+            cache = Path(tmp) / "scanner-cache"
+            cache.mkdir()
+            (cache / "blocklist_ssh").write_text("198.51.100.7\n")
+            past = time.time() - age_seconds
+            os.utime(cache / "blocklist_ssh", (past, past))
+            return menu.blocklist_updated()
+
+    def test_ages_are_readable(self):
+        self.assertEqual(self.check(600), "меньше часа назад")
+        self.assertEqual(self.check(5 * 3600 + 100), "5 ч назад")
+        self.assertEqual(self.check(3 * 86400), "3 дн. назад")
+
+
 class StatusText(unittest.TestCase):
     def test_status_explains_the_rule(self):
         menu = load()
+        menu.blocklist_updated = lambda: "3 ч назад"
         sets = [{"set": {"name": name}} for name in ("bl4", "bl6")]
         rule = {"rule": {"chain": "input", "comment": "blocklist-ssh", "expr": [
             {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": {"set": [22]}}},
@@ -174,6 +195,48 @@ class StatusText(unittest.TestCase):
         self.assertIn("порт 22", text)
         self.assertRegex(text, r"Отброшено пакетов: 4")
         self.assertRegex(text, r"Адреса blocklist\.de, блокируются на SSH")
+        self.assertIn("обновляется вместе с правилами", text)
+        self.assertIn("обновлён 3 ч назад", text)
+
+
+class AddressCounts(unittest.TestCase):
+    def pair(self, address, port):
+        return {"elem": {"val": {"concat": [address, port]}, "expires": 600000, "counter": {"packets": 1, "bytes": 60}}}
+
+    def render(self, stat_sets, comment, extra_expr=()):
+        menu = load()
+        sets = [{"set": {"name": name, "elem": elems}} for name, elems in stat_sets.items()]
+        rule = {"rule": {"chain": "input", "comment": comment, "expr": [
+            {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": {"set": [22]}}},
+            *extra_expr, {"counter": {"packets": 40, "bytes": 2400}}, {"drop": None}]}}
+        chain = {"chain": {"name": "input", "table": "fw"}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            menu.explain_rules([chain] + sets + [rule])
+        return out.getvalue()
+
+    def test_blocklist_step_counts_distinct_addresses_not_pairs(self):
+        text = self.render({"bs4": [self.pair("198.51.100.7", 22), self.pair("198.51.100.7", 2222), self.pair("203.0.113.9", 22)],
+                            "bs6": [self.pair("2001:db8:5::1", 22)]}, "blocklist-ssh",
+                           [{"set": {"op": "add", "elem": {}, "set": "@bs4"}}])
+        self.assertRegex(text, r"Отброшено пакетов: 40.*Адресов за 7 дней: 3")
+
+    def test_scanner_step_gets_the_same_line(self):
+        text = self.render({"ss4": [self.pair("192.0.2.5", 80), self.pair("192.0.2.6", 80)], "ss6": []}, "scanners")
+        self.assertRegex(text, r"Отброшено пакетов: 40.*Адресов за 7 дней: 2")
+
+    def test_no_address_count_without_the_stats_sets(self):
+        text = self.render({}, "scanners")
+        self.assertIn("Отброшено пакетов: 40", text)
+        self.assertNotIn("Адресов за 7 дней", text)
+
+    def test_packet_is_explained_once(self):
+        text = self.render({"ss4": [self.pair("192.0.2.5", 80)], "ss6": []}, "scanners")
+        self.assertEqual(text.count("Пакет — одно сетевое сообщение"), 1)
+
+    def test_blocklist_step_says_how_the_list_is_refreshed(self):
+        text = self.render({}, "blocklist-ssh")
+        self.assertIn("обновляется вместе с правилами", text)
 
 
 if __name__ == "__main__":

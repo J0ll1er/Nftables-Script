@@ -84,3 +84,14 @@ class Refresh(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GeoMirrorIsNotAWarning(unittest.TestCase):
+    def test_primary_down_mirror_up_stays_green(self):
+        env = {**os.environ, "TEST_CONF_APPEND": 'ZKEEN_URL="https://primary.invalid/zkeenip.dat"\nBLOCKLIST_SSH=0',
+               "SCEN_GEO_PRIMARY": "down"}
+        result = subprocess.run(["bash", str(ROOT / "tests/run_updater.sh"), "geo_mirror", "--dry"],
+                                cwd=ROOT, env=env, text=True, capture_output=True)
+        text = result.stdout + result.stderr
+        self.assertIn("код возврата: 0", text, text)
+        self.assertNotIn("WARN: геобаза не скачалась", text)

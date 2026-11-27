@@ -5014,8 +5014,16 @@ menu = replace_once(menu, '''    print(f"Сейчас: {'включено' if en
 # blocklist.de запускаем сразу после включения таймера, а не ждём суточного обновления.
 menu = replace_once(menu, '''            print("Правила подтверждены. Таймер включён.")
 ''', '''            print("Правила подтверждены. Таймер включён.")
-            subprocess.run([str(UPDATER), "--blocklist"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            # Через минуту, уже без lock применения: update-fw.sh --blocklist при занятом .apply.lock отказывается работать.
+            subprocess.run(["systemctl", "stop", "fw-blocklist-*.timer"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            subprocess.run(["systemd-run", "--quiet", "--collect", f"--unit=fw-blocklist-{int(datetime.datetime.now().timestamp())}", "--on-active=1min",
+                            str(UPDATER), "--blocklist"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 ''', "blocklist: цепочка сразу после включения таймера")
+
+# Основной адрес геобазы может быть недоступен, а зеркало работает: это не замечание. Предупреждением остаются
+# только случаи, когда файл получен, но плох (не разобран, неполный, отклонён).
+upd = replace_once(upd, '    note "WARN: геобаза не скачалась с ${url#https://}"\n',
+                   '    note "Геобаза не скачалась с ${url#https://}, пробую следующий адрес"\n', "геобаза: недоступный адрес не замечание")
 
 new_text = text
 for key, replacement in (("menu", menu), ("update", upd)):

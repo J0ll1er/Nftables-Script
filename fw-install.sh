@@ -669,7 +669,7 @@ fetch_scanner_file() {
 geo_ok=0
 for url in "$ZKEEN_URL" $ZKEEN_MIRRORS; do
   if ! dl "$MAX_GEO_BYTES" "$TMP/geo.dat" -L --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 60 "$url"; then
-    note "WARN: геобаза не скачалась с ${url#https://}"
+    note "Геобаза не скачалась с ${url#https://}, пробую следующий адрес"
     continue
   fi
   if ! reason=$(unpack_geoip "$TMP/geo.dat" "$GEO_TAG" "$TMP/ru_raw" 2>&1); then
@@ -4593,7 +4593,10 @@ def apply_rules():
             return
         if run("systemctl", "enable", "fw-update.service") and run("systemctl", "enable", "--now", "fw-update.timer"):
             print("Правила подтверждены. Таймер включён.")
-            subprocess.run([str(UPDATER), "--blocklist"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            # Через минуту, уже без lock применения: update-fw.sh --blocklist при занятом .apply.lock отказывается работать.
+            subprocess.run(["systemctl", "stop", "fw-blocklist-*.timer"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            subprocess.run(["systemd-run", "--quiet", "--collect", f"--unit=fw-blocklist-{int(datetime.datetime.now().timestamp())}", "--on-active=1min",
+                            str(UPDATER), "--blocklist"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             result = last_result()
             if result == "ok":
                 paint(32, "ИТОГ: ВСЁ В ПОРЯДКЕ — правила применены и подтверждены, таймер включён")
@@ -7523,8 +7526,8 @@ WantedBy=timers.target
 FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
-    'e40760cfe339b767f6cc5df05202e8a958a2d2be86d3f240cde4f9cab4d21a7a' "$stage/update-fw.sh" \
-    '2953534d840d64a5426ade94317ee19494a834106f42165d163917b8753a7b6d' "$stage/fw-menu" \
+    'd7c56ea9005c214a79caf46f3afc0b6d3c23c7cc5f9adaac6eeb12480eab161c' "$stage/update-fw.sh" \
+    '389fef18e7c3e86635c09a2f3098f4d59d91624f8b6f20c2cd68b5c4a7f9ac5e' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

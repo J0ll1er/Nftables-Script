@@ -12,6 +12,7 @@ emit() { if [ -n "$out" ]; then cat > "$out"; else cat; fi; }
 case "$url" in
   *zkeenip.dat*)
     if [ "${SCEN_GEO:-ok}" = down ]; then echo "curl: geo down" >&2; exit 28; fi
+    case "$*" in *primary.invalid*) if [ "${SCEN_GEO_PRIMARY:-ok}" = down ]; then echo "curl: primary down" >&2; exit 28; fi ;; esac
     emit < "$GEO_DAT" ;;
   https://stat.ripe.net/*)
     echo x >> "$STUB_DIR/ripe_calls"

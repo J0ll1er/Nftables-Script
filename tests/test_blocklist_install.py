@@ -79,13 +79,22 @@ if __name__ == "__main__":
 
 
 class FreshInstallChain(unittest.TestCase):
-    def test_chain_starts_right_after_the_timer_is_enabled(self):
-        # На чистой установке первый update-fw.sh идёт до включения таймера и цепочку не ставит:
-        # её запускает apply_rules сразу после «systemctl enable --now fw-update.timer».
+    def body(self):
         text = (ROOT / "build" / "fw-menu").read_text(encoding="utf-8")
         start = text.index("def apply_rules():")
-        body = text[start:text.index("\ndef remove_rules", start)]
+        return text[start:text.index("\ndef remove_rules", start)]
+
+    def test_chain_starts_after_the_timer_is_enabled_and_the_apply_lock_is_free(self):
+        # На чистой установке первый update-fw.sh идёт до включения таймера и цепочку не ставит. Запускать
+        # --blocklist прямо в apply_rules нельзя: пока меню держит .apply.lock, updater отвечает ошибкой
+        # «ручное применение ещё не подтверждено» и пишет её в журнал и в last-result. Поэтому разовый запуск через systemd-run.
+        body = self.body()
         enabled = body.index('"enable", "--now", "fw-update.timer"')
-        started = body.index('[str(UPDATER), "--blocklist"]')
+        started = body.index('"--on-active=1min"')
         self.assertGreater(started, enabled)
         self.assertLess(started, body.index("reconcile_reinstall_guard()"))
+        self.assertNotIn('subprocess.run([str(UPDATER), "--blocklist"]', body)
+
+    def test_old_chain_is_stopped_before_the_first_run_is_armed(self):
+        body = self.body()
+        self.assertLess(body.index('"stop", "fw-blocklist-*.timer"'), body.index('"--on-active=1min"'))

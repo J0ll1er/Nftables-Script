@@ -1975,7 +1975,7 @@ def collect_profile():
 
 
 def show_profile():
-    result = collect_profile()
+    result = prefetched("profile", collect_profile)
     geo_ports, api_ports, hook = configured_ports()
     print(f"\nПрофиль сервера — {result['profile']}")
     if hook == "prerouting":
@@ -3107,7 +3107,25 @@ def show_status(compact=False):
         sys.stdout.write(compact_status(buffer.getvalue()) if compact and completed else buffer.getvalue())
 
 
+STATUS_PREFETCH = {}
+
+
+def prefetch_status():
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    STATUS_PREFETCH["profile"] = pool.submit(collect_profile)
+    STATUS_PREFETCH["table"] = pool.submit(
+        lambda: subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
+                               text=True, capture_output=True, check=False))
+    pool.shutdown(wait=False)
+
+
+def prefetched(name, fallback):
+    future = STATUS_PREFETCH.pop(name, None)
+    return future.result() if future else fallback()
+
+
 def status_body(problems):
+    prefetch_status()  # самые долгие запросы идут параллельно с остальной проверкой
     print("Проверка файлов и команд")
     for name in ("fw.conf", "asn.txt", "extra.txt", "trusted.txt", "update-fw.sh"):
         path = DIRECTORY / name
@@ -3175,8 +3193,8 @@ def status_body(problems):
     if timer.get("ActiveState") in ("inactive", "failed", "deactivating"):
         problems.append((33, "таймер обновления не активен: списки не обновляются"))
     print("\nЗагруженные правила (счётчики с момента последнего применения правил)", flush=True)
-    table = subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
-                           text=True, capture_output=True, check=False)
+    table = prefetched("table", lambda: subprocess.run(["nft", "-j", "list", "table", "inet", "fw"],
+                                                       text=True, capture_output=True, check=False))
     if table.returncode:
         print(table.stderr.strip() or "Таблица inet fw пока не загружена.")
         problems.append((33, "правила ещё не загружены: «Проверить и применить правила»"))
@@ -7469,7 +7487,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '04d6e3f3f69a373a0ef52161e3f05895c733e5d662b6cc21704d6831618b9466' "$stage/update-fw.sh" \
-    '42a2bcda2bbbab4d930b7a906ffc5d8caaf7581ca7470a246bce1a1aae4ae049' "$stage/fw-menu" \
+    '72f05ce0f366d8e4efcdea711eacbab178b38c67b752f078aa114d43b8cade57' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

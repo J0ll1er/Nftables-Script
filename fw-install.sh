@@ -4301,18 +4301,39 @@ def blocklist_updated():
 
 
 def blocklist_listed(addresses):
-    # Какие из адресов сейчас в наборе blocklist.de (nft get element сам ищет и среди диапазонов).
-    listed = set()
+    # Какие из адресов сейчас в наборах blocklist.de. Каждый набор читается один раз (параллельно): поиск через
+    # `nft get element` по каждому адресу на ноде занимал около 0,3 с на адрес, то есть секунды на экран.
+    parsed = {}
     for address in addresses:
         try:
-            version = ipaddress.ip_address(address).version
+            parsed[address] = ipaddress.ip_address(address)
         except ValueError:
             continue
-        answer = probe_output("nft", "-n", "get", "element", "inet", "fw", "bl4" if version == 4 else "bl6",
-                              "{ " + address + " }", timeout=3)
-        if "elements" in answer:
-            listed.add(address)
-    return listed
+    versions = sorted({value.version for value in parsed.values()})
+    if not versions:
+        return set()
+    names = {4: "bl4", 6: "bl6"}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(versions)) as pool:
+        texts = dict(zip(versions, pool.map(
+            lambda version: probe_output("nft", "-n", "list", "set", "inet", "fw", names[version], timeout=5), versions)))
+    single, spans = {4: set(), 6: set()}, {4: [], 6: []}
+    for version, text in texts.items():
+        match = re.search(r"elements = \{(.*?)\}", text, re.S)
+        for item in (match.group(1).split(",") if match else []):
+            item = item.strip()
+            try:
+                if "-" in item:
+                    low, _, high = item.partition("-")
+                    spans[version].append((ipaddress.ip_address(low.strip()), ipaddress.ip_address(high.strip())))
+                elif "/" in item:
+                    network = ipaddress.ip_network(item, strict=False)
+                    spans[version].append((network[0], network[-1]))
+                elif item:
+                    single[version].add(ipaddress.ip_address(item))
+            except ValueError:
+                continue
+    return {name for name, value in parsed.items()
+            if value in single[value.version] or any(low <= value <= high for low, high in spans[value.version])}
 
 
 def show_ssh_attempts(say):
@@ -7448,7 +7469,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '04d6e3f3f69a373a0ef52161e3f05895c733e5d662b6cc21704d6831618b9466' "$stage/update-fw.sh" \
-    '4c0ad3bb2bcc032f2a0ffdf4b4d4f503bad635df54aadea0f72fd82096674c9b' "$stage/fw-menu" \
+    '42a2bcda2bbbab4d930b7a906ffc5d8caaf7581ca7470a246bce1a1aae4ae049' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

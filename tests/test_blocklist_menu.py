@@ -121,22 +121,44 @@ class Marks(unittest.TestCase):
     def setUp(self):
         self.menu = load()
 
-    def test_listed_addresses_are_found_by_nft_get_element(self):
+    SET4 = ("table inet fw {\n\tset bl4 {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n"
+            "\t\telements = { 198.51.100.7, 203.0.113.0/30,\n\t\t\t     192.0.2.10-192.0.2.20 }\n\t}\n}\n")
+    SET6 = "table inet fw {\n\tset bl6 {\n\t\ttype ipv6_addr\n\t\telements = { 2001:db8:5::1, 2001:db8:9::/48 }\n\t}\n}\n"
+
+    def stub(self):
         calls = []
 
         def probe(*command, **_):
             calls.append(command)
-            return "table inet fw { set bl4 { elements = { 198.51.100.7 } } }" if "198.51.100.7" in command[-1] else ""
+            return {"bl4": self.SET4, "bl6": self.SET6}.get(command[-1], "")
         self.menu.probe_output = probe
-        listed = self.menu.blocklist_listed(["198.51.100.7", "203.0.113.9", "garbage"])
-        self.assertEqual(listed, {"198.51.100.7"})
-        self.assertIn("bl4", calls[0])
+        return calls
+
+    def test_single_range_and_network_entries_are_found(self):
+        self.stub()
+        listed = self.menu.blocklist_listed(["198.51.100.7", "203.0.113.2", "192.0.2.15", "192.0.2.21", "203.0.113.9",
+                                             "198.51.100.8", "garbage"])
+        self.assertEqual(listed, {"198.51.100.7", "203.0.113.2", "192.0.2.15"})
 
     def test_ipv6_uses_the_v6_set(self):
-        calls = []
-        self.menu.probe_output = lambda *c, **_: calls.append(c) or ""
-        self.menu.blocklist_listed(["2001:db8:5::1"])
-        self.assertIn("bl6", calls[0])
+        self.stub()
+        self.assertEqual(self.menu.blocklist_listed(["2001:db8:5::1", "2001:db8:9::77", "2001:db8:6::1"]),
+                         {"2001:db8:5::1", "2001:db8:9::77"})
+
+    def test_the_sets_are_read_once_not_per_address(self):
+        calls = self.stub()
+        self.menu.blocklist_listed([f"198.51.100.{n}" for n in range(1, 11)] + ["2001:db8:5::1"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({call[-1] for call in calls}, {"bl4", "bl6"})
+
+    def test_no_addresses_means_no_nft_calls(self):
+        calls = self.stub()
+        self.assertEqual(self.menu.blocklist_listed([]), set())
+        self.assertEqual(calls, [])
+
+    def test_unreadable_set_means_nobody_is_listed(self):
+        self.menu.probe_output = lambda *c, **_: ""
+        self.assertEqual(self.menu.blocklist_listed(["198.51.100.7"]), set())
 
     def test_attempts_block_marks_listed_addresses(self):
         menu = self.menu

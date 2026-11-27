@@ -4773,6 +4773,133 @@ menu = replace_once(menu, '''        print("\\nНастройки")
         blocklist_on = blocklist_setting()
 ''', "статус: значение blocklist")
 
+# ---------------------------------------------------------------- короткий «Статус файрвола» (1.10.0)
+# 1 → 1 показывает коротко: итог, что включено, когда обновление, что делает каждое правило.
+# 1 → 5 — прежний подробный экран (проверка файлов, профиль сервера, списки адресов, настройки).
+menu = replace_once(menu, 'def show_status():\n', r'''STATUS_COMPACT = False
+STATUS_SECTIONS = ("Проверка файлов и команд", "Проверка reverse proxy", "Профиль сервера", "Настройки", "Служба и таймер",
+                   "Загруженные правила", "Списки адресов", "Как проверяется каждое новое входящее подключение",
+                   "Технический вид правил")
+
+
+def compact_status(text):
+    # Из подробного текста статуса оставляет то, что важно сразу: замечания, включённое, ближайшее обновление, правила.
+    blocks = []
+    kept = []
+    section = None
+    heading = ""
+    good = {"загружена", "включён", "активен", "успешно"}
+
+    def flush():
+        if section and (kept or section == "Как проверяется каждое новое входящее подключение"):
+            blocks.append([heading] + kept)
+
+    for raw in text.splitlines():
+        plain = BOX_ANSI.sub("", raw).strip()
+        name = next((item for item in STATUS_SECTIONS if plain.startswith(item)), None)
+        if name:
+            flush()
+            section, heading, kept = name, raw, []
+            continue
+        if not plain or section is None:
+            continue
+        if section == "Проверка файлов и команд":
+            if plain.startswith(("ПРОВЕРЬ", "Внимание")):
+                kept.append(raw)
+        elif section == "Проверка reverse proxy":
+            if plain.startswith("Внимание"):
+                kept.append(raw)
+        elif section == "Профиль сервера":
+            if kept or plain.startswith("Расхождения с настройками:"):
+                kept.append(raw)
+        elif section == "Настройки":
+            if "←" in plain or not re.match(r"\w+ \.{2,}", plain):
+                kept.append(raw)
+        elif section == "Служба и таймер":
+            label, _, value = plain.partition(" — ")
+            if label.startswith(("Последнее обновление", "Следующее обновление")) or not value or value not in good:
+                kept.append(raw)
+        elif section in ("Загруженные правила", "Как проверяется каждое новое входящее подключение"):
+            kept.append(raw)
+    flush()
+    lines = []
+    for block in blocks:
+        lines.extend(["", *block])
+    lines.extend(["", "Подробно (проверка файлов, списки адресов, профиль сервера): fw-menu → 1 → 5"])
+    return "\n".join(lines).strip("\n") + "\n"
+
+
+def short_step(group):
+    # Короткая формулировка правила для компактного статуса (None — оставить подробный текст).
+    ports = ", ".join(group.get("ports") or [])
+    kind = group["kind"]
+    if kind == "api_lock":
+        return f"Порт управления {ports}: только допущенные адреса"
+    if kind == "scanners":
+        return "Сканеры и сети ведомств: блокируются на всех портах"
+    if kind == "blocklist":
+        return f"SSH, порт {ports}: адреса из blocklist.de блокируются"
+    if kind == "ssh_rate":
+        return f"SSH, порт {ports}: не больше {group['rate']} новых подключений в минуту с одного адреса"
+    if kind == "non_ru":
+        return f"Порт {ports}: адреса не из России блокируются"
+    return None
+
+
+def short_counter(group):
+    count = group.get("addresses")
+    if count is None:
+        return f"     отброшено пакетов: {group['packets']}"
+    return f"     отброшено за 7 дней: {count} {addresses_word(count)}"
+
+
+def show_status(compact=False):
+''', "статус: короткий вид, функции")
+menu = replace_once(menu, '''    completed = False
+    try:
+        with contextlib.redirect_stdout(buffer):
+            status_body(problems)
+        completed = True
+    finally:
+''', '''    completed = False
+    global STATUS_COMPACT
+    try:
+        STATUS_COMPACT = compact
+        with contextlib.redirect_stdout(buffer):
+            status_body(problems)
+        completed = True
+    finally:
+        STATUS_COMPACT = False
+''', "статус: флаг короткого вида")
+menu = replace_once(menu, '        sys.stdout.write(buffer.getvalue())\n',
+                    '        sys.stdout.write(compact_status(buffer.getvalue()) if compact and completed else buffer.getvalue())\n',
+                    "статус: вывод")
+menu = replace_once(menu, '''        print(textwrap.fill(f"{number}. {text}", width=92, initial_indent="  ", subsequent_indent="     "))
+        if isinstance(text, CountedStep):
+''', '''        shown = short_step(text.group) if STATUS_COMPACT and isinstance(text, CountedStep) else None
+        print(textwrap.fill(f"{number}. {shown or text}", width=92, initial_indent="  ", subsequent_indent="     "))
+        if shown:
+            if text.group["packets"]:
+                paint(33, short_counter(text.group))
+            else:
+                print(short_counter(text.group))
+        elif isinstance(text, CountedStep):
+''', "статус: короткий шаг")
+menu = replace_once(menu, '''    if any(isinstance(text, CountedStep) for text in steps):
+        print(textwrap.fill("Пакет''', '''    if not STATUS_COMPACT and any(isinstance(text, CountedStep) for text in steps):
+        print(textwrap.fill("Пакет''', "статус: пояснение про пакеты только в подробном")
+menu = replace_once(menu, '''def settings_paths():''', '''def show_status_short():
+    show_status(compact=True)
+
+
+def settings_paths():''', "статус: функция для меню")
+menu = replace_once(menu, '("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),\n',
+                    '("Статус файрвола", boxed("Статус файрвола", show_status_short, BOX_HEADINGS)),\n', "статус: пункт 1 короткий")
+menu = replace_once(menu, '''            ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),
+''', '''            ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),
+            ("Статус файрвола подробно", boxed("Статус файрвола подробно", show_status, BOX_HEADINGS)),
+''', "статус: подробный пункт")
+
 new_text = text
 for key, replacement in (("menu", menu), ("update", upd)):
     a, b, _ = parts[key]

@@ -2238,8 +2238,14 @@ def explain_rules(items):
     if chain.get("hook") == "prerouting":
         print("  Фильтр стоит до маршрутизации (prerouting), поэтому действует и на порты Docker-контейнеров.")
     for number, text in enumerate(steps, 1):
-        print(textwrap.fill(f"{number}. {text}", width=92, initial_indent="  ", subsequent_indent="     "))
-        if isinstance(text, CountedStep):
+        shown = short_step(text.group) if STATUS_COMPACT and isinstance(text, CountedStep) else None
+        print(textwrap.fill(f"{number}. {shown or text}", width=92, initial_indent="  ", subsequent_indent="     "))
+        if shown:
+            if text.group["packets"]:
+                paint(33, short_counter(text.group))
+            else:
+                print(short_counter(text.group))
+        elif isinstance(text, CountedStep):
             # Счётчик отдельной строкой под пунктом: ненулевой выделен, чтобы было видно, где что-то отбрасывается.
             if text.group["packets"]:
                 paint(33, dropped_line(text.group))
@@ -2247,7 +2253,7 @@ def explain_rules(items):
                 print(dropped_line(text.group))
             if stats_line(text.group):
                 print(stats_line(text.group))
-    if any(isinstance(text, CountedStep) for text in steps):
+    if not STATUS_COMPACT and any(isinstance(text, CountedStep) for text in steps):
         print(textwrap.fill("Пакет — одно сетевое сообщение: одна попытка подключения состоит из нескольких пакетов. "
                             "Пакеты считаются с последнего применения правил, а статистика адресов хранится 7 дней и "
                             "при применении не сбрасывается.", width=92,
@@ -2994,7 +3000,84 @@ def show_hits():
     say("Считаются отдельные пакеты, а не подключения: один сканер может прислать несколько пакетов на один порт.")
 
 
-def show_status():
+STATUS_COMPACT = False
+STATUS_SECTIONS = ("Проверка файлов и команд", "Проверка reverse proxy", "Профиль сервера", "Настройки", "Служба и таймер",
+                   "Загруженные правила", "Списки адресов", "Как проверяется каждое новое входящее подключение",
+                   "Технический вид правил")
+
+
+def compact_status(text):
+    # Из подробного текста статуса оставляет то, что важно сразу: замечания, включённое, ближайшее обновление, правила.
+    blocks = []
+    kept = []
+    section = None
+    heading = ""
+    good = {"загружена", "включён", "активен", "успешно"}
+
+    def flush():
+        if section and (kept or section == "Как проверяется каждое новое входящее подключение"):
+            blocks.append([heading] + kept)
+
+    for raw in text.splitlines():
+        plain = BOX_ANSI.sub("", raw).strip()
+        name = next((item for item in STATUS_SECTIONS if plain.startswith(item)), None)
+        if name:
+            flush()
+            section, heading, kept = name, raw, []
+            continue
+        if not plain or section is None:
+            continue
+        if section == "Проверка файлов и команд":
+            if plain.startswith(("ПРОВЕРЬ", "Внимание")):
+                kept.append(raw)
+        elif section == "Проверка reverse proxy":
+            if plain.startswith("Внимание"):
+                kept.append(raw)
+        elif section == "Профиль сервера":
+            if kept or plain.startswith("Расхождения с настройками:"):
+                kept.append(raw)
+        elif section == "Настройки":
+            if "←" in plain or not re.match(r"\w+ \.{2,}", plain):
+                kept.append(raw)
+        elif section == "Служба и таймер":
+            label, _, value = plain.partition(" — ")
+            if label.startswith(("Последнее обновление", "Следующее обновление")) or not value or value not in good:
+                kept.append(raw)
+        elif section in ("Загруженные правила", "Как проверяется каждое новое входящее подключение"):
+            kept.append(raw)
+    flush()
+    lines = []
+    for block in blocks:
+        lines.extend(["", *block])
+    lines.extend(["", "Подробно (проверка файлов, списки адресов, профиль сервера): fw-menu → 1 → 5"])
+    return "\n".join(lines).strip("\n") + "\n"
+
+
+def short_step(group):
+    # Короткая формулировка правила для компактного статуса (None — оставить подробный текст).
+    ports = ", ".join(group.get("ports") or [])
+    kind = group["kind"]
+    if kind == "api_lock":
+        return f"Порт управления {ports}: только допущенные адреса"
+    if kind == "scanners":
+        return "Сканеры и сети ведомств: блокируются на всех портах"
+    if kind == "blocklist":
+        return f"SSH, порт {ports}: адреса из blocklist.de блокируются"
+    if kind == "ssh_rate":
+        return f"SSH, порт {ports}: не больше {group['rate']} новых подключений в минуту с одного адреса"
+    if kind == "non_ru":
+        return f"Порт {ports}: адреса не из России блокируются"
+    return None
+
+
+def short_counter(group):
+    count = group.get("addresses")
+    if count is None:
+        return f"     отброшено пакетов: {group['packets']}"
+    return f"     отброшено за 7 дней: {count} {addresses_word(count)}"
+
+
+def show_status(compact=False):
     # Сначала собирается весь экран, потом сверху печатается итог: одна строка, по которой видно, всё ли в порядке.
     problems = []
     real_tty = sys.stdout.isatty()
@@ -3005,11 +3088,14 @@ def show_status():
 
     buffer = Buffer()
     completed = False
+    global STATUS_COMPACT
     try:
+        STATUS_COMPACT = compact
         with contextlib.redirect_stdout(buffer):
             status_body(problems)
         completed = True
     finally:
+        STATUS_COMPACT = False
         if completed:
             if problems:
                 paint(min(code for code, _ in problems), f"ИТОГ: ЕСТЬ ЗАМЕЧАНИЯ ({len(problems)})")
@@ -3018,7 +3104,7 @@ def show_status():
             else:
                 paint(32, "ИТОГ: ВСЁ В ПОРЯДКЕ — файлы на месте, правила загружены, таймер активен, расхождений нет")
             print()
-        sys.stdout.write(buffer.getvalue())
+        sys.stdout.write(compact_status(buffer.getvalue()) if compact and completed else buffer.getvalue())
 
 
 def status_body(problems):
@@ -3102,6 +3188,10 @@ def status_body(problems):
         problems.append((33, "правила не удалось разобрать: смотри технический вид ниже"))
         return
     print("\nТехнический вид правил: nft list table inet fw")
+
+
+def show_status_short():
+    show_status(compact=True)
 
 
 def settings_paths():
@@ -5573,10 +5663,11 @@ def main():
     ensure_motd_notice()
     entries = (
         ("Статус и наблюдение", (
-            ("Статус файрвола", boxed("Статус файрвола", show_status, BOX_HEADINGS)),
+            ("Статус файрвола", boxed("Статус файрвола", show_status_short, BOX_HEADINGS)),
             ("Кто стучится", boxed("Кто стучится", show_hits, HITS_HEADINGS)),
             ("Журнал ошибок", boxed("Журнал ошибок", show_error_log)),
             ("Что ещё есть на сервере", boxed("Что ещё есть на сервере", show_server_overview)),
+            ("Статус файрвола подробно", boxed("Статус файрвола подробно", show_status, BOX_HEADINGS)),
         )),
         ("Настроить доступ", (
             ("Добавить доверенные IP или подсети через пробел", add_trusted),
@@ -7356,7 +7447,7 @@ FW_TIMER_FILE
 
 if ! printf '%s  %s\n%s  %s\n%s  %s\n' \
     '04d6e3f3f69a373a0ef52161e3f05895c733e5d662b6cc21704d6831618b9466' "$stage/update-fw.sh" \
-    'a2e1574a5c2060ab07dedd809bd7801e28c604ef1bb9f5d1d864689ac53eafc8' "$stage/fw-menu" \
+    'fda9f42ce0a65ee00c2b45f8577b12567097733ec18a8c02d5e7d86349e1d78c' "$stage/fw-menu" \
     '05111a5a7d9680df7bde7b7f24bfaa530a012b6d965e62a477e93fe5f6b3e521' "$stage/seed.txt" | sha256sum -c - >/dev/null; then
   echo 'Блок вставился с искажениями (контрольная сумма не сошлась). Ничего не изменено.' >&2
   exit 1

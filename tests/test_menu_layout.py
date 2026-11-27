@@ -53,9 +53,11 @@ class Layout(unittest.TestCase):
         first = self.entries()[0][1]
         self.assertIsInstance(first, tuple)
         self.assertEqual([label for label, _ in first],
-                         ["Статус файрвола", "Кто стучится", "Журнал ошибок", "Что ещё есть на сервере"])
+                         ["Статус файрвола", "Кто стучится", "Журнал ошибок", "Что ещё есть на сервере",
+                          "Статус файрвола подробно"])
         wrapped = [getattr(action, "__wrapped__", action) for _, action in first]
-        self.assertEqual(wrapped, [self.menu.show_status, self.menu.show_hits, self.menu.show_error_log, self.menu.show_server_overview])
+        self.assertEqual(wrapped, [self.menu.show_status_short, self.menu.show_hits, self.menu.show_error_log,
+                                   self.menu.show_server_overview, self.menu.show_status])
 
     def test_old_sections_moved_without_losing_actions(self):
         entries = dict(self.entries())
